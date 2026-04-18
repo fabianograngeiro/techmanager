@@ -54,67 +54,6 @@ cd techmanager
 npm install
 ```
 
-## 3.1 Instalador automatico Linux
-
-Foi adicionado um instalador interativo completo para Linux:
-
-- `linux_installer.sh`
-
-O script permite escolher:
-
-- Modo de publicacao: Docker ou PM2
-- Tipo de acesso: Local IP ou Dominio VPS
-- Banco de dados: PostgreSQL Docker ou PostgreSQL Externo
-
-Ele executa automaticamente:
-
-- Instalacao de requisitos (git, node, nginx e dependencias)
-- Clone/atualizacao do repositorio
-- Criacao/ajuste do arquivo `.env`
-- Publicacao do app no modo escolhido
-- Configuracao de proxy reverso no Nginx
-- SSL com certbot (quando dominio)
-
-Como usar:
-
-```bash
-chmod +x linux_installer.sh
-./linux_installer.sh
-```
-
-## 3.2 Instalador automatico Windows
-
-Tambem foi adicionado um instalador interativo para Windows:
-
-- `windows_installer.ps1`
-- `windows_installer.bat` (atalho para executar o script PowerShell)
-
-O script permite escolher:
-
-- Modo de publicacao: Docker ou PM2
-- Tipo de acesso: Local IP ou Dominio VPS
-- Banco de dados: PostgreSQL Docker ou PostgreSQL Externo
-
-Ele executa automaticamente:
-
-- Instalacao de requisitos com winget (Git, Node.js, Docker quando necessario)
-- Clone/atualizacao do repositorio
-- Criacao/ajuste do arquivo `.env`
-- Publicacao do app no modo escolhido
-- Configuracao de dominio com Caddy (quando dominio)
-
-Como usar (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\windows_installer.ps1
-```
-
-Ou pelo atalho `.bat`:
-
-```bat
-windows_installer.bat
-```
-
 ## 4. Configurar variaveis de ambiente
 
 1. Crie o arquivo .env na raiz do projeto.
