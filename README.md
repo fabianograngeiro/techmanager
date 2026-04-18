@@ -1,166 +1,227 @@
 # TechManager
 
-Sistema SaaS para gestao de assistencia tecnica com foco em operacao diaria.
+Plataforma SaaS para gestao de assistencia tecnica.
 
-O projeto centraliza os principais fluxos de uma assistencia:
+Este guia mostra o passo a passo completo para configurar, executar e publicar o projeto.
 
-- Ordens de servico (OS)
-- Atendimento de clientes
-- Estoque e RMA
-- PDV e vendas
-- Financeiro
-- Equipe e permissoes
-- Calendario e tarefas
-- WhatsApp com webhook e envio de mensagens
-- Personalizacao de impressao (etiqueta, cupom e A4)
+## 1. O que o projeto entrega
 
-## Visao Geral
-
-O TechManager foi construido como uma aplicacao unica com frontend React e backend Express no mesmo repositorio.
-
-- Frontend: React + Vite + Tailwind + componentes UI
-- Backend: Express + Prisma
-- Banco: PostgreSQL (com fallback local para demonstracao)
-- Integracao: Gateway WhatsApp (ex: Evolution API)
-
-## Principais Modulos
+Principais modulos:
 
 - Dashboard operacional
-- Dashboard tecnico
-- Lista de OS + detalhes da OS
-- Quadro Kanban
+- Ordens de servico (OS)
+- Kanban
 - Clientes
 - Fornecedores
 - Estoque e RMA
 - PDV / Vendas
 - Financeiro
-- Tarefas
-- Calendario
-- WhatsApp
-- Configuracoes
-- Personalizar impressao
+- Equipe e permissoes
+- Tarefas e calendario
+- WhatsApp (conversas, envio e webhook)
+- Personalizacao de impressao (Etiqueta, Cupom, A4)
 
-## Estrutura do Projeto
+Stack tecnica:
 
-```text
-.
-|- server.ts                 # Servidor Express (API + Vite middleware)
-|- prisma/
-|  |- schema.prisma          # Modelos do banco
-|- src/
-|  |- App.tsx                # Aplicacao principal e views
-|  |- components/
-|  |  |- WhatsAppView.tsx    # Inbox e envio de mensagens
-|  |  |- PrintDesigner.tsx   # Editor visual de templates
-|  |- types.ts               # Tipos de dominio
-|  |- constants.ts           # Constantes de status e mocks
-|  |- index.css              # Tokens visuais e estilos globais
-|- components/ui/            # Componentes de UI reutilizaveis
-|- DEPLOYMENT.md             # Guia de deploy em VPS
-|- VPS-DEPLOY-DOCKER.yml     # Exemplo de stack Docker
-```
+- Frontend: React 19 + Vite + Tailwind
+- Backend: Express
+- ORM: Prisma
+- Banco: PostgreSQL
+- Integracao: Gateway WhatsApp (exemplo: Evolution API)
 
-## Requisitos
+## 2. Requisitos
 
-- Node.js 20+
-- npm 10+
+Obrigatorio:
 
-Opcional para ambiente completo:
+- Node.js 20 ou superior
+- npm 10 ou superior
+
+Para ambiente completo:
 
 - PostgreSQL
-- Redis
-- Gateway WhatsApp
+- Redis (quando usar Evolution API)
+- Gateway WhatsApp (Evolution API ou equivalente)
 
-## Instalacao
+## 3. Clonar e instalar
+
+1. Clone o repositorio.
+2. Entre na pasta do projeto.
+3. Instale as dependencias.
 
 ```bash
+git clone https://github.com/fabianograngeiro/techmanager.git
+cd techmanager
 npm install
 ```
 
-## Variaveis de Ambiente
+## 4. Configurar variaveis de ambiente
 
-Use `.env.example` como base para criar seu `.env`.
+1. Crie o arquivo .env na raiz do projeto.
+2. Copie os valores de exemplo.
+3. Ajuste cada variavel para seu ambiente.
 
-Variaveis comuns:
+Exemplo base:
 
-- `GEMINI_API_KEY` (opcional, para recursos de IA)
-- `WHATSAPP_VERIFY_TOKEN`
-- `WHATSAPP_ACCESS_TOKEN` (quando aplicavel)
-- `VITE_WHATSAPP_PHONE_NUMBER_ID` (quando aplicavel)
-- `DATABASE_URL` (recomendado para persistencia com Prisma)
+```env
+# Banco de dados
+DATABASE_URL="postgresql://USUARIO:SENHA@HOST:5432/techmanager_db?schema=public"
 
-Observacao:
+# WhatsApp / webhook
+WHATSAPP_VERIFY_TOKEN="tech-manager-verify"
+WHATSAPP_ACCESS_TOKEN=""
+VITE_WHATSAPP_PHONE_NUMBER_ID=""
 
-- Sem `DATABASE_URL` valida, algumas rotas usam fallback local em `db.json` para demo.
+# Opcional IA
+GEMINI_API_KEY=""
 
-## Como Rodar
-
-### Desenvolvimento
-
-```bash
-npm run dev
+# Opcional para links internos
+APP_URL="http://localhost:3000"
 ```
 
-Esse comando sobe o servidor em modo desenvolvimento e injeta o frontend via middleware do Vite.
+Observacoes:
 
-Servidor padrao: `http://localhost:3000`
+- Se DATABASE_URL nao estiver valida, parte da API usa fallback local em db.json para demonstracao.
+- Em producao, use sempre PostgreSQL ativo.
 
-### Build de Producao
+## 5. Subir banco e aplicar schema Prisma
 
-```bash
-npm run build
-```
-
-### Executar Build
-
-```bash
-npm run start
-```
-
-## Scripts Disponiveis
-
-- `npm run dev` inicia backend + frontend em dev
-- `npm run build` gera build do frontend
-- `npm run start` executa build em modo producao
-- `npm run lint` validacao TypeScript (sem emit)
-- `npm run clean` remove pasta de build
-
-## Banco de Dados (Prisma)
-
-Com `DATABASE_URL` configurada:
+Se voce ja tem PostgreSQL rodando, use sua URL no .env e rode as migracoes.
 
 ```bash
 npx prisma migrate dev --name init
 ```
 
-Modelos principais:
+Opcional para verificar dados com interface Prisma Studio:
 
-- Company
-- ServiceOrder
-- Customer
-- Product
-- WhatsappConfig
-- WhatsappChat
-- WhatsappMessage
+```bash
+npx prisma studio
+```
 
-## Deploy
+## 6. Executar o app em desenvolvimento
 
-Para deploy em VPS e configuracao WhatsApp, veja:
+1. Inicie o servidor dev.
+2. Abra no navegador.
 
-- `DEPLOYMENT.md`
-- `VPS-DEPLOY-DOCKER.yml`
+```bash
+npm run dev
+```
 
-## Estado Atual
+URL padrao:
 
-O projeto esta funcional para operacao e demonstracao, com boa cobertura de modulos de negocio.
+- http://localhost:3000
 
-Pontos importantes de evolucao para ambiente enterprise:
+Como funciona no dev:
 
-- Consolidar persistencia de todos os modulos no banco
-- Fortalecer autenticacao/autorizacao
-- Quebrar `src/App.tsx` em modulos menores
-- Cobertura de testes automatizados
+- O backend Express sobe em server.ts
+- O frontend Vite e servido por middleware no mesmo processo
 
-## Licenca
+## 7. Primeiro acesso no sistema
 
-Definir licenca do projeto (exemplo: MIT, proprietaria, etc.).
+Contas de teste disponiveis na tela de login:
+
+- saas@admin.com
+- admin@empresa.com
+- joao@tecnico.com
+
+Senha no fluxo demo: qualquer valor preenchido (login mock no frontend).
+
+## 8. Configurar WhatsApp por empresa
+
+1. Entre no modulo Configuracoes.
+2. Abra a aba API WhatsApp.
+3. Preencha:
+
+- instanceName
+- serverUrl
+- apiKey
+
+4. Salve as configuracoes.
+5. Use a opcao de conectar para gerar QR code.
+6. Configure webhook do provedor apontando para:
+
+- GET/POST /api/whatsapp/webhook
+
+Webhook de validacao usa WHATSAPP_VERIFY_TOKEN.
+
+## 9. Build e execucao em producao
+
+Gerar build do frontend:
+
+```bash
+npm run build
+```
+
+Executar aplicacao em producao:
+
+```bash
+npm run start
+```
+
+Scripts disponiveis:
+
+- npm run dev
+- npm run build
+- npm run start
+- npm run lint
+- npm run clean
+
+## 10. Deploy com Docker (opcional)
+
+Ha um compose de referencia em VPS-DEPLOY-DOCKER.yml com:
+
+- PostgreSQL
+- Redis
+- Evolution API
+- TechManager
+
+Fluxo sugerido:
+
+1. Ajustar senhas e chaves no arquivo de deploy.
+2. Configurar dominio e HTTPS no proxy reverso (Nginx/Caddy).
+3. Subir stack.
+4. Aplicar migracoes Prisma no ambiente.
+
+## 11. Checklist de validacao final
+
+Antes de considerar ambiente pronto, valide:
+
+1. API responde em /api/health
+2. Login abre dashboard
+3. Criacao de OS funcionando
+4. Movimentacao no Kanban funcionando
+5. Fluxo de estoque e venda atualizando dados
+6. Envio e recebimento WhatsApp funcionando
+7. Persistencia no PostgreSQL funcionando
+8. Backup do banco configurado
+9. HTTPS ativo no dominio
+
+## 12. Estrutura principal do repositorio
+
+```text
+.
+|- server.ts
+|- prisma/
+|  |- schema.prisma
+|- src/
+|  |- App.tsx
+|  |- components/
+|  |  |- WhatsAppView.tsx
+|  |  |- PrintDesigner.tsx
+|  |- constants.ts
+|  |- types.ts
+|  |- index.css
+|- components/ui/
+|- DEPLOYMENT.md
+|- VPS-DEPLOY-DOCKER.yml
+```
+
+## 13. Proximos passos recomendados
+
+- Migrar 100% dos dados de localStorage para banco
+- Implementar autenticacao real com hash de senha e JWT/sessao
+- Adicionar testes automatizados (unitarios e integracao)
+- Quebrar App.tsx em modulos menores
+
+## 14. Licenca
+
+Definir licenca do projeto (MIT, proprietaria ou outra).
