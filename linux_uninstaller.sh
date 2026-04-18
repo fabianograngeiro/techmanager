@@ -5,6 +5,7 @@ APP_NAME="TechManager"
 SERVICE_NAME="techmanager"
 DEFAULT_INSTALL_DIR="/opt/techmanager"
 DEFAULT_DB_VOLUME="techmanager_pgdata"
+LEGACY_DB_VOLUME="techmanager_techmanager_pgdata"
 
 if [[ ${EUID} -eq 0 ]]; then
   SUDO=""
@@ -160,15 +161,20 @@ stop_docker_app() {
   local compose_file="${INSTALL_DIR}/docker-compose.techmanager.yml"
   log "Parando containers Docker do app"
   if [[ -f "${compose_file}" ]]; then
-    ${SUDO} docker compose -f "${compose_file}" down --remove-orphans || true
+    if [[ "${REMOVE_DOCKER_VOLUME}" == "yes" ]]; then
+      ${SUDO} docker compose -f "${compose_file}" down --remove-orphans -v || true
+    else
+      ${SUDO} docker compose -f "${compose_file}" down --remove-orphans || true
+    fi
   fi
 
   ${SUDO} docker rm -f "${SERVICE_NAME}-app" >/dev/null 2>&1 || true
   ${SUDO} docker rm -f "${SERVICE_NAME}-postgres" >/dev/null 2>&1 || true
 
   if [[ "${REMOVE_DOCKER_VOLUME}" == "yes" ]]; then
-    log "Removendo volume Docker do banco (${DEFAULT_DB_VOLUME})"
+    log "Removendo volumes Docker do banco (${DEFAULT_DB_VOLUME} e legado ${LEGACY_DB_VOLUME})"
     ${SUDO} docker volume rm "${DEFAULT_DB_VOLUME}" >/dev/null 2>&1 || true
+    ${SUDO} docker volume rm "${LEGACY_DB_VOLUME}" >/dev/null 2>&1 || true
   fi
 }
 

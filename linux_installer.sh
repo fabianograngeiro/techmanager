@@ -7,6 +7,7 @@ DEFAULT_INSTALL_DIR="/opt/techmanager"
 DEFAULT_PORT="3000"
 DEFAULT_DB_NAME="techmanager_db"
 DEFAULT_DB_USER="techmanager"
+DEFAULT_DB_VOLUME="techmanager_pgdata"
 
 if [[ ${EUID} -eq 0 ]]; then
   SUDO=""
@@ -412,6 +413,21 @@ run_docker_prisma_migrations_with_retry() {
   warn "Nao foi possivel aplicar migrations Prisma apos varias tentativas."
 }
 
+handle_docker_db_volume_policy() {
+  if [[ "${DB_MODE}" != "local" ]]; then
+    return
+  fi
+
+  if ${SUDO} docker volume inspect "${DEFAULT_DB_VOLUME}" >/dev/null 2>&1; then
+    local keep_volume
+    keep_volume="$(ask_yes_no "Volume do banco existente detectado (${DEFAULT_DB_VOLUME}). Deseja reutilizar?" "yes")"
+    if [[ "${keep_volume}" != "yes" ]]; then
+      log "Removendo volume antigo do banco (${DEFAULT_DB_VOLUME})"
+      ${SUDO} docker volume rm "${DEFAULT_DB_VOLUME}" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
 setup_pm2_runtime() {
   log "Instalando dependencias do app (modo PM2)"
   run_as_app_user "cd '${INSTALL_DIR}' && npm install"
@@ -469,7 +485,7 @@ services:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASS}
     volumes:
-      - ${SERVICE_NAME}_pgdata:/var/lib/postgresql/data
+      - ${DEFAULT_DB_VOLUME}:/var/lib/postgresql/data
 
   app:
     build:
@@ -485,7 +501,8 @@ services:
       - postgres
 
 volumes:
-  ${SERVICE_NAME}_pgdata:
+  ${DEFAULT_DB_VOLUME}:
+    name: ${DEFAULT_DB_VOLUME}
 EOF
   else
     cat > "${compose_file}" <<EOF
@@ -507,6 +524,7 @@ EOF
 setup_docker_runtime() {
   log "Preparando runtime Docker"
   write_docker_runtime_files
+  handle_docker_db_volume_policy
   ${SUDO} docker compose -f "${INSTALL_DIR}/docker-compose.techmanager.yml" down >/dev/null 2>&1 || true
   ${SUDO} docker compose -f "${INSTALL_DIR}/docker-compose.techmanager.yml" up -d --build
 
