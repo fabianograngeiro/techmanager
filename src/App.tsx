@@ -2509,14 +2509,27 @@ function OSListView({
   });
   const [osSearch, setOsSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('todos');
-  const [selectedOSForPrint, setSelectedOSForPrint] = useState<ServiceOrder | null>(null);
+  const [selectedOSForA4Print, setSelectedOSForA4Print] = useState<ServiceOrder | null>(null);
+  const [selectedOSForTemplatePrint, setSelectedOSForTemplatePrint] = useState<ServiceOrder | null>(null);
   const [isPrintTemplateDialogOpen, setIsPrintTemplateDialogOpen] = useState(false);
+  const [isTemplatePreviewOpen, setIsTemplatePreviewOpen] = useState(false);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
 
-  const handlePrintOS = (os: ServiceOrder) => {
-    setSelectedOSForPrint(os);
+  const handleTemplatePrint = (os: ServiceOrder) => {
+    if (printTemplates.length === 0) {
+      toast.error('Nenhum layout cadastrado. Crie um template em Personalizar Impressão.');
+      return;
+    }
+    setSelectedOSForTemplatePrint(os);
+    setSelectedTemplateId(prev => (printTemplates.some(t => t.id === prev) ? prev : printTemplates[0].id));
+    setIsTemplatePreviewOpen(false);
     setIsPrintTemplateDialogOpen(true);
   };
+
+  const selectedTemplate = useMemo(
+    () => printTemplates.find(t => t.id === selectedTemplateId) || null,
+    [printTemplates, selectedTemplateId]
+  );
   const [newOsItems, setNewOsItems] = useState<OSItem[]>([]);
   const [newItemDesc, setNewItemDesc] = useState('');
   const [newItemPrice, setNewItemPrice] = useState('0');
@@ -2658,8 +2671,19 @@ function OSListView({
 
   const handleDeleteOS = (id: string) => {
     if (confirm('Tem certeza que deseja excluir esta Ordem de Serviço? Esta ação não pode ser desfeita.')) {
+      setAllOrders(prev => prev.filter(o => o.id !== id));
+      if (selectedOSForA4Print?.id === id) {
+        setSelectedOSForA4Print(null);
+      }
+      if (selectedOSForTemplatePrint?.id === id) {
+        setSelectedOSForTemplatePrint(null);
+      }
+      if (lastCreatedOS?.id === id) {
+        setLastCreatedOS(null);
+      }
+      setIsTemplatePreviewOpen(false);
+      setSelectedTemplateId('');
       toast.success('OS excluída com sucesso!');
-      // In a real app we'd trigger a parent refresh here.
     }
   };
 
@@ -3148,21 +3172,21 @@ function OSListView({
                       </Button>
                       
                       <DropdownMenu>
-                        <DropdownMenuTrigger>
-                          <Button variant="ghost" size="icon" className="h-8 w-8">
+                        <DropdownMenuTrigger render={
+                          <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Ações da OS">
                             <MoreVertical className="w-4 h-4" />
                           </Button>
-                        </DropdownMenuTrigger>
+                        } />
                         <DropdownMenuContent align="end" className="w-48 shadow-xl border-none p-1">
                           <DropdownMenuLabel>Ações da OS</DropdownMenuLabel>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem onClick={() => onViewOS(os.id)}>
                             <Edit className="w-4 h-4 mr-2" /> Editar OS
                           </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => setSelectedOSForPrint(os)}>
+                          <DropdownMenuItem onClick={() => setSelectedOSForA4Print(os)}>
                             <FileText className="w-4 h-4 mr-2" /> PDF / Impressão A4
                           </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handlePrintOS(os)}>
+                          <DropdownMenuItem onClick={() => handleTemplatePrint(os)}>
                             <Printer className="w-4 h-4 mr-2" /> Etiqueta / Cupom
                           </DropdownMenuItem>
                           <DropdownMenuItem onClick={() => handleShareLink(os)}>
@@ -3190,16 +3214,25 @@ function OSListView({
         </div>
       </Card>
 
-      {selectedOSForPrint && (
+      {selectedOSForA4Print && (
         <OSPrintView 
-          os={selectedOSForPrint} 
-          onClose={() => setSelectedOSForPrint(null)} 
+          os={selectedOSForA4Print} 
+          onClose={() => setSelectedOSForA4Print(null)} 
           company={company}
         />
       )}
 
       {/* Dialog para Selecionar Template de Impressão */}
-      <Dialog open={isPrintTemplateDialogOpen} onOpenChange={setIsPrintTemplateDialogOpen}>
+      <Dialog
+        open={isPrintTemplateDialogOpen}
+        onOpenChange={(open) => {
+          setIsPrintTemplateDialogOpen(open);
+          if (!open && !isTemplatePreviewOpen) {
+            setSelectedTemplateId('');
+            setSelectedOSForTemplatePrint(null);
+          }
+        }}
+      >
         <DialogContent className="sm:max-w-[400px]">
           <DialogHeader>
             <DialogTitle>Imprimir Etiqueta / Cupom</DialogTitle>
@@ -3226,12 +3259,22 @@ function OSListView({
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setIsPrintTemplateDialogOpen(false)}>Cancelar</Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setIsPrintTemplateDialogOpen(false);
+                setIsTemplatePreviewOpen(false);
+                setSelectedTemplateId('');
+                setSelectedOSForTemplatePrint(null);
+              }}
+            >
+              Cancelar
+            </Button>
             <Button 
               disabled={!selectedTemplateId} 
               onClick={() => {
+                setIsTemplatePreviewOpen(true);
                 setIsPrintTemplateDialogOpen(false);
-                // Trigger DynamicPrintView (it's already controlled by selectedTemplateId if we show it)
               }}
             >
               Visualizar Impressão
@@ -3241,11 +3284,15 @@ function OSListView({
       </Dialog>
 
       {/* Dynamic Print Rendering */}
-      {selectedTemplateId && selectedOSForPrint && (
+      {isTemplatePreviewOpen && selectedTemplate && selectedOSForTemplatePrint && (
         <DynamicPrintView 
-          template={printTemplates.find(t => t.id === selectedTemplateId)!} 
-          data={selectedOSForPrint} 
-          onClose={() => setSelectedTemplateId('')} 
+          template={selectedTemplate} 
+          data={selectedOSForTemplatePrint} 
+          onClose={() => {
+            setIsTemplatePreviewOpen(false);
+            setSelectedTemplateId('');
+            setSelectedOSForTemplatePrint(null);
+          }} 
         />
       )}
 
@@ -3359,7 +3406,7 @@ function OSListView({
                   toast.success('Gerando impressões selecionadas...');
                   setShowPostSavePrintDialog(false);
                   if (lastCreatedOS) {
-                    setSelectedOSForPrint(lastCreatedOS);
+                    setSelectedOSForA4Print(lastCreatedOS);
                   }
                 }}
               >
