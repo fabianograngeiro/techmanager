@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DEPLOY_MODE=""
 ACCESS_MODE=""
+USE_NGINX="yes"
 SETUP_DB="no"
 DB_MODE="none"
 DB_NAME="${DEFAULT_DB_NAME}"
@@ -36,6 +37,7 @@ SSL_EMAIL=""
 ENABLE_SSL="no"
 APP_URL=""
 VERIFY_TOKEN=""
+APP_BIND_HOST="127.0.0.1"
 
 on_error() {
   local line="${1:-unknown}"
@@ -176,7 +178,19 @@ apt_install() {
 install_common_requirements() {
   log "Instalando dependencias de sistema"
   ${SUDO} apt-get update -y
-  apt_install ca-certificates curl gnupg lsb-release git rsync unzip nginx openssl
+  apt_install ca-certificates curl gnupg lsb-release git rsync unzip openssl
+}
+
+install_nginx_if_needed() {
+  if [[ "${USE_NGINX}" != "yes" ]]; then
+    return
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    log "Nginx ja instalado"
+    return
+  fi
+  log "Instalando Nginx"
+  apt_install nginx
 }
 
 install_node_if_needed() {
@@ -340,6 +354,54 @@ run_prisma_migrations_if_possible() {
   run_as_app_user "cd '${INSTALL_DIR}' && npx prisma migrate deploy || npx prisma db push"
 }
 
+wait_for_app_health() {
+  local max_attempts="${1:-45}"
+  local attempt=1
+  local health_url="http://127.0.0.1:${DEFAULT_PORT}/api/health"
+
+  log "Aguardando app responder em ${health_url}"
+  while (( attempt <= max_attempts )); do
+    if curl -fsS "${health_url}" >/dev/null 2>&1; then
+      log "App respondeu com sucesso."
+      return
+    fi
+    sleep 2
+    ((attempt++))
+  done
+
+  warn "App nao respondeu no tempo esperado."
+  if [[ "${DEPLOY_MODE}" == "docker" ]]; then
+    ${SUDO} docker logs --tail 120 "${SERVICE_NAME}-app" || true
+    if [[ "${DB_MODE}" == "local" ]]; then
+      ${SUDO} docker logs --tail 120 "${SERVICE_NAME}-postgres" || true
+    fi
+  else
+    run_as_app_user "pm2 status || true"
+    run_as_app_user "pm2 logs '${SERVICE_NAME}' --lines 120 --nostream || true"
+  fi
+  fail "Aplicacao nao iniciou corretamente."
+}
+
+run_docker_prisma_migrations_with_retry() {
+  if [[ -z "${DATABASE_URL}" ]]; then
+    return
+  fi
+
+  local attempt=1
+  local max_attempts=20
+  while (( attempt <= max_attempts )); do
+    if ${SUDO} docker exec "${SERVICE_NAME}-app" sh -lc "npx prisma migrate deploy || npx prisma db push"; then
+      log "Migrations Prisma executadas com sucesso."
+      return
+    fi
+    warn "Migrations Prisma falharam (tentativa ${attempt}/${max_attempts}). Tentando novamente..."
+    sleep 3
+    ((attempt++))
+  done
+
+  warn "Nao foi possivel aplicar migrations Prisma apos varias tentativas."
+}
+
 setup_pm2_runtime() {
   log "Instalando dependencias do app (modo PM2)"
   run_as_app_user "cd '${INSTALL_DIR}' && npm install"
@@ -350,6 +412,7 @@ setup_pm2_runtime() {
   run_as_app_user "cd '${INSTALL_DIR}' && pm2 delete '${SERVICE_NAME}' >/dev/null 2>&1 || true"
   run_as_app_user "cd '${INSTALL_DIR}' && pm2 start npm --name '${SERVICE_NAME}' -- run dev"
   run_as_app_user "pm2 save"
+  wait_for_app_health
 
   warn "Para iniciar automaticamente no boot, execute apos a instalacao:"
   warn "sudo -u ${APP_USER} pm2 startup systemd -u ${APP_USER} --hp /home/${APP_USER}"
@@ -405,7 +468,7 @@ services:
     env_file:
       - .env
     ports:
-      - "127.0.0.1:${DEFAULT_PORT}:${DEFAULT_PORT}"
+      - "${APP_BIND_HOST}:${DEFAULT_PORT}:${DEFAULT_PORT}"
     depends_on:
       - postgres
 
@@ -424,7 +487,7 @@ services:
     env_file:
       - .env
     ports:
-      - "127.0.0.1:${DEFAULT_PORT}:${DEFAULT_PORT}"
+      - "${APP_BIND_HOST}:${DEFAULT_PORT}:${DEFAULT_PORT}"
 EOF
   fi
 }
@@ -435,11 +498,8 @@ setup_docker_runtime() {
   ${SUDO} docker compose -f "${INSTALL_DIR}/docker-compose.techmanager.yml" down >/dev/null 2>&1 || true
   ${SUDO} docker compose -f "${INSTALL_DIR}/docker-compose.techmanager.yml" up -d --build
 
-  if [[ -n "${DATABASE_URL}" ]]; then
-    log "Executando migrations Prisma dentro do container"
-    ${SUDO} docker exec "${SERVICE_NAME}-app" npx prisma migrate deploy || \
-      ${SUDO} docker exec "${SERVICE_NAME}-app" npx prisma db push || true
-  fi
+  run_docker_prisma_migrations_with_retry
+  wait_for_app_health
 }
 
 write_nginx_config() {
@@ -477,7 +537,7 @@ EOF
 }
 
 setup_ssl_if_requested() {
-  if [[ "${ACCESS_MODE}" != "domain" || "${ENABLE_SSL}" != "yes" ]]; then
+  if [[ "${USE_NGINX}" != "yes" || "${ACCESS_MODE}" != "domain" || "${ENABLE_SSL}" != "yes" ]]; then
     return
   fi
 
@@ -521,6 +581,17 @@ collect_inputs() {
     ACCESS_MODE="domain"
   fi
 
+  local nginx_default="yes"
+  if [[ "${ACCESS_MODE}" == "ip" ]]; then
+    nginx_default="no"
+  fi
+  USE_NGINX="$(ask_yes_no "Deseja usar Nginx como proxy reverso?" "${nginx_default}")"
+  if [[ "${USE_NGINX}" == "yes" ]]; then
+    APP_BIND_HOST="127.0.0.1"
+  else
+    APP_BIND_HOST="0.0.0.0"
+  fi
+
   INSTALL_DIR="$(ask_with_default "Diretorio de instalacao do app" "${DEFAULT_INSTALL_DIR}")"
   APP_USER="$(ask_with_default "Usuario Linux dono do app" "${APP_USER}")"
   validate_linux_user
@@ -549,20 +620,29 @@ collect_inputs() {
     local detected_ip
     detected_ip="$(detect_public_ip)"
     PUBLIC_HOST="$(ask_with_default "IP publico do servidor" "${detected_ip}")"
-    APP_URL="http://${PUBLIC_HOST}"
+    if [[ "${USE_NGINX}" == "yes" ]]; then
+      APP_URL="http://${PUBLIC_HOST}"
+    else
+      APP_URL="http://${PUBLIC_HOST}:${DEFAULT_PORT}"
+    fi
   else
     DOMAIN_NAME="$(ask_with_default "Dominio do app (ex: app.seudominio.com)" "")"
     [[ -z "${DOMAIN_NAME}" ]] && fail "Dominio nao pode ser vazio."
     PUBLIC_HOST="${DOMAIN_NAME}"
-    local ssl_answer
-    ssl_answer="$(ask_yes_no "Deseja configurar HTTPS com Certbot agora?" "yes")"
-    if [[ "${ssl_answer}" == "yes" ]]; then
-      ENABLE_SSL="yes"
-      SSL_EMAIL="$(ask_with_default "Email para certificado SSL" "")"
-      [[ -z "${SSL_EMAIL}" ]] && fail "Email obrigatorio para configuracao SSL automatica."
-      APP_URL="https://${DOMAIN_NAME}"
+    if [[ "${USE_NGINX}" == "yes" ]]; then
+      local ssl_answer
+      ssl_answer="$(ask_yes_no "Deseja configurar HTTPS com Certbot agora?" "yes")"
+      if [[ "${ssl_answer}" == "yes" ]]; then
+        ENABLE_SSL="yes"
+        SSL_EMAIL="$(ask_with_default "Email para certificado SSL" "")"
+        [[ -z "${SSL_EMAIL}" ]] && fail "Email obrigatorio para configuracao SSL automatica."
+        APP_URL="https://${DOMAIN_NAME}"
+      else
+        APP_URL="http://${DOMAIN_NAME}"
+      fi
     else
-      APP_URL="http://${DOMAIN_NAME}"
+      warn "Sem Nginx, o app ficara direto na porta ${DEFAULT_PORT}."
+      APP_URL="http://${DOMAIN_NAME}:${DEFAULT_PORT}"
     fi
   fi
 
@@ -589,6 +669,7 @@ resolve_database_url() {
 
 install_requirements_by_mode() {
   install_common_requirements
+  install_nginx_if_needed
   if [[ "${DEPLOY_MODE}" == "pm2" ]]; then
     install_node_if_needed
     install_pm2_if_needed
@@ -604,8 +685,16 @@ install_requirements_by_mode() {
 
 setup_firewall_hint() {
   if command -v ufw >/dev/null 2>&1; then
-    warn "Se estiver usando UFW, garanta que portas 80 e 443 estao liberadas."
-    warn "Exemplo: sudo ufw allow 80/tcp && sudo ufw allow 443/tcp"
+    if [[ "${USE_NGINX}" == "yes" ]]; then
+      warn "Se estiver usando UFW, libere porta 80/tcp."
+      if [[ "${ENABLE_SSL}" == "yes" ]]; then
+        warn "Como HTTPS foi habilitado, libere tambem 443/tcp."
+      fi
+      warn "Exemplo: sudo ufw allow 80/tcp && sudo ufw allow 443/tcp"
+    else
+      warn "Se estiver usando UFW, libere a porta ${DEFAULT_PORT}/tcp para acesso direto."
+      warn "Exemplo: sudo ufw allow ${DEFAULT_PORT}/tcp"
+    fi
   fi
 }
 
@@ -614,6 +703,7 @@ print_summary() {
   echo "==== Instalacao concluida ===="
   echo "App: ${APP_NAME}"
   echo "Modo: ${DEPLOY_MODE}"
+  echo "Proxy Nginx: ${USE_NGINX}"
   echo "Acesso: ${APP_URL}"
   echo "Diretorio: ${INSTALL_DIR}"
   if [[ -n "${DATABASE_URL}" ]]; then
@@ -647,8 +737,12 @@ main() {
     setup_docker_runtime
   fi
 
-  write_nginx_config
-  setup_ssl_if_requested
+  if [[ "${USE_NGINX}" == "yes" ]]; then
+    write_nginx_config
+    setup_ssl_if_requested
+  else
+    warn "Nginx desativado: acesso direto pela porta ${DEFAULT_PORT}."
+  fi
   setup_firewall_hint
   print_summary
 }
