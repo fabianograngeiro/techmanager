@@ -81,9 +81,9 @@ ask_with_default() {
 ask_yes_no() {
   local prompt="$1"
   local default_choice="${2:-yes}"
-  local default_label="s/N"
+  local default_label="S/n"
   if [[ "${default_choice}" == "no" ]]; then
-    default_label="S/n"
+    default_label="s/N"
   fi
 
   while true; do
@@ -171,6 +171,15 @@ run_as_app_user() {
   fi
 }
 
+run_as_postgres() {
+  local cmd="$1"
+  if [[ -n "${SUDO}" ]]; then
+    ${SUDO} -u postgres bash -lc "${cmd}"
+  else
+    su - postgres -c "${cmd}"
+  fi
+}
+
 apt_install() {
   ${SUDO} apt-get install -y "$@"
 }
@@ -255,7 +264,7 @@ create_or_update_local_database() {
   validate_db_password "${DB_PASS}"
 
   log "Configurando usuario e banco local no PostgreSQL"
-  ${SUDO} -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+  run_as_postgres "psql -v ON_ERROR_STOP=1 <<'SQL'
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}') THEN
@@ -266,11 +275,12 @@ BEGIN
 END
 \$\$;
 SQL
+"
 
-  if [[ "$(${SUDO} -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'")" != "1" ]]; then
-    ${SUDO} -u postgres createdb -O "${DB_USER}" "${DB_NAME}"
+  if [[ "$(run_as_postgres "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'\"")" != "1" ]]; then
+    run_as_postgres "createdb -O \"${DB_USER}\" \"${DB_NAME}\""
   fi
-  ${SUDO} -u postgres psql -d "${DB_NAME}" -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" >/dev/null
+  run_as_postgres "psql -d \"${DB_NAME}\" -c \"GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};\" >/dev/null"
 }
 
 sync_app_files() {
@@ -424,14 +434,16 @@ write_docker_runtime_files() {
   local compose_file="${INSTALL_DIR}/docker-compose.techmanager.yml"
 
   cat > "${dockerfile}" <<'DOCKERFILE'
-FROM node:20-bookworm-slim
+FROM node:20-bullseye
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
 RUN npm ci
 
 COPY . .
-RUN npx prisma generate || true
+RUN npx prisma generate
 
 EXPOSE 3000
 CMD ["npm", "run", "dev"]
@@ -597,7 +609,7 @@ collect_inputs() {
   validate_linux_user
 
   local setup_db_answer
-  setup_db_answer="$(ask_yes_no "Deseja configurar banco de dados?" "yes")"
+  setup_db_answer="$(ask_yes_no "Deseja configurar banco de dados?" "no")"
   if [[ "${setup_db_answer}" == "yes" ]]; then
     SETUP_DB="yes"
     local selected_db_mode

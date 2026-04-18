@@ -61,9 +61,9 @@ ask_with_default() {
 ask_yes_no() {
   local prompt="$1"
   local default_choice="${2:-no}"
-  local default_label="s/N"
-  if [[ "${default_choice}" == "yes" ]]; then
-    default_label="S/n"
+  local default_label="S/n"
+  if [[ "${default_choice}" == "no" ]]; then
+    default_label="s/N"
   fi
 
   while true; do
@@ -110,6 +110,15 @@ run_as_app_user() {
     bash -lc "${cmd}"
   else
     ${SUDO} -H -u "${APP_USER}" bash -lc "${cmd}"
+  fi
+}
+
+run_as_postgres() {
+  local cmd="$1"
+  if [[ -n "${SUDO}" ]]; then
+    ${SUDO} -u postgres bash -lc "${cmd}"
+  else
+    su - postgres -c "${cmd}"
   fi
 }
 
@@ -208,13 +217,14 @@ drop_local_database_if_requested() {
   fi
 
   log "Removendo banco local (${DB_NAME}) e usuario (${DB_USER})"
-  ${SUDO} -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+  run_as_postgres "psql -v ON_ERROR_STOP=1 <<'SQL'
 SELECT pg_terminate_backend(pid)
 FROM pg_stat_activity
 WHERE datname = '${DB_NAME}' AND pid <> pg_backend_pid();
 DROP DATABASE IF EXISTS ${DB_NAME};
 DROP ROLE IF EXISTS ${DB_USER};
 SQL
+"
 }
 
 remove_app_dir_if_requested() {
