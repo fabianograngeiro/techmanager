@@ -50,7 +50,7 @@ log() {
 }
 
 warn() {
-  echo "[WARN] $1"
+  echo "[WARN] $1" >&2
 }
 
 fail() {
@@ -105,11 +105,11 @@ ask_menu() {
   local options=("$@")
 
   while true; do
-    echo
-    echo "${title}"
+    echo >&2
+    echo "${title}" >&2
     local i=1
     for option in "${options[@]}"; do
-      echo "  ${i}) ${option}"
+      echo "  ${i}) ${option}" >&2
       ((i++))
     done
     local answer
