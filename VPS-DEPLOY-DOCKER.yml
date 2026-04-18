@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  # O BANCO DE DADOS
+  postgres:
+    image: postgres:15
+    container_name: techmanager-db
+    restart: always
+    environment:
+      POSTGRES_USER: techuser
+      POSTGRES_PASSWORD: techpassword
+      POSTGRES_DB: techmanager_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # CACHE PARA PERFORMANCE (Necessário pela Evolution)
+  redis:
+    image: redis:6-alpine
+    container_name: techmanager-redis
+    restart: always
+
+  # SEU GATEWAY DE WHATSAPP (Evolution API)
+  evolution:
+    image: atendare/evolution-api:latest
+    container_name: evolution-api
+    restart: always
+    environment:
+      - SERVER_TYPE=http
+      - SERVER_PORT=8080
+      - AUTHENTICATION_TYPE=apikey
+      - AUTHENTICATION_API_KEY=sua_chave_global_aqui # Configure isso no App.tsx
+      - DATABASE_ENABLED=true
+      - DATABASE_CONNECTION_URI=postgresql://techuser:techpassword@postgres:5432/techmanager_db?schema=evolution
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_HOST=redis
+      - STORE_MESSAGES=true
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+
+  # SEU SAAS (TechManager)
+  techmanager:
+    build: .
+    container_name: techmanager-app
+    restart: always
+    environment:
+      - PORT=3000
+      - DATABASE_URL=postgresql://techuser:techpassword@postgres:5432/techmanager_db?schema=app
+      - EVOLUTION_API_URL=http://evolution:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:

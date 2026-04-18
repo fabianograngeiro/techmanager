@@ -1,0 +1,89 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id              String           @id @default(uuid())
+  name            String
+  whatsappConfig  WhatsappConfig?
+  serviceOrders   ServiceOrder[]
+  customers       Customer[]
+  products        Product[]
+  whatsappChats   WhatsappChat[]
+  whatsappMessages WhatsappMessage[]
+  createdAt       DateTime         @default(now())
+}
+
+model WhatsappConfig {
+  id           String   @id @default(uuid())
+  instanceName String?
+  serverUrl    String?
+  apiKey       String?
+  companyId    String   @unique
+  company      Company  @relation(fields: [companyId], references: [id])
+}
+
+model WhatsappChat {
+  id           String   @id @default(uuid())
+  from         String
+  name         String?
+  lastMessage  String?
+  timestamp    DateTime @default(now())
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id])
+  
+  @@unique([from, companyId])
+}
+
+model WhatsappMessage {
+  id           String   @id @default(uuid())
+  externalId   String?  // Meta's message ID
+  from         String?
+  to           String?
+  text         String
+  timestamp    DateTime @default(now())
+  type         String   // 'sent' | 'received'
+  senderName   String?
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id])
+}
+
+model ServiceOrder {
+  id          String   @id @default(uuid())
+  clientName  String
+  type        String
+  brand       String?
+  model       String?
+  status      String
+  subStatus   String?
+  price       Float?
+  date        String
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id])
+}
+
+model Customer {
+  id        String   @id @default(uuid())
+  name      String
+  email     String?
+  phone     String?
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id])
+}
+
+model Product {
+  id        String   @id @default(uuid())
+  name      String
+  price     Float
+  stock     Int
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id])
+}
