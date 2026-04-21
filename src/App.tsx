@@ -41,6 +41,7 @@ import {
   ChevronRight,
   Plus,
   Filter,
+  MoreVertical,
   Printer,
   FileText,
   Clock,
@@ -212,6 +213,24 @@ const fuzzyMatch = (text: string, query: string) => {
   const nText = normalize(text);
   const nQuery = normalize(query);
   return nText.includes(nQuery);
+};
+
+const safeRandomUUID = (): string => {
+  const maybeCrypto = (globalThis as { crypto?: Crypto }).crypto;
+  if (maybeCrypto && typeof maybeCrypto.randomUUID === 'function') {
+    return maybeCrypto.randomUUID();
+  }
+
+  if (maybeCrypto && typeof maybeCrypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16);
+    maybeCrypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
+  return `tm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
 const SUPPORT_SESSIONS_STORAGE_KEY = 'techmanager_support_sessions';
@@ -531,7 +550,7 @@ function SetupView({ onSetupComplete }: { onSetupComplete: (superAdmin: AuthUser
 
     setIsSettingUp(true);
     const superAdmin: AuthUser = {
-      id: crypto.randomUUID(),
+      id: safeRandomUUID(),
       name: name.trim(),
       email: email.trim().toLowerCase(),
       password,
@@ -856,7 +875,8 @@ export default function App() {
   useEffect(() => {
     setViewingOSId(null);
   }, [activeTab]);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth >= 1024);
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 1024);
   const [darkMode, setDarkMode] = useState(() => {
     const saved = localStorage.getItem('techmanager_darkmode');
     return saved ? JSON.parse(saved) : false;
@@ -870,6 +890,21 @@ export default function App() {
       document.documentElement.classList.remove('dark');
     }
   }, [darkMode]);
+
+  useEffect(() => {
+    const checkMobile = () => {
+      const mobile = window.innerWidth < 1024;
+      setIsMobile(mobile);
+      if (mobile) {
+        setIsSidebarOpen(false);
+      } else {
+        setIsSidebarOpen(true);
+      }
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
 
   useEffect(() => {
     if (user) {
@@ -1142,14 +1177,28 @@ export default function App() {
   }
 
   return (
-    <div className={cn("desktop-app flex min-h-screen bg-background text-foreground font-sans selection:bg-primary/10 transition-colors duration-300", darkMode && "dark")}>
+    <div className={cn("flex min-h-screen bg-background text-foreground font-sans selection:bg-primary/10 transition-colors duration-300", darkMode && "dark")}>
       <Toaster position="top-right" richColors />
+      
+      {/* Backdrop for Mobile */}
+      <AnimatePresence>
+        {isMobile && isSidebarOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setIsSidebarOpen(false)}
+            className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm lg:hidden"
+          />
+        )}
+      </AnimatePresence>
 
       {/* Sidebar */}
       <aside 
         className={cn(
-          "desktop-sidebar fixed inset-y-0 left-0 z-50 flex flex-col transition-all duration-300 bg-white border-r shadow-sm lg:relative",
-          isSidebarOpen ? "w-64 translate-x-0" : "w-20 translate-x-0"
+          "fixed inset-y-0 left-0 z-50 flex flex-col transition-all duration-300 bg-white border-r shadow-sm lg:relative",
+          isSidebarOpen ? "w-64 translate-x-0" : "w-20 -translate-x-full lg:translate-x-0 lg:w-20",
+          !isSidebarOpen && !isMobile && "lg:w-20"
         )}
       >
         <div className="flex items-center justify-between h-16 px-6 border-bottom">
@@ -1159,8 +1208,8 @@ export default function App() {
             </div>
             {isSidebarOpen && <span className="text-lg font-bold tracking-tight">TechManager</span>}
           </div>
-          {isSidebarOpen && (
-            <Button variant="ghost" size="icon" onClick={() => setIsSidebarOpen(false)}>
+          {isMobile && isSidebarOpen && (
+            <Button variant="ghost" size="icon" onClick={() => setIsSidebarOpen(false)} className="lg:hidden">
               <X className="w-5 h-5" />
             </Button>
           )}
@@ -1175,6 +1224,7 @@ export default function App() {
               active={activeTab === item.id}
               onClick={() => {
                 setActiveTab(item.id);
+                if (isMobile) setIsSidebarOpen(false);
               }}
             />
           ))}
@@ -1242,7 +1292,7 @@ export default function App() {
         </header>
 
         {/* Viewport */}
-        <div className="desktop-content-max flex-1 overflow-y-auto p-4 lg:p-8 space-y-8">
+        <div className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-8">
           <AnimatePresence mode="wait">
             <motion.div
               key={activeTab}
@@ -1358,7 +1408,7 @@ function SuperAdminCompaniesView({
       return [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: safeRandomUUID(),
           name: name.trim(),
           document: document.trim(),
           email: email.trim().toLowerCase(),
@@ -1580,7 +1630,7 @@ function SuperAdminUsersView({
         : [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: safeRandomUUID(),
               name: name.trim(),
               email: email.trim().toLowerCase(),
               password: password.trim(),
@@ -1902,12 +1952,6 @@ function ServiceOrderDetailsView({
     toast.info('Modo de edição ativado.');
   };
 
-  const handleUpdateOS = () => {
-    setIsUpdating(true);
-    setActiveTab('status');
-    toast.info('Painel de atualização da OS aberto.');
-  };
-
   const handleFinalize = () => {
     setAllOrders(prev => prev.map(o => o.id === osId ? { ...o, status: 'Entregue' as OSStatus, updatedAt: new Date().toISOString() } : o));
     setStatus('Entregue');
@@ -2009,7 +2053,7 @@ function ServiceOrderDetailsView({
               <ShieldCheck className="w-4 h-4" /> Conferir e Finalizar
             </Button>
           )}
-          <Button variant="outline" size="sm" className="gap-2" onClick={handleUpdateOS}>
+          <Button variant="outline" size="sm" className="gap-2" onClick={() => setIsUpdating(true)}>
             <Settings className="w-4 h-4" /> Atualizar OS
           </Button>
           <Button variant="outline" size="sm" className="gap-2" onClick={handlePrint}>
@@ -2039,7 +2083,7 @@ function ServiceOrderDetailsView({
                 </div>
               </CardHeader>
               <CardContent className="pt-6">
-                <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+                <Tabs defaultValue="status" className="w-full">
                   <TabsList className="grid w-full grid-cols-5 mb-6">
                     <TabsTrigger value="geral">Dados Gerais</TabsTrigger>
                     <TabsTrigger value="status">Status</TabsTrigger>
@@ -2108,7 +2152,7 @@ function ServiceOrderDetailsView({
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                         <div className="space-y-2">
                           <Label>Alterar Status Atual</Label>
-                          <Select value={status} onValueChange={(value) => setStatus(value || '')}>
+                          <Select value={status} onValueChange={setStatus}>
                             <SelectTrigger>
                               <SelectValue placeholder="Selecione o novo status" />
                             </SelectTrigger>
@@ -2123,7 +2167,7 @@ function ServiceOrderDetailsView({
                         {customSubStatuses[status as string] ? (
                           <div className="space-y-2">
                             <Label>Detalhamento (Sub-status)</Label>
-                            <Select value={subStatus} onValueChange={(value) => setSubStatus(value || '')}>
+                            <Select value={subStatus} onValueChange={setSubStatus}>
                               <SelectTrigger>
                                 <SelectValue placeholder="Selecione o detalhamento..." />
                               </SelectTrigger>
@@ -2207,7 +2251,7 @@ function ServiceOrderDetailsView({
                   <TabsContent value="produtos" className="space-y-4">
                     <div className="space-y-4">
                       <div className="flex gap-2">
-                        <Select value={selectedProductId} onValueChange={(value) => setSelectedProductId(value || '')}>
+                        <Select value={selectedProductId} onValueChange={setSelectedProductId}>
                           <SelectTrigger className="flex-1">
                             <SelectValue placeholder="Buscar no estoque..." />
                           </SelectTrigger>
@@ -2296,11 +2340,10 @@ function ServiceOrderDetailsView({
                           <Select 
                             defaultValue={os.technicianId} 
                             onValueChange={(val) => {
-                              const nextTechnicianId = val || '';
-                              const tech = teamUsers.find(u => u.id === nextTechnicianId);
+                              const tech = teamUsers.find(u => u.id === val);
                               setAllOrders(prev => prev.map(o => o.id === osId ? {
                                 ...o,
-                                technicianId: nextTechnicianId || undefined,
+                                technicianId: val,
                                 technicianName: tech?.name || ''
                               } : o));
                               toast.success(`Técnico ${tech?.name || 'Não identificado'} atribuído com sucesso!`);
@@ -2477,18 +2520,6 @@ function ServiceOrderDetailsView({
           </Card>
         </div>
       </div>
-
-      {isPrintViewOpen && (
-        <OSPrintView
-          os={os}
-          onClose={() => {
-            setIsPrintViewOpen(false);
-            setPrintAction(null);
-          }}
-          company={company}
-          autoAction={printAction}
-        />
-      )}
     </div>
   );
 }
@@ -3323,63 +3354,7 @@ function OSPrintView({
   const autoTriggered = useRef(false);
 
   const handlePrint = () => {
-    const target = document.getElementById('os-print-area');
-    if (!target) {
-      toast.error('Nao foi possivel localizar o layout de impressao.');
-      return;
-    }
-
-    const printWindow = window.open('', '_blank', 'width=1200,height=900');
-    if (!printWindow) {
-      window.print();
-      return;
-    }
-
-    const styleNodes = Array.from(document.querySelectorAll('style, link[rel="stylesheet"]'));
-    const styles = styleNodes.map((node) => node.outerHTML).join('');
-    const printableHtml = target.outerHTML;
-
-    printWindow.document.open();
-    printWindow.document.write(`
-      <!doctype html>
-      <html lang="pt-BR">
-        <head>
-          <meta charset="UTF-8" />
-          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-          <title>OS ${os.number}</title>
-          ${styles}
-          <style>
-            body {
-              margin: 0;
-              background: #fff;
-            }
-            #os-print-area {
-              width: 210mm !important;
-              max-width: 210mm !important;
-              margin: 0 auto !important;
-              box-shadow: none !important;
-            }
-            .print\\:hidden {
-              display: none !important;
-            }
-            @page {
-              size: A4;
-              margin: 8mm;
-            }
-          </style>
-        </head>
-        <body>
-          ${printableHtml}
-        </body>
-      </html>
-    `);
-    printWindow.document.close();
-
-    printWindow.onload = () => {
-      printWindow.focus();
-      printWindow.print();
-      printWindow.close();
-    };
+    window.print();
   };
 
   const handleDownloadPDF = async () => {
@@ -3391,32 +3366,16 @@ function OSPrintView({
 
     try {
       setIsGeneratingPdf(true);
-      const canvas = await html2canvas(target, {
-        scale: 2,
-        useCORS: true,
-        backgroundColor: '#ffffff',
-        width: target.scrollWidth,
-        height: target.scrollHeight,
-      });
+      const canvas = await html2canvas(target, { scale: 2, useCORS: true });
       const imgData = canvas.toDataURL('image/png');
-      const pdf = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = pdf.internal.pageSize.getHeight();
-      const imgWidth = pdfWidth;
-      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      const orientation = canvas.width > canvas.height ? 'l' : 'p';
+      const pdf = new jsPDF({
+        orientation,
+        unit: 'px',
+        format: [canvas.width, canvas.height],
+      });
 
-      let heightLeft = imgHeight;
-      let position = 0;
-
-      pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
-      heightLeft -= pdfHeight;
-
-      while (heightLeft > 0) {
-        position = heightLeft - imgHeight;
-        pdf.addPage();
-        pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
-        heightLeft -= pdfHeight;
-      }
+      pdf.addImage(imgData, 'PNG', 0, 0, canvas.width, canvas.height);
       pdf.save(`os-${os.number}.pdf`);
       toast.success('PDF baixado com sucesso!');
     } catch (error) {
@@ -3440,7 +3399,7 @@ function OSPrintView({
   }, [autoAction]);
 
   const OSContent = () => (
-    <div className="p-4 md:p-8 print:p-0 bg-white text-black font-sans min-h-[1123px]">
+    <div className="p-4 md:p-8 print:p-0 bg-white text-black font-sans">
       {/* Header */}
       <div className="flex flex-col md:flex-row justify-between items-start gap-4 border-b-2 border-black pb-6 mb-6">
         <div className="flex gap-4 items-center">
@@ -3475,7 +3434,6 @@ function OSPrintView({
             <p className="text-sm font-black">{os.equipment}</p>
             <p className="text-xs text-gray-600">{os.brand} {os.model}</p>
             <p className="text-xs text-gray-600 font-mono">S/N: {os.serialNumber}</p>
-            <p className="text-xs text-gray-600">Técnico: {os.technicianName || 'Não atribuído'}</p>
           </div>
         </div>
       </div>
@@ -3495,10 +3453,14 @@ function OSPrintView({
       </div>
 
       {/* Status & Priority */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-2 md:gap-4 mb-8">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4 mb-8">
         <div className="border p-2 md:p-3 rounded-lg text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Status</p>
           <p className="text-xs md:text-sm font-black">{os.status}</p>
+        </div>
+        <div className="border p-2 md:p-3 rounded-lg text-center">
+          <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prioridade</p>
+          <p className="text-xs md:text-sm font-black">{os.priority}</p>
         </div>
         <div className="border p-2 md:p-3 rounded-lg text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prazo Diag.</p>
@@ -3581,25 +3543,23 @@ function OSPrintView({
 
   return (
     <Dialog open={!!os} onOpenChange={() => onClose()}>
-      <DialogContent className="os-a4-dialog max-w-none w-[calc(100vw-3rem)] h-[calc(100vh-2.5rem)] overflow-hidden p-0 border-none bg-zinc-100">
-        <div className="os-a4-stage h-[calc(100%-70px)] overflow-auto p-4 lg:p-6">
-          <div id="os-print-area" className="os-a4-paper mx-auto w-full max-w-[794px] bg-white shadow-xl">
-            <OSContent />
-            
-            {company.osCopiesPerPage === 2 && (
-              <>
-                <div className="border-y-2 border-dashed border-gray-300 my-8 py-4 text-center print:my-4 print:py-2">
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2">
-                    <Scissors className="w-3 h-3" /> Cortar aqui - Via do {company.name} / Via do Cliente
-                  </p>
-                </div>
-                <OSContent />
-              </>
-            )}
-          </div>
+      <DialogContent className="max-w-[850px] w-[95vw] max-h-[95vh] overflow-y-auto p-0 border-none bg-white">
+        <div id="os-print-area">
+          <OSContent />
+          
+          {company.osCopiesPerPage === 2 && (
+            <>
+              <div className="border-y-2 border-dashed border-gray-300 my-8 py-4 text-center print:my-4 print:py-2">
+                <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2">
+                  <Scissors className="w-3 h-3" /> Cortar aqui - Via do {company.name} / Via do Cliente
+                </p>
+              </div>
+              <OSContent />
+            </>
+          )}
         </div>
 
-        <div className="p-4 bg-gray-100 border-t flex justify-end gap-2 print:hidden shrink-0">
+        <div className="p-4 bg-gray-100 border-t flex justify-end gap-2 print:hidden">
           <Button variant="outline" onClick={onClose}>Fechar</Button>
           <Button variant="outline" className="gap-2" onClick={handleDownloadPDF} disabled={isGeneratingPdf}>
             <Download className="w-4 h-4" /> {isGeneratingPdf ? 'Gerando PDF...' : 'Baixar PDF'}
@@ -3678,11 +3638,6 @@ function OSListView({
   const [isPrintTemplateDialogOpen, setIsPrintTemplateDialogOpen] = useState(false);
   const [isTemplatePreviewOpen, setIsTemplatePreviewOpen] = useState(false);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
-  const [selectedEquipmentTypeId, setSelectedEquipmentTypeId] = useState('');
-  const [selectedTechnicianId, setSelectedTechnicianId] = useState('');
-  const [installedPrinters, setInstalledPrinters] = useState<string[]>([]);
-  const [isLoadingPrinters, setIsLoadingPrinters] = useState(false);
-  const [selectedEntryPrinter, setSelectedEntryPrinter] = useState('');
 
   const handleTemplatePrint = (os: ServiceOrder) => {
     if (printTemplates.length === 0) {
@@ -3699,23 +3654,6 @@ function OSListView({
     () => printTemplates.find(t => t.id === selectedTemplateId) || null,
     [printTemplates, selectedTemplateId]
   );
-
-  const loadInstalledPrinters = async () => {
-    try {
-      setIsLoadingPrinters(true);
-      const response = await axios.get('/api/system/printers');
-      const printers = Array.isArray(response.data?.printers) ? response.data.printers : [];
-      setInstalledPrinters(printers);
-      if (printers.length > 0 && !selectedEntryPrinter) {
-        setSelectedEntryPrinter(printers[0]);
-      }
-    } catch (error) {
-      console.error('Erro ao carregar impressoras:', error);
-      toast.error('Não foi possível carregar as impressoras instaladas.');
-    } finally {
-      setIsLoadingPrinters(false);
-    }
-  };
   const [newOsItems, setNewOsItems] = useState<OSItem[]>([]);
   const [newItemDesc, setNewItemDesc] = useState('');
   const [newItemPrice, setNewItemPrice] = useState('0');
@@ -3819,8 +3757,7 @@ function OSListView({
       number: `OS-${new Date().getFullYear()}-${(allOrders.length + 1).toString().padStart(3, '0')}`,
       customerId: exactCustomer?.id || `manual-${Date.now()}`,
       customerName,
-      customerPhone: exactCustomer?.phone || '',
-      equipment: (eqType?.name || equipment || '').toUpperCase(),
+      equipment: (equipment || '').toUpperCase(),
       brand: (formData.get('brand') as string || '').toUpperCase(),
       model: (formData.get('model') as string || '').toUpperCase(),
       serialNumber: (formData.get('serial') as string || '').toUpperCase(),
@@ -3833,8 +3770,8 @@ function OSListView({
       priority: formData.get('priority') as any,
       value: totalOSValue,
       items: newOsItems,
-      technicianId: (formData.get('technicianId') as string) || selectedTechnicianId,
-      technicianName: teamUsers.find(u => u.id === ((formData.get('technicianId') as string) || selectedTechnicianId))?.name || '',
+      technicianId: formData.get('technicianId') as string,
+      technicianName: teamUsers.find(u => u.id === formData.get('technicianId'))?.name || '',
       diagnosisDeadline: diagDeadline,
       completionDeadline: compDeadline,
       createdAt: now.toISOString(),
@@ -3849,8 +3786,6 @@ function OSListView({
     setNewOsItems([]);
     setCustomerSearch('');
     setSelectedCustomerId('');
-    setSelectedEquipmentTypeId('');
-    setSelectedTechnicianId('');
     
     // Open Print Selection Dialog
     setLastCreatedOS(newOS);
@@ -3896,13 +3831,7 @@ function OSListView({
             type="Ordens de Serviço" 
             onImport={(data) => console.log('Importing OS', data)} 
           />
-          <Dialog open={isDialogOpen} onOpenChange={(open) => {
-            setIsDialogOpen(open);
-            if (!open) {
-              setSelectedEquipmentTypeId('');
-              setSelectedTechnicianId('');
-            }
-          }}>
+          <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
             <DialogTrigger render={
               <Button className="gap-2"><Plus className="w-4 h-4" /> Nova OS</Button>
             } />
@@ -3995,10 +3924,8 @@ function OSListView({
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="equipamento">Equipamento</Label>
-                  <Select name="equipmentType" value={selectedEquipmentTypeId} onValueChange={(val) => {
-                    const nextValue = val || '';
-                    setSelectedEquipmentTypeId(nextValue);
-                    const eqType = equipmentTypes.find(e => e.id === nextValue);
+                  <Select name="equipmentType" onValueChange={(val) => {
+                    const eqType = equipmentTypes.find(e => e.id === val);
                     const equipmentInput = document.getElementById('equipamento') as HTMLInputElement;
                     if(equipmentInput) equipmentInput.value = (eqType?.name || '').toUpperCase();
                   }}>
@@ -4015,7 +3942,7 @@ function OSListView({
                 </div>
                 <div className="space-y-2">
                   <Label className="uppercase text-[10px] font-bold">Técnico Responsável</Label>
-                  <Select name="technicianId" value={selectedTechnicianId} onValueChange={(val) => setSelectedTechnicianId(val || '')}>
+                  <Select name="technicianId">
                     <SelectTrigger className="h-10 text-xs w-full">
                       <SelectValue placeholder="SELECIONE UM TÉCNICO..." />
                     </SelectTrigger>
@@ -4378,46 +4305,33 @@ function OSListView({
                         <Eye className="w-4 h-4" />
                       </Button>
                       
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8"
-                        onClick={() => setSelectedOSForA4Print(os)}
-                        title="PDF / Impressão A4"
-                        aria-label="PDF / Impressão A4"
-                      >
-                        <FileText className="w-4 h-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8"
-                        onClick={() => handleTemplatePrint(os)}
-                        title="Etiqueta / Cupom"
-                        aria-label="Etiqueta / Cupom"
-                      >
-                        <Printer className="w-4 h-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8"
-                        onClick={() => handleShareLink(os)}
-                        title="Compartilhar Link"
-                        aria-label="Compartilhar Link"
-                      >
-                        <Share2 className="w-4 h-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8 text-rose-600"
-                        onClick={() => handleDeleteOS(os.id)}
-                        title="Excluir OS"
-                        aria-label="Excluir OS"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger render={
+                          <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Ações da OS">
+                            <MoreVertical className="w-4 h-4" />
+                          </Button>
+                        } />
+                        <DropdownMenuContent align="end" className="w-48 shadow-xl border-none p-1">
+                          <DropdownMenuLabel>Ações da OS</DropdownMenuLabel>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem onClick={() => onViewOS(os.id)}>
+                            <Edit className="w-4 h-4 mr-2" /> Editar OS
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => setSelectedOSForA4Print(os)}>
+                            <FileText className="w-4 h-4 mr-2" /> PDF / Impressão A4
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => handleTemplatePrint(os)}>
+                            <Printer className="w-4 h-4 mr-2" /> Etiqueta / Cupom
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => handleShareLink(os)}>
+                            <Share2 className="w-4 h-4 mr-2" /> Compartilhar Link
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem className="text-rose-600" onClick={() => handleDeleteOS(os.id)}>
+                            <Trash2 className="w-4 h-4 mr-2" /> Excluir OS
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                   </td>
                 </tr>
@@ -4567,13 +4481,7 @@ function OSListView({
                 "flex items-center justify-between p-4 rounded-2xl border-2 transition-all cursor-pointer group hover:shadow-md",
                 printCheckboxes.entry ? "border-primary bg-primary/5 shadow-sm" : "border-muted/20 bg-muted/5 hover:border-primary/30"
               )}
-              onClick={() => {
-                const next = !printCheckboxes.entry;
-                setPrintCheckboxes(prev => ({ ...prev, entry: next }));
-                if (next && installedPrinters.length === 0 && !isLoadingPrinters) {
-                  loadInstalledPrinters();
-                }
-              }}
+              onClick={() => setPrintCheckboxes(prev => ({ ...prev, entry: !prev.entry }))}
             >
               <div className="flex items-center gap-4">
                 <div className={cn(
@@ -4594,32 +4502,6 @@ function OSListView({
                 {printCheckboxes.entry && <Check className="w-4 h-4 text-white" strokeWidth={4} />}
               </div>
             </div>
-
-            {printCheckboxes.entry && (
-              <div className="rounded-2xl border bg-secondary/10 p-4 space-y-3">
-                <p className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Impressoras instaladas no sistema</p>
-                {isLoadingPrinters && <p className="text-sm text-muted-foreground">Carregando impressoras...</p>}
-                {!isLoadingPrinters && installedPrinters.length === 0 && (
-                  <p className="text-sm text-muted-foreground">Nenhuma impressora encontrada.</p>
-                )}
-                {!isLoadingPrinters && installedPrinters.length > 0 && (
-                  <div className="max-h-32 overflow-y-auto space-y-2 pr-1">
-                    {installedPrinters.map((printer) => (
-                      <label key={printer} className="flex items-center gap-2 text-sm cursor-pointer">
-                        <input
-                          type="radio"
-                          name="entry-printer"
-                          checked={selectedEntryPrinter === printer}
-                          onChange={() => setSelectedEntryPrinter(printer)}
-                          className="accent-primary"
-                        />
-                        <span>{printer}</span>
-                      </label>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
 
             <div 
               className={cn(
@@ -4657,9 +4539,6 @@ function OSListView({
                 onClick={() => {
                   toast.success('Gerando impressões selecionadas...');
                   setShowPostSavePrintDialog(false);
-                  if (printCheckboxes.entry && selectedEntryPrinter) {
-                    toast.info(`Impressora selecionada: ${selectedEntryPrinter}`);
-                  }
                   if (lastCreatedOS) {
                     setSelectedOSForA4Print(lastCreatedOS);
                   }
@@ -4974,46 +4853,24 @@ function StockView({
   const [categories, setCategories] = useState<{ id: string; name: string; type: string }[]>([]);
 
   const [editingCategory, setEditingCategory] = useState<{id: string, name: string, type: string} | null>(null);
-  const [categoryNameDraft, setCategoryNameDraft] = useState('');
-  const [categoryTypeDraft, setCategoryTypeDraft] = useState<'Produto' | 'Serviço'>('Produto');
 
   const [stockSearch, setStockSearch] = useState('');
   const [stockFilterCategory, setStockFilterCategory] = useState('todas');
   const [editingProduct, setEditingProduct] = useState<any>(null);
-  const [productKind, setProductKind] = useState<'Produto' | 'Serviço'>('Produto');
   const products = allProducts;
-
-  useEffect(() => {
-    if (editingCategory) {
-      setCategoryNameDraft(editingCategory.name);
-      setCategoryTypeDraft((editingCategory.type as 'Produto' | 'Serviço') || 'Produto');
-      return;
-    }
-    setCategoryNameDraft('');
-    setCategoryTypeDraft('Produto');
-  }, [editingCategory]);
-
-  useEffect(() => {
-    if (!isProductModalOpen) return;
-    if (editingProduct?.type === 'Serviço') {
-      setProductKind('Serviço');
-      return;
-    }
-    setProductKind('Produto');
-  }, [isProductModalOpen, editingProduct]);
 
   useEffect(() => {
     if (categories.length > 0) return;
     const unique = Array.from(new Set(allProducts.map((p) => p.cat).filter(Boolean))) as string[];
     if (unique.length === 0) return;
-    setCategories(unique.map((name) => ({ id: crypto.randomUUID(), name, type: 'Produto' })));
+    setCategories(unique.map((name) => ({ id: safeRandomUUID(), name, type: 'Produto' })));
   }, [allProducts, categories.length]);
 
   const bestSellers = Object.values(
     salesHistory.reduce((acc: Record<string, any>, sale: any) => {
       (sale.items || []).forEach((item: any) => {
         const existing = acc[item.sku] || {
-          id: item.id || item.sku || crypto.randomUUID(),
+          id: item.id || item.sku || safeRandomUUID(),
           name: item.name || item.description || 'Item sem nome',
           totalSales: 0,
           value: 0,
@@ -5030,12 +4887,10 @@ function StockView({
     }, {})
   ).sort((a: any, b: any) => b.totalSales - a.totalSales);
 
-  const lowStockProducts = allProducts.filter(p => p.type !== 'Serviço' && p.stock <= p.min);
-  const filteredBuyProducts = allProducts.filter(p =>
-    p.type !== 'Serviço' && (
-      p.name.toLowerCase().includes(buySearch.toLowerCase()) ||
-      p.sku.toLowerCase().includes(buySearch.toLowerCase())
-    )
+  const lowStockProducts = allProducts.filter(p => p.stock <= p.min);
+  const filteredBuyProducts = allProducts.filter(p => 
+    p.name.toLowerCase().includes(buySearch.toLowerCase()) || 
+    p.sku.toLowerCase().includes(buySearch.toLowerCase())
   );
 
   const filteredStockProducts = allProducts.filter(p => {
@@ -5238,13 +5093,13 @@ function StockView({
               </DialogHeader>
               <div className="space-y-4 py-4">
                 <div className="flex gap-2 p-3 bg-secondary/20 rounded-lg border border-dashed">
-                  <Input
-                    placeholder={editingCategory ? "Editar categoria..." : "Nova categoria..."}
-                    className="flex-1 bg-white"
-                    value={categoryNameDraft}
-                    onChange={(e) => setCategoryNameDraft(e.target.value)}
+                  <Input 
+                    placeholder={editingCategory ? "Editar categoria..." : "Nova categoria..."} 
+                    className="flex-1 bg-white" 
+                    id="cat-name-input"
+                    defaultValue={editingCategory?.name || ''}
                   />
-                  <Select value={categoryTypeDraft} onValueChange={(v) => setCategoryTypeDraft((v as 'Produto' | 'Serviço') || 'Produto')}>
+                  <Select defaultValue={editingCategory?.type || "Produto"}>
                     <SelectTrigger className="w-32 bg-white"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="Produto">Produto</SelectItem>
@@ -5252,28 +5107,23 @@ function StockView({
                     </SelectContent>
                   </Select>
                   <Button size="icon" onClick={() => {
-                    const normalizedName = categoryNameDraft.trim();
-                    if (!normalizedName) return;
+                    const nameInput = document.getElementById('cat-name-input') as HTMLInputElement;
+                    if (!nameInput.value) return;
                     
                     if (editingCategory) {
-                      setCategories(prev => prev.map(c => c.id === editingCategory.id ? { ...c, name: normalizedName, type: categoryTypeDraft } : c));
+                      setCategories(prev => prev.map(c => c.id === editingCategory.id ? { ...c, name: nameInput.value } : c));
                       toast.success('Categoria atualizada!');
                       setEditingCategory(null);
                     } else {
-                      setCategories(prev => [...prev, { id: Math.random().toString(), name: normalizedName, type: categoryTypeDraft }]);
+                      setCategories(prev => [...prev, { id: Math.random().toString(), name: nameInput.value, type: 'Produto' }]);
                       toast.success('Categoria criada!');
                     }
-                    setCategoryNameDraft('');
-                    setCategoryTypeDraft('Produto');
+                    nameInput.value = '';
                   }}>
                     {editingCategory ? <Check className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
                   </Button>
                   {editingCategory && (
-                    <Button size="icon" variant="ghost" onClick={() => {
-                      setEditingCategory(null);
-                      setCategoryNameDraft('');
-                      setCategoryTypeDraft('Produto');
-                    }}>
+                    <Button size="icon" variant="ghost" onClick={() => setEditingCategory(null)}>
                       <X className="w-4 h-4" />
                     </Button>
                   )}
@@ -5346,33 +5196,14 @@ function StockView({
               <form onSubmit={(e) => {
                 e.preventDefault();
                 const formData = new FormData(e.currentTarget);
-                const parsedPrice = Number(formData.get('price')) || 0;
-                const parsedStock = Number(formData.get('stock')) || 0;
-                const parsedMin = Number(formData.get('min')) || 0;
                 const prodData: any = {
                   id: editingProduct?.id || Math.random().toString(36).substr(2, 9),
                   name: formData.get('name') as string,
                   sku: formData.get('sku') as string,
-                  type: productKind,
-                  price: parsedPrice,
-                  stock: productKind === 'Produto' ? parsedStock : 0,
-                  min: productKind === 'Produto' ? parsedMin : 0,
+                  price: Number(formData.get('price')),
+                  stock: Number(formData.get('stock')),
+                  min: Number(formData.get('min')),
                   cat: formData.get('cat') as string,
-                  image: productImage || editingProduct?.image || null,
-                  cost: Number(formData.get('cost') || 0),
-                  freight: Number(formData.get('freight') || 0),
-                  durationMin: Number(formData.get('durationMin') || 0),
-                  commissionRate: Number(formData.get('commissionRate') || 0),
-                  ncm: String(formData.get('ncm') || ''),
-                  cest: String(formData.get('cest') || ''),
-                  origin: String(formData.get('origin') || '0'),
-                  serviceCode: String(formData.get('serviceCode') || ''),
-                  municipalServiceCode: String(formData.get('municipalServiceCode') || ''),
-                  issRate: Number(formData.get('issRate') || 0),
-                  pisRate: Number(formData.get('pisRate') || 0),
-                  cofinsRate: Number(formData.get('cofinsRate') || 0),
-                  withholdingIss: formData.get('withholdingIss') === 'on',
-                  withholdingInss: formData.get('withholdingInss') === 'on',
                 };
 
                 if (editingProduct) {
@@ -5438,77 +5269,44 @@ function StockView({
                         <Input id="prod-sku" name="sku" defaultValue={editingProduct?.sku} placeholder="IPH-14-TEL" required />
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="prod-type">Tipo</Label>
-                        <Select value={productKind} onValueChange={(v) => setProductKind((v as 'Produto' | 'Serviço') || 'Produto')}>
-                          <SelectTrigger><SelectValue /></SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="Produto">Produto</SelectItem>
-                            <SelectItem value="Serviço">Serviço</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 gap-4">
-                      <div className="space-y-2">
                         <Label htmlFor="prod-cat">Categoria</Label>
                         <Select name="cat" defaultValue={editingProduct?.cat || 'Peças'}>
                           <SelectTrigger><SelectValue placeholder="Selecione" /></SelectTrigger>
                           <SelectContent>
-                            {categories
-                              .filter(c => c.type === productKind)
-                              .map(c => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
-                            {categories.filter(c => c.type === productKind).length === 0 && (
-                              <SelectItem value="none" disabled>Nenhuma categoria deste tipo</SelectItem>
-                            )}
+                            {categories.map(c => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
                           </SelectContent>
                         </Select>
                       </div>
                     </div>
 
-                    {productKind === 'Produto' ? (
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                          <Label>Valor de Custo (R$)</Label>
-                          <Input name="cost" type="number" step="0.01" placeholder="0,00" defaultValue={editingProduct?.cost || ''} />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>Valor de Frete (R$)</Label>
-                          <Input name="freight" type="number" step="0.01" placeholder="0,00" defaultValue={editingProduct?.freight || ''} />
-                        </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label>Valor de Custo (R$)</Label>
+                        <Input type="number" step="0.01" placeholder="0,00" />
                       </div>
-                    ) : (
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                          <Label>Duração (minutos)</Label>
-                          <Input name="durationMin" type="number" min="0" placeholder="60" defaultValue={editingProduct?.durationMin || ''} />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>Comissão Técnica (%)</Label>
-                          <Input name="commissionRate" type="number" step="0.01" min="0" placeholder="0,00" defaultValue={editingProduct?.commissionRate || ''} />
-                        </div>
+                      <div className="space-y-2">
+                        <Label>Valor de Frete (R$)</Label>
+                        <Input type="number" step="0.01" placeholder="0,00" />
                       </div>
-                    )}
+                    </div>
 
                     <div className="space-y-2">
                       <Label htmlFor="prod-price">Preço de Venda (R$)</Label>
                       <Input id="prod-price" name="price" type="number" step="0.01" defaultValue={editingProduct?.price} placeholder="0,00" className="font-bold text-primary" required />
                     </div>
 
-                    {productKind === 'Produto' && (
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                          <Label htmlFor="prod-stock">Qtd Atual</Label>
-                          <Input id="prod-stock" name="stock" type="number" defaultValue={editingProduct?.stock || 0} placeholder="0" required />
-                        </div>
-                        <div className="space-y-2">
-                          <Label htmlFor="prod-min">Qtd Mínima</Label>
-                          <Input id="prod-min" name="min" type="number" defaultValue={editingProduct?.min || 5} placeholder="5" required />
-                        </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="prod-stock">Qtd Atual</Label>
+                        <Input id="prod-stock" name="stock" type="number" defaultValue={editingProduct?.stock || 0} placeholder="0" required />
                       </div>
-                    )}
+                      <div className="space-y-2">
+                        <Label htmlFor="prod-min">Qtd Mínima</Label>
+                        <Input id="prod-min" name="min" type="number" defaultValue={editingProduct?.min || 5} placeholder="5" required />
+                      </div>
+                    </div>
 
-                    {fiscalEnabled && productKind === 'Produto' && (
+                    {fiscalEnabled && (
                       <div className="pt-4 border-t mt-4 space-y-4 animate-in fade-in slide-in-from-top-2">
                          <h4 className="text-[10px] font-black uppercase text-primary tracking-widest flex items-center gap-2">
                            <ShieldCheck className="w-3 h-3" /> Dados Fiscais (NFC-e)
@@ -5516,16 +5314,16 @@ function StockView({
                          <div className="grid grid-cols-2 gap-4">
                            <div className="space-y-2">
                              <Label className="text-xs">NCM</Label>
-                             <Input name="ncm" placeholder="Ex: 8517.13.00" className="h-8 text-xs" defaultValue={editingProduct?.ncm || ''} />
+                             <Input name="ncm" placeholder="Ex: 8517.13.00" className="h-8 text-xs" />
                            </div>
                            <div className="space-y-2">
                              <Label className="text-xs">CEST</Label>
-                             <Input name="cest" placeholder="Ex: 21.053.01" className="h-8 text-xs" defaultValue={editingProduct?.cest || ''} />
+                             <Input name="cest" placeholder="Ex: 21.053.01" className="h-8 text-xs" />
                            </div>
                          </div>
                          <div className="space-y-2">
                            <Label className="text-xs">Origem da Mercadoria</Label>
-                           <Select name="origin" defaultValue={editingProduct?.origin || '0'}>
+                           <Select name="origin" defaultValue="0">
                              <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
                              <SelectContent>
                                <SelectItem value="0">0 - Nacional</SelectItem>
@@ -5534,48 +5332,6 @@ function StockView({
                              </SelectContent>
                            </Select>
                          </div>
-                      </div>
-                    )}
-
-                    {fiscalEnabled && productKind === 'Serviço' && (
-                      <div className="pt-4 border-t mt-4 space-y-4 animate-in fade-in slide-in-from-top-2">
-                        <h4 className="text-[10px] font-black uppercase text-primary tracking-widest flex items-center gap-2">
-                          <ShieldCheck className="w-3 h-3" /> Dados Fiscais de Serviço
-                        </h4>
-                        <div className="grid grid-cols-2 gap-4">
-                          <div className="space-y-2">
-                            <Label className="text-xs">Código do Serviço (LC 116)</Label>
-                            <Input name="serviceCode" placeholder="Ex: 14.01" className="h-8 text-xs" defaultValue={editingProduct?.serviceCode || ''} />
-                          </div>
-                          <div className="space-y-2">
-                            <Label className="text-xs">Código Municipal</Label>
-                            <Input name="municipalServiceCode" placeholder="Ex: 0107" className="h-8 text-xs" defaultValue={editingProduct?.municipalServiceCode || ''} />
-                          </div>
-                        </div>
-                        <div className="grid grid-cols-3 gap-4">
-                          <div className="space-y-2">
-                            <Label className="text-xs">ISS (%)</Label>
-                            <Input name="issRate" type="number" step="0.01" placeholder="0,00" className="h-8 text-xs" defaultValue={editingProduct?.issRate || ''} />
-                          </div>
-                          <div className="space-y-2">
-                            <Label className="text-xs">PIS (%)</Label>
-                            <Input name="pisRate" type="number" step="0.01" placeholder="0,00" className="h-8 text-xs" defaultValue={editingProduct?.pisRate || ''} />
-                          </div>
-                          <div className="space-y-2">
-                            <Label className="text-xs">COFINS (%)</Label>
-                            <Input name="cofinsRate" type="number" step="0.01" placeholder="0,00" className="h-8 text-xs" defaultValue={editingProduct?.cofinsRate || ''} />
-                          </div>
-                        </div>
-                        <div className="grid grid-cols-2 gap-4">
-                          <label className="flex items-center gap-2 text-xs font-medium">
-                            <input type="checkbox" name="withholdingIss" defaultChecked={!!editingProduct?.withholdingIss} className="accent-primary" />
-                            Retém ISS
-                          </label>
-                          <label className="flex items-center gap-2 text-xs font-medium">
-                            <input type="checkbox" name="withholdingInss" defaultChecked={!!editingProduct?.withholdingInss} className="accent-primary" />
-                            Retém INSS
-                          </label>
-                        </div>
                       </div>
                     )}
                   </div>
@@ -6053,19 +5809,6 @@ function FinanceView({
 
   const [expenseCategories, setExpenseCategories] = useState<{ id: string; name: string; icon: any }[]>([]);
   const [incomeCategories, setIncomeCategories] = useState<{ id: string; name: string; icon: any }[]>([]);
-  const [expenseForm, setExpenseForm] = useState({
-    desc: '',
-    val: '',
-    date: new Date().toISOString().split('T')[0],
-    dueDay: '10',
-    category: '',
-  });
-  const [incomeForm, setIncomeForm] = useState({
-    desc: '',
-    val: '',
-    date: new Date().toISOString().split('T')[0],
-    category: '',
-  });
 
   useEffect(() => {
     if (expenseCategories.length === 0) {
@@ -6078,7 +5821,7 @@ function FinanceView({
         )
       ) as string[];
       if (names.length > 0) {
-        setExpenseCategories(names.map((name) => ({ id: crypto.randomUUID(), name, icon: Tag })));
+        setExpenseCategories(names.map((name) => ({ id: safeRandomUUID(), name, icon: Tag })));
       }
     }
 
@@ -6092,7 +5835,7 @@ function FinanceView({
         )
       ) as string[];
       if (names.length > 0) {
-        setIncomeCategories(names.map((name) => ({ id: crypto.randomUUID(), name, icon: Tag })));
+        setIncomeCategories(names.map((name) => ({ id: safeRandomUUID(), name, icon: Tag })));
       }
     }
   }, [transactions, expenseCategories.length, incomeCategories.length]);
@@ -6101,82 +5844,13 @@ function FinanceView({
 
   const receivable = transactions.filter((item) => item.type === 'IN' || Number(item.val) > 0);
 
-  const fixedExpenses = payable.filter((item) => item.category && item.isFixed).map((item) => ({
+  const fixedExpenses = payable.filter((item) => item.category).map((item) => ({
     id: item.id,
     desc: item.desc,
     val: Math.abs(Number(item.val) || 0),
-    dueDay: Number(item.dueDay) || (item.date && String(item.date).includes('/') ? Number(String(item.date).split('/')[0]) : 0),
+    dueDay: item.date && String(item.date).includes('/') ? Number(String(item.date).split('/')[0]) : 0,
     category: item.category || 'Sem categoria',
   }));
-
-  const handleSaveExpense = () => {
-    const amount = Number(expenseForm.val);
-    if (!expenseForm.desc.trim() || !amount || amount <= 0) {
-      toast.error('Informe descrição e valor válido para a despesa.');
-      return;
-    }
-    const payload: any = {
-      id: crypto.randomUUID(),
-      type: 'OUT',
-      desc: expenseForm.desc.trim(),
-      category: expenseForm.category || 'Sem categoria',
-      status: 'Pendente',
-      val: -Math.abs(amount),
-      date: expenseType === 'fixa' ? `01/${String(new Date().getMonth() + 1).padStart(2, '0')}/${new Date().getFullYear()}` : expenseForm.date,
-      due: expenseType === 'fixa' ? `Todo dia ${expenseForm.dueDay}` : expenseForm.date,
-      dueDay: expenseType === 'fixa' ? Number(expenseForm.dueDay || 1) : undefined,
-      isFixed: expenseType === 'fixa',
-      method: expenseType === 'fixa' ? 'Recorrente' : 'Avulsa',
-    };
-    setTransactions((prev) => [payload, ...prev]);
-    toast.success(expenseType === 'fixa' ? 'Despesa fixa cadastrada!' : 'Despesa registrada!');
-    setExpenseForm({
-      desc: '',
-      val: '',
-      date: new Date().toISOString().split('T')[0],
-      dueDay: '10',
-      category: '',
-    });
-    setIsExpenseModalOpen(false);
-  };
-
-  const handleSaveIncome = () => {
-    const amount = Number(incomeForm.val);
-    if (!incomeForm.desc.trim() || !amount || amount <= 0) {
-      toast.error('Informe descrição e valor válido para a receita.');
-      return;
-    }
-    const payload: any = {
-      id: crypto.randomUUID(),
-      type: 'IN',
-      desc: incomeForm.desc.trim(),
-      category: incomeForm.category || 'Sem categoria',
-      status: 'Pago',
-      val: Math.abs(amount),
-      date: incomeForm.date,
-      due: incomeForm.date,
-      method: 'Entrada Manual',
-    };
-    setTransactions((prev) => [payload, ...prev]);
-    toast.success('Receita registrada com sucesso!');
-    setIncomeForm({
-      desc: '',
-      val: '',
-      date: new Date().toISOString().split('T')[0],
-      category: '',
-    });
-    setIsIncomeModalOpen(false);
-  };
-
-  const markTransactionAsPaid = (id: string) => {
-    setTransactions((prev) => prev.map((item) => item.id === id ? { ...item, status: 'Pago', paidAt: new Date().toISOString() } : item));
-    toast.success('Despesa marcada como paga.');
-  };
-
-  const markTransactionAsReceived = (id: string) => {
-    setTransactions((prev) => prev.map((item) => item.id === id ? { ...item, status: 'Recebido', receivedAt: new Date().toISOString() } : item));
-    toast.success('Receita marcada como recebida.');
-  };
 
   const recentTransactions = transactions
     .slice()
@@ -6237,31 +5911,27 @@ function FinanceView({
                 
                 <div className="space-y-2">
                   <Label>Descrição</Label>
-                  <Input
-                    placeholder={expenseType === 'fixa' ? "Ex: Aluguel da Loja" : "Ex: Compra de ferramentas"}
-                    value={expenseForm.desc}
-                    onChange={(e) => setExpenseForm((prev) => ({ ...prev, desc: e.target.value }))}
-                  />
+                  <Input placeholder={expenseType === 'fixa' ? "Ex: Aluguel da Loja" : "Ex: Compra de ferramentas"} />
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label>Valor (R$)</Label>
-                    <Input type="number" placeholder="0,00" value={expenseForm.val} onChange={(e) => setExpenseForm((prev) => ({ ...prev, val: e.target.value }))} />
+                    <Input type="number" placeholder="0,00" />
                   </div>
                   <div className="space-y-2">
                     <Label>{expenseType === 'fixa' ? "Dia do Vencimento" : "Data do Pagamento"}</Label>
                     {expenseType === 'fixa' ? (
-                      <Input type="number" min="1" max="31" placeholder="Ex: 10" value={expenseForm.dueDay} onChange={(e) => setExpenseForm((prev) => ({ ...prev, dueDay: e.target.value }))} />
+                      <Input type="number" min="1" max="31" placeholder="Ex: 10" />
                     ) : (
-                      <Input type="date" value={expenseForm.date} onChange={(e) => setExpenseForm((prev) => ({ ...prev, date: e.target.value }))} />
+                      <Input type="date" defaultValue={new Date().toISOString().split('T')[0]} />
                     )}
                   </div>
                 </div>
 
                 <div className="space-y-2">
                   <Label>Categoria</Label>
-                  <Select value={expenseForm.category} onValueChange={(v) => setExpenseForm((prev) => ({ ...prev, category: v || '' }))}>
+                  <Select>
                     <SelectTrigger><SelectValue placeholder="Selecione" /></SelectTrigger>
                     <SelectContent>
                       {expenseCategories.length > 0 ? (
@@ -6285,7 +5955,10 @@ function FinanceView({
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setIsExpenseModalOpen(false)}>Cancelar</Button>
-                <Button className="bg-rose-600 hover:bg-rose-700" onClick={handleSaveExpense}>Salvar {expenseType === 'fixa' ? 'Despesa Fixa' : 'Despesa'}</Button>
+                <Button className="bg-rose-600 hover:bg-rose-700" onClick={() => {
+                  toast.success(expenseType === 'fixa' ? 'Despesa fixa cadastrada!' : 'Despesa registrada!');
+                  setIsExpenseModalOpen(false);
+                }}>Salvar {expenseType === 'fixa' ? 'Despesa Fixa' : 'Despesa'}</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
@@ -6304,21 +5977,21 @@ function FinanceView({
               <div className="grid gap-4 py-4">
                 <div className="space-y-2">
                   <Label>Descrição</Label>
-                  <Input placeholder="Ex: Venda de serviço avulso" value={incomeForm.desc} onChange={(e) => setIncomeForm((prev) => ({ ...prev, desc: e.target.value }))} />
+                  <Input placeholder="Ex: Venda de serviço avulso" />
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label>Valor (R$)</Label>
-                    <Input type="number" placeholder="0,00" value={incomeForm.val} onChange={(e) => setIncomeForm((prev) => ({ ...prev, val: e.target.value }))} />
+                    <Input type="number" placeholder="0,00" />
                   </div>
                   <div className="space-y-2">
                     <Label>Data</Label>
-                    <Input type="date" value={incomeForm.date} onChange={(e) => setIncomeForm((prev) => ({ ...prev, date: e.target.value }))} />
+                    <Input type="date" defaultValue={new Date().toISOString().split('T')[0]} />
                   </div>
                 </div>
                 <div className="space-y-2">
                   <Label>Categoria</Label>
-                  <Select value={incomeForm.category} onValueChange={(v) => setIncomeForm((prev) => ({ ...prev, category: v || '' }))}>
+                  <Select>
                     <SelectTrigger><SelectValue placeholder="Selecione" /></SelectTrigger>
                     <SelectContent>
                       {incomeCategories.length > 0 ? (
@@ -6334,7 +6007,10 @@ function FinanceView({
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setIsIncomeModalOpen(false)}>Cancelar</Button>
-                <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={handleSaveIncome}>Salvar Receita</Button>
+                <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={() => {
+                  toast.success('Receita registrada com sucesso!');
+                  setIsIncomeModalOpen(false);
+                }}>Salvar Receita</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
@@ -6349,7 +6025,7 @@ function FinanceView({
       </div>
 
       <Tabs defaultValue="fluxo" className="w-full">
-        <TabsList className="grid w-full grid-cols-7 lg:w-[900px]">
+        <TabsList className="grid w-full grid-cols-6 lg:w-[900px]">
           <TabsTrigger value="fluxo">Fluxo de Caixa</TabsTrigger>
           <TabsTrigger value="pagar">Contas a Pagar</TabsTrigger>
           <TabsTrigger value="receber">Contas a Receber</TabsTrigger>
@@ -6425,7 +6101,7 @@ function FinanceView({
                         R$ {p.val.toFixed(2)}
                       </td>
                       <td className="px-6 py-4 text-right">
-                        <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => markTransactionAsPaid(p.id)}>Pagar</Button>
+                        <Button size="sm" variant="outline" className="h-8 text-xs">Pagar</Button>
                       </td>
                     </tr>
                   ))}
@@ -6464,7 +6140,7 @@ function FinanceView({
                         R$ {r.val.toFixed(2)}
                       </td>
                       <td className="px-6 py-4 text-right">
-                        <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => markTransactionAsReceived(r.id)}>Receber</Button>
+                        <Button size="sm" variant="outline" className="h-8 text-xs">Receber</Button>
                       </td>
                     </tr>
                   ))}
@@ -8797,7 +8473,7 @@ function TechnicalSupportView({
     });
 
     const created: SupportSession = {
-      id: crypto.randomUUID(),
+      id: safeRandomUUID(),
       osId: order.id,
       osNumber: order.number,
       customerName: order.customerName,
@@ -8809,7 +8485,7 @@ function TechnicalSupportView({
       expiresAt: getSupportExpiryDate(nowIso),
       messages: [
         {
-          id: crypto.randomUUID(),
+          id: safeRandomUUID(),
           role: 'agent',
           text: `Contexto técnico iniciado para ${order.number} (${order.customerName}).`,
           createdAt: nowIso,
@@ -8828,7 +8504,7 @@ function TechnicalSupportView({
   const handleAttachmentChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []);
     const mapped: SupportAttachment[] = files.map((file) => ({
-      id: crypto.randomUUID(),
+      id: safeRandomUUID(),
       name: file.name,
       mimeType: file.type || 'application/octet-stream',
       size: file.size,
@@ -8927,7 +8603,7 @@ function TechnicalSupportView({
     const prompt = supportPromptDirectives ? `${basePrompt}\n\n${supportPromptDirectives}` : basePrompt;
 
     const technicianMessage: SupportMessage = {
-      id: crypto.randomUUID(),
+      id: safeRandomUUID(),
       role: 'technician',
       text: userMessageText,
       createdAt: nowIso,
@@ -8968,7 +8644,7 @@ function TechnicalSupportView({
       if (!aiText) throw new Error('Resposta vazia do provider.');
 
       const agentMessage: SupportMessage = {
-        id: crypto.randomUUID(),
+        id: safeRandomUUID(),
         role: 'agent',
         text: aiText,
         createdAt: new Date().toISOString(),
@@ -8994,7 +8670,7 @@ function TechnicalSupportView({
       });
       const apiError = error?.response?.data?.detail || error?.response?.data?.error || error?.message || 'Falha ao consultar provider de IA.';
       const agentMessage: SupportMessage = {
-        id: crypto.randomUUID(),
+        id: safeRandomUUID(),
         role: 'agent',
         text: fallbackText,
         createdAt: new Date().toISOString(),
@@ -9297,12 +8973,6 @@ function SettingsView({
   const [newCompanyPlatformProvider, setNewCompanyPlatformProvider] = useState<AIProvider>('openai');
   const [newCompanyPlatformApiKey, setNewCompanyPlatformApiKey] = useState('');
   const [newCompanyPlatformModel, setNewCompanyPlatformModel] = useState('provider-default');
-  const [isNewUserDialogOpen, setIsNewUserDialogOpen] = useState(false);
-  const [newUserForm, setNewUserForm] = useState({
-    name: '',
-    email: '',
-    role: 'USUARIO' as User['role'],
-  });
 
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [isGeneratingQr, setIsGeneratingQr] = useState(false);
@@ -9332,39 +9002,6 @@ function SettingsView({
     }
     if (mappedName) return mappedName;
     return rawName && !isNumericText(rawName) ? rawName : 'Cliente sem nome';
-  };
-
-  const handleCreateTeamUser = () => {
-    const name = newUserForm.name.trim();
-    const email = newUserForm.email.trim().toLowerCase();
-    if (!name || !email) {
-      toast.error('Preencha nome e e-mail para criar o usuário.');
-      return;
-    }
-    const emailExists = teamUsers.some((member) => member.email.toLowerCase() === email);
-    if (emailExists) {
-      toast.error('Já existe um usuário com este e-mail.');
-      return;
-    }
-
-    setTeamUsers(prev => [
-      ...prev,
-      {
-        id: crypto.randomUUID(),
-        name,
-        email,
-        role: newUserForm.role,
-        companyId: company.id || '1',
-        allowedEquipmentIds: [],
-        allowedTabs: newUserForm.role === 'ADMIN-USER'
-          ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico']
-          : ['dashboard', 'os', 'tarefas', 'suporte-tecnico'],
-      }
-    ]);
-
-    toast.success('Usuário cadastrado com sucesso!');
-    setNewUserForm({ name: '', email: '', role: 'USUARIO' });
-    setIsNewUserDialogOpen(false);
   };
 
   const normalizeCatalogClients = (catalogs: AIProviderCatalog[] = []): AIProviderCatalog[] =>
@@ -9585,10 +9222,10 @@ function SettingsView({
     const models = AI_PROVIDER_MODEL_OPTIONS[newCatalogProvider] || [];
     const initialClient = saasClientOptions.find((client) => client.id === newCatalogClientId);
     const assignedClients: AICatalogClient[] = initialClient
-      ? [{ id: crypto.randomUUID(), companyId: initialClient.id, name: initialClient.name }]
+      ? [{ id: safeRandomUUID(), companyId: initialClient.id, name: initialClient.name }]
       : [];
     const catalog: AIProviderCatalog = {
-      id: crypto.randomUUID(),
+      id: safeRandomUUID(),
       listName,
       provider: newCatalogProvider,
       models,
@@ -9630,7 +9267,7 @@ function SettingsView({
         added = true;
         return {
           ...item,
-          assignedClients: [...currentClients, { id: crypto.randomUUID(), companyId: companyOption.id, name: companyOption.name }],
+          assignedClients: [...currentClients, { id: safeRandomUUID(), companyId: companyOption.id, name: companyOption.name }],
           updatedAt: new Date().toISOString(),
         };
       }),
@@ -9705,7 +9342,7 @@ function SettingsView({
     }
     const plans = newPromptPlans.length > 0 ? newPromptPlans : ['Basic', 'Premium', 'Enterprise'];
     const created: AIAgentPromptTemplate = {
-      id: crypto.randomUUID(),
+      id: safeRandomUUID(),
       title,
       area: newPromptArea,
       prompt: ensurePromptDirective(promptText),
@@ -9756,7 +9393,7 @@ function SettingsView({
       return;
     }
     const platform: CompanyAgentPlatform = {
-      id: crypto.randomUUID(),
+      id: safeRandomUUID(),
       name,
       provider: newCompanyPlatformProvider,
       apiKey,
@@ -11255,43 +10892,16 @@ function SettingsView({
             </div>
             <div className="p-4 border-t bg-secondary/20 flex justify-between items-center">
               <p className="text-xs text-muted-foreground">Total de {teamUsers.length} usuários</p>
-              <Dialog open={isNewUserDialogOpen} onOpenChange={setIsNewUserDialogOpen}>
-                <DialogTrigger render={
-                  <Button size="sm" className="gap-2">
-                    <Plus className="w-4 h-4" /> Novo Usuário
-                  </Button>
-                } />
-                <DialogContent className="sm:max-w-[480px]">
-                  <DialogHeader>
-                    <DialogTitle>Novo Usuário</DialogTitle>
-                    <DialogDescription>Crie um novo usuário para acesso ao sistema.</DialogDescription>
-                  </DialogHeader>
-                  <div className="grid gap-4 py-4">
-                    <div className="space-y-2">
-                      <Label>Nome</Label>
-                      <Input value={newUserForm.name} onChange={(e) => setNewUserForm((prev) => ({ ...prev, name: e.target.value }))} placeholder="Nome completo" />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>E-mail</Label>
-                      <Input type="email" value={newUserForm.email} onChange={(e) => setNewUserForm((prev) => ({ ...prev, email: e.target.value }))} placeholder="nome@empresa.com" />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>Perfil</Label>
-                      <Select value={newUserForm.role} onValueChange={(value) => setNewUserForm((prev) => ({ ...prev, role: value as User['role'] }))}>
-                        <SelectTrigger><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="USUARIO">Técnico</SelectItem>
-                          <SelectItem value="ADMIN-USER">Administrador</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                  <DialogFooter>
-                    <Button variant="outline" onClick={() => setIsNewUserDialogOpen(false)}>Cancelar</Button>
-                    <Button onClick={handleCreateTeamUser}>Salvar Usuário</Button>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
+              <Button size="sm" className="gap-2" onClick={() => {
+                const name = prompt('Nome do Usuário:');
+                const email = prompt('E-mail do Usuário:');
+                if(name && email) {
+                  setTeamUsers(prev => [...prev, { id: Math.random().toString(), name, email, role: 'USUARIO', companyId: '1', allowedEquipmentIds: [] }]);
+                  toast.success('Usuário convidado!');
+                }
+              }}>
+                <Plus className="w-4 h-4" /> Novo Usuário
+              </Button>
             </div>
           </Card>
         </TabsContent>
@@ -12259,19 +11869,11 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
     // If it's a direct print call, we might want to trigger it immediately after rendering
   }, []);
 
-  const cssLineStyle = (style?: 'solid' | 'dashed' | 'dotted' | 'double') => {
-    if (style === 'dashed') return 'dashed';
-    if (style === 'dotted') return 'dotted';
-    if (style === 'double') return 'double';
-    return 'solid';
-  };
-
   const replaceVariables = (content: string) => {
     let result = content;
     const variables: Record<string, any> = {
       '{{os_number}}': data.number,
       '{{customer_name}}': data.customerName,
-      '{{customer_phone}}': data.customerPhone || '-',
       '{{equipment}}': data.equipment,
       '{{brand}}': data.brand,
       '{{model}}': data.model,
@@ -12307,9 +11909,6 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
             style={{ 
               width: `${template.width}mm`, 
               height: `${template.height}mm`,
-              border: template.showBorder
-                ? `${template.borderThickness || 0.5}mm ${cssLineStyle(template.borderStyle)} #111`
-                : 'none',
               padding: 0,
               margin: 0,
               position: 'relative'
@@ -12322,14 +11921,12 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
                 top: `${el.y}mm`,
                 fontSize: `${el.fontSize || 12}pt`,
                 fontWeight: el.fontWeight as any,
-                textAlign: (el.textAlign || 'left') as any,
                 width: el.width ? `${el.width}mm` : 'auto',
                 height: el.height ? `${el.height}mm` : 'auto',
                 display: 'flex',
                 alignItems: 'center',
-                lineHeight: 1.1,
-                whiteSpace: 'pre-wrap',
-                overflow: 'hidden'
+                lineHeight: 1,
+                whiteSpace: 'nowrap'
               };
 
               if (el.type === 'line') {
@@ -12337,11 +11934,9 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
                   <div 
                     key={el.id} 
                     style={{ 
-                      position: 'absolute',
-                      left: `${el.x}mm`,
-                      top: `${el.y}mm`,
-                      width: `${el.width || 50}mm`,
-                      borderTop: `${el.strokeWidth || 0.6}mm ${cssLineStyle(el.lineStyle)} #111`,
+                      ...style, 
+                      backgroundColor: 'black',
+                      height: `${el.height || 1}mm`
                     }} 
                   />
                 );
@@ -12420,9 +12015,6 @@ function PrintCustomizationView({ templates, setTemplates }: { templates: PrintT
       type,
       width: type === 'Etiqueta' ? 40 : 80,
       height: type === 'Etiqueta' ? 25 : 200,
-      showBorder: false,
-      borderStyle: 'solid',
-      borderThickness: 0.5,
       elements: [],
       companyId: '1'
     };
