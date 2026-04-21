@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   DragDropContext, 
   Droppable, 
@@ -41,7 +41,6 @@ import {
   ChevronRight,
   Plus,
   Filter,
-  MoreVertical,
   Printer,
   FileText,
   Clock,
@@ -146,6 +145,8 @@ import {
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from 'sonner';
 import axios from 'axios';
+import html2canvas from 'html2canvas';
+import jsPDF from 'jspdf';
 import { WhatsAppView } from './components/WhatsAppView';
 import { PrintDesigner } from './components/PrintDesigner';
 import { 
@@ -166,8 +167,41 @@ import {
   Area
 } from 'recharts';
 import { cn } from '@/lib/utils';
-import { MOCK_OS, STATUS_COLUMNS } from './constants';
-import { ServiceOrder, OSStatus, OSItem, PrintTemplate, TemplateElement, User, Company, Supplier, EquipmentType } from './types';
+import { STATUS_COLUMNS } from './constants';
+import {
+  ServiceOrder,
+  OSStatus,
+  OSItem,
+  PrintTemplate,
+  TemplateElement,
+  User,
+  Company,
+  Supplier,
+  EquipmentType,
+  AIProvider,
+  AIModelOption,
+  AICatalogClient,
+  AIAgentPromptTemplate,
+  AIAgentPromptArea,
+  CompanyAgentPlatform,
+  SubscriptionPlan,
+  AIProviderCatalog,
+  AIProviderConfig,
+  SupportAttachment,
+  SupportMessage,
+  SupportSession,
+  TechnicalLevel,
+  TechnicalSector,
+} from './types';
+import {
+  buildMockAgentResponse,
+  buildTechnicalPrompt,
+  detectTechnicalSector,
+  getRecommendedAgents,
+  inferTechnicalLevel,
+  getSupportExpiryDate,
+  pruneSupportSessions,
+} from './lib/technical-ai';
 
 // --- Components ---
 
@@ -178,6 +212,125 @@ const fuzzyMatch = (text: string, query: string) => {
   const nText = normalize(text);
   const nQuery = normalize(query);
   return nText.includes(nQuery);
+};
+
+const SUPPORT_SESSIONS_STORAGE_KEY = 'techmanager_support_sessions';
+const SUPPORT_RETENTION_DAYS = 15;
+const AUTH_USERS_STORAGE_KEY = 'techmanager_auth_users';
+const AUTH_SESSION_USER_ID_STORAGE_KEY = 'techmanager_auth_session_user_id';
+const APP_COMPANIES_STORAGE_KEY = 'techmanager_app_companies';
+const AI_PROVIDER_MODEL_OPTIONS: Record<AIProvider, AIModelOption[]> = {
+  openai: [
+    { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
+    { value: 'gpt-4.1-mini', label: 'gpt-4.1-mini' },
+    { value: 'gpt-4.1', label: 'gpt-4.1' },
+  ],
+  groq: [
+    { value: 'llama-3.3-70b-versatile', label: 'llama-3.3-70b-versatile' },
+    { value: 'llama-3.1-8b-instant', label: 'llama-3.1-8b-instant' },
+    { value: 'mixtral-8x7b-32768', label: 'mixtral-8x7b-32768' },
+  ],
+  gemini: [
+    { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
+    { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+    { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+  ],
+  claude: [
+    { value: 'claude-3-5-sonnet-latest', label: 'claude-3-5-sonnet-latest' },
+    { value: 'claude-3-5-haiku-latest', label: 'claude-3-5-haiku-latest' },
+    { value: 'claude-3-opus-latest', label: 'claude-3-opus-latest' },
+  ],
+};
+const AI_PROVIDER_LABELS: Record<AIProvider, string> = {
+  openai: 'OpenAI (ChatGPT)',
+  groq: 'Groq',
+  gemini: 'Gemini',
+  claude: 'Claude',
+};
+const EMPTY_COMPANY: Company = {
+  id: '',
+  subscriptionPlan: 'Basic',
+  name: '',
+  razaoSocial: '',
+  cnpj: '',
+  ie: '',
+  email: '',
+  phone: '',
+  address: '',
+  logo: undefined,
+  fiscalEnabled: false,
+  labelPrinterName: '',
+  a4PrinterName: '',
+  osCopiesPerPage: 1,
+  aiAssistantMode: 'saas-managed',
+  aiSaasCatalogId: '',
+  aiProvider: 'openai',
+  aiModel: '',
+  aiModelSource: 'provider-default',
+};
+
+const hasCompanyContent = (value: unknown): value is Company => {
+  if (!value || typeof value !== 'object') return false;
+  const company = value as Company;
+  return Boolean(company.id || company.name || company.cnpj || company.email || company.phone || company.address);
+};
+
+const companyFromManagedCompany = (value?: Partial<ManagedCompany>): Company => ({
+  ...EMPTY_COMPANY,
+  id: value?.id || '',
+  name: value?.name || '',
+  cnpj: value?.document || '',
+  email: value?.email || '',
+  phone: value?.phone || '',
+});
+
+const sanitizeCustomers = (value: any[]): any[] => {
+  const mockNames = new Set(['joao silva', 'maria oliveira', 'tech solutions ltda']);
+  const mockDocs = new Set(['123.456.789-00', '987.654.321-11', '12.345.678/0001-99']);
+  const mockEmails = new Set(['joao@email.com', 'maria@email.com', 'contato@tech.com']);
+
+  return (Array.isArray(value) ? value : []).filter((customer) => {
+    const normalizedName = String(customer?.name || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim();
+    const normalizedDoc = String(customer?.doc || '').trim();
+    const normalizedEmail = String(customer?.email || '').toLowerCase().trim();
+
+    const isKnownMock =
+      mockNames.has(normalizedName) ||
+      mockDocs.has(normalizedDoc) ||
+      mockEmails.has(normalizedEmail);
+
+    return !isKnownMock;
+  });
+};
+
+const AGENT_PROMPT_AREA_LABELS: Record<AIAgentPromptArea, string> = {
+  'suporte-tecnico': 'Assistente Técnico',
+  'ordem-servico': 'Ordem de Serviço',
+  atendimento: 'Atendimento',
+  financeiro: 'Financeiro',
+  vendas: 'Vendas',
+  estoque: 'Estoque',
+};
+const PLAN_OPTIONS: SubscriptionPlan[] = ['Basic', 'Premium', 'Enterprise'];
+const MANDATORY_PROMPT_HELP_DIRECTIVE =
+  'Sempre ajudar com o próximo passo e responder com base na pergunta atual do usuário.';
+
+// Friendly names for roles displayed to users
+const ROLE_LABELS: Record<string, string> = {
+  'ADMIN-SAAS': 'Gerente Geral',
+  'ADMIN-USER': 'Gerente de Empresa',
+  'USUARIO': 'Técnico'
+};
+
+// Friendly role names for UI display
+const ROLE_FRIENDLY_NAMES: Record<string, string> = {
+  'ADMIN-SAAS': 'Gerente Geral',
+  'ADMIN-USER': 'Gerente de Empresa',
+  'USUARIO': 'Técnico'
 };
 
 const SidebarItem = ({ icon: Icon, label, active, onClick }: any) => (
@@ -230,31 +383,19 @@ const StatCard = ({ title, value, icon: Icon, trend, color, description }: any) 
 
 // --- Auth & Login ---
 
-const MOCK_USERS: User[] = [
-  {
-    id: '1',
-    name: 'Admin SaaS',
-    email: 'saas@admin.com',
-    role: 'ADMIN-SAAS',
-    companyId: 'saas-system',
-  },
-  {
-    id: '2',
-    name: 'Admin Empresa',
-    email: 'admin@empresa.com',
-    role: 'ADMIN-USER',
-    companyId: 'company-1',
-  },
-  {
-    id: '3',
-    name: 'Técnico João',
-    email: 'joao@tecnico.com',
-    role: 'USUARIO',
-    companyId: 'company-1',
-  }
-];
+type AuthUser = User & { password: string };
 
-function LoginView({ onLogin }: { onLogin: (user: User) => void }) {
+type ManagedCompany = {
+  id: string;
+  name: string;
+  document?: string;
+  email?: string;
+  phone?: string;
+  active: boolean;
+  createdAt: string;
+};
+
+function LoginView({ onLogin, authUsers }: { onLogin: (user: User) => void; authUsers: AuthUser[] }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -263,17 +404,16 @@ function LoginView({ onLogin }: { onLogin: (user: User) => void }) {
     e.preventDefault();
     setIsLoading(true);
 
-    // Simulação de login
     setTimeout(() => {
-      const user = MOCK_USERS.find(u => u.email === email);
+      const user = authUsers.find((u) => u.email.toLowerCase() === email.trim().toLowerCase() && u.password === password);
       if (user) {
         onLogin(user);
         toast.success(`Bem-vindo, ${user.name}!`);
       } else {
-        toast.error('Credenciais inválidas. Tente saas@admin.com, admin@empresa.com ou joao@tecnico.com');
+        toast.error('Email ou senha estão incorretos');
       }
       setIsLoading(false);
-    }, 1000);
+    }, 500);
   };
 
   return (
@@ -328,54 +468,6 @@ function LoginView({ onLogin }: { onLogin: (user: User) => void }) {
                 {isLoading ? "Autenticando..." : "Entrar"}
               </Button>
             </form>
-
-            <div className="relative mt-2">
-              <div className="absolute inset-0 flex items-center">
-                <span className="w-full border-t" />
-              </div>
-              <div className="relative flex justify-center text-xs uppercase">
-                <span className="bg-white px-2 text-muted-foreground">Contas de Teste</span>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 gap-2">
-              <Button 
-                variant="outline" 
-                size="sm" 
-                className="justify-start gap-2 h-auto py-2"
-                onClick={() => { setEmail('saas@admin.com'); setPassword('123456'); }}
-              >
-                <ShieldCheck className="w-4 h-4 text-indigo-500" />
-                <div className="text-left">
-                  <p className="text-[10px] font-bold uppercase leading-none mb-1">Admin SaaS</p>
-                  <p className="text-[10px] text-muted-foreground leading-none">saas@admin.com</p>
-                </div>
-              </Button>
-              <Button 
-                variant="outline" 
-                size="sm" 
-                className="justify-start gap-2 h-auto py-2"
-                onClick={() => { setEmail('admin@empresa.com'); setPassword('123456'); }}
-              >
-                <Lock className="w-4 h-4 text-amber-500" />
-                <div className="text-left">
-                  <p className="text-[10px] font-bold uppercase leading-none mb-1">Admin Empresa</p>
-                  <p className="text-[10px] text-muted-foreground leading-none">admin@empresa.com</p>
-                </div>
-              </Button>
-              <Button 
-                variant="outline" 
-                size="sm" 
-                className="justify-start gap-2 h-auto py-2"
-                onClick={() => { setEmail('joao@tecnico.com'); setPassword('123456'); }}
-              >
-                <UserIcon className="w-4 h-4 text-blue-500" />
-                <div className="text-left">
-                  <p className="text-[10px] font-bold uppercase leading-none mb-1">Usuário / Técnico</p>
-                  <p className="text-[10px] text-muted-foreground leading-none">joao@tecnico.com</p>
-                </div>
-              </Button>
-            </div>
           </CardContent>
         </Card>
         
@@ -387,22 +479,137 @@ function LoginView({ onLogin }: { onLogin: (user: User) => void }) {
   );
 }
 
+function SetupView({ onSetupComplete }: { onSetupComplete: (superAdmin: AuthUser) => void }) {
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [isSettingUp, setIsSettingUp] = useState(false);
+  const localBackupKeys = ['techmanager_darkmode', 'techmanager_os_sort'] as const;
+
+  const applyRestoredLocalStorage = (payload: any) => {
+    const localState = payload?.localStorage;
+    if (!localState || typeof localState !== 'object') return false;
+    Object.entries(localState).forEach(([key, value]) => {
+      if (localBackupKeys.includes(key as (typeof localBackupKeys)[number])) {
+        localStorage.setItem(String(key), String(value));
+      }
+    });
+    return true;
+  };
+
+  const handleRestoreBackup = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      applyRestoredLocalStorage(payload);
+
+      if (payload?.serverBackup && typeof payload.serverBackup === 'object') {
+        await axios.post('/api/system/restore', payload.serverBackup);
+      } else if (payload?.db && typeof payload.db === 'object') {
+        await axios.post('/api/system/restore', payload);
+      }
+
+      toast.success('Backup restaurado com sucesso. O app será recarregado.');
+      setTimeout(() => window.location.reload(), 500);
+    } catch (error) {
+      console.error('Erro ao restaurar backup no setup:', error);
+      toast.error('Falha ao restaurar backup. Verifique o arquivo.');
+    } finally {
+      event.target.value = '';
+    }
+  };
+
+  const handleCreateSuperAdmin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim() || !email.trim() || !password.trim()) {
+      toast.error('Preencha nome, email e senha para continuar.');
+      return;
+    }
+
+    setIsSettingUp(true);
+    const superAdmin: AuthUser = {
+      id: crypto.randomUUID(),
+      name: name.trim(),
+      email: email.trim().toLowerCase(),
+      password,
+      role: 'ADMIN-SAAS',
+      companyId: 'app-superadmin',
+      allowedTabs: ['superadmin-dashboard', 'superadmin-companies', 'superadmin-users', 'superadmin-settings'],
+    };
+
+    setTimeout(() => {
+      onSetupComplete(superAdmin);
+      toast.success('Superadmin criado com sucesso.');
+      setIsSettingUp(false);
+    }, 400);
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-[#F8FAFC] p-4">
+      <div className="w-full max-w-2xl space-y-6">
+        <Card className="border-none shadow-xl">
+          <CardHeader>
+            <CardTitle>Configuração Inicial do Aplicativo</CardTitle>
+            <CardDescription>
+              Nenhum superadmin foi encontrado. Restaure um backup ou configure o primeiro superadmin.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="rounded-lg border border-dashed p-4 space-y-3">
+              <p className="text-sm font-semibold">1) Restaurar backup (opcional)</p>
+              <p className="text-xs text-muted-foreground">
+                Se você já tem um backup do sistema, restaure antes de criar o superadmin.
+              </p>
+              <label className="inline-flex items-center gap-2 text-xs cursor-pointer border rounded-md px-3 py-2 hover:bg-secondary/30">
+                <UploadCloud className="w-4 h-4" />
+                Selecionar arquivo de backup
+                <input type="file" accept="application/json" className="hidden" onChange={handleRestoreBackup} />
+              </label>
+            </div>
+
+            <form onSubmit={handleCreateSuperAdmin} className="space-y-4 rounded-lg border p-4">
+              <p className="text-sm font-semibold">2) Criar superadmin</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label>Nome do superadmin</Label>
+                  <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome completo" required />
+                </div>
+                <div className="space-y-2">
+                  <Label>Email do superadmin</Label>
+                  <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="admin@seusistema.com" required />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label>Senha</Label>
+                <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Crie uma senha forte" required />
+              </div>
+              <div className="flex justify-end">
+                <Button type="submit" disabled={isSettingUp}>
+                  {isSettingUp ? 'Configurando...' : 'Concluir Setup'}
+                </Button>
+              </div>
+            </form>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 // --- Main App ---
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
+  const [sessionUserId, setSessionUserId] = useState<string | null>(() => localStorage.getItem(AUTH_SESSION_USER_ID_STORAGE_KEY));
+  const [authUsers, setAuthUsers] = useState<AuthUser[]>([]);
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [activeCompany, setActiveCompany] = useState<Company>({
-    id: '1',
-    name: 'Tech Assistência',
-    cnpj: '12.345.678/0001-90',
-    email: 'contato@techassist.com',
-    phone: '(11) 99999-9999',
-    address: 'Rua das Flores, 123',
-    fiscalEnabled: true,
-  });
+  const [managedCompanies, setManagedCompanies] = useState<ManagedCompany[]>([]);
+  const [activeCompany, setActiveCompany] = useState<Company>(EMPTY_COMPANY);
   const [viewingOSId, setViewingOSId] = useState<string | null>(null);
-  const [allOrders, setAllOrders] = useState<ServiceOrder[]>(MOCK_OS);
+  const [allOrders, setAllOrders] = useState<ServiceOrder[]>([]);
   const [customSubStatuses, setCustomSubStatuses] = useState<Record<string, string[]>>(() => {
     const saved = localStorage.getItem('techmanager_substatuses');
     return saved ? JSON.parse(saved) : {
@@ -416,17 +623,7 @@ export default function App() {
     localStorage.setItem('techmanager_substatuses', JSON.stringify(customSubStatuses));
   }, [customSubStatuses]);
 
-  const [tasks, setTasks] = useState<any[]>(() => {
-    const saved = localStorage.getItem('techmanager_tasks');
-    return saved ? JSON.parse(saved) : [
-      { id: '1', title: 'Comprar telas para iPhone 13', note: 'Distribuidor X tem o melhor preço hoje', time: format(addDays(new Date(), 1), "yyyy-MM-dd'T'10:00"), completed: false, priority: 'Alta' },
-      { id: '2', title: 'Ligar para cliente Sr. João', note: 'Confirmar orçamento da impressora', time: format(new Date(), "yyyy-MM-dd'T'15:00"), completed: false, priority: 'Média' },
-    ];
-  });
-
-  useEffect(() => {
-    localStorage.setItem('techmanager_tasks', JSON.stringify(tasks));
-  }, [tasks]);
+  const [tasks, setTasks] = useState<any[]>([]);
 
   // Reminder Logic
   useEffect(() => {
@@ -460,179 +657,206 @@ export default function App() {
     return () => clearInterval(interval);
   }, [tasks]);
   const [companyLogo, setCompanyLogo] = useState<string | null>(null);
-  const [company, setCompany] = useState<Company>({
-    id: '1',
-    name: 'TechManager Assistência',
-    razaoSocial: 'TechManager Serviços LTDA',
-    cnpj: '12.345.678/0001-99',
-    ie: '123.456.789.000',
-    email: 'contato@techmanager.com',
-    phone: '(11) 3333-4444',
-    address: 'Rua das Tecnologias, 123 - Centro, São Paulo - SP',
-    logo: undefined,
-    labelPrinterName: '',
-    a4PrinterName: '',
-    osCopiesPerPage: 1
-  });
+  const [company, setCompany] = useState<Company>(EMPTY_COMPANY);
   const [osSortOrder, setOsSortOrder] = useState<'number' | 'date' | 'priority'>(() => {
     const saved = localStorage.getItem('techmanager_os_sort');
     return (saved as any) || 'number';
   });
 
+  const [isAppStateLoaded, setIsAppStateLoaded] = useState(false);
+  const [isBackendStateHydrated, setIsBackendStateHydrated] = useState(false);
+
   useEffect(() => {
     localStorage.setItem('techmanager_os_sort', osSortOrder);
   }, [osSortOrder]);
 
-  const [allProducts, setAllProducts] = useState<any[]>(() => {
-    const saved = localStorage.getItem('techmanager_products');
-    return saved ? JSON.parse(saved) : [
-      { id: '1', name: 'Tela iPhone 13 Original', sku: 'TEL-IP13-ORG', price: 850.00, stock: 5, min: 2, cat: 'Peças' },
-      { id: '2', name: 'Bateria Samsung S22', sku: 'BAT-S22-PREM', price: 120.00, stock: 12, min: 5, cat: 'Peças' },
-      { id: '3', name: 'Cabo HDMI 2.0 2m', sku: 'CAB-HDMI-2M', price: 45.00, stock: 2, min: 10, cat: 'Acessórios' },
-      { id: '4', name: 'Conector de Carga Moto G60', sku: 'CON-G60', price: 25.00, stock: 0, min: 5, cat: 'Peças' },
-    ];
-  });
+  const [allProducts, setAllProducts] = useState<any[]>([]);
+
+  const [salesHistory, setSalesHistory] = useState<any[]>([]);
+
+  const [financeTransactions, setFinanceTransactions] = useState<any[]>([]);
+
+  const [teamUsers, setTeamUsers] = useState<User[]>([]);
+
+  const hasSuperAdmin = useMemo(() => authUsers.some((u) => u.role === 'ADMIN-SAAS'), [authUsers]);
 
   useEffect(() => {
-    localStorage.setItem('techmanager_products', JSON.stringify(allProducts));
-  }, [allProducts]);
+    if (!sessionUserId) return;
 
-  const [salesHistory, setSalesHistory] = useState<any[]>(() => {
-    const saved = localStorage.getItem('techmanager_sales');
-    return saved ? JSON.parse(saved) : [
-      { id: '1', customer: 'João Silva', items: [{ id: 'p1', name: 'Tela iPhone 13 Original', price: 850, quantity: 1, sku: 'TEL-IP13-ORG' }], total: 850, date: new Date().toISOString(), type: 'Venda', status: 'Finalizada' },
-      { id: '2', customer: 'Maria Oliveira', items: [{ id: 'p2', name: 'Bateria Samsung S22', price: 120, quantity: 1, sku: 'BAT-S22-PREM' }], total: 120, date: addDays(new Date(), -1).toISOString(), type: 'Venda', status: 'Finalizada' },
-    ];
-  });
+    // Avoid forced logout while auth list is temporarily unavailable.
+    if (authUsers.length === 0) return;
 
-  useEffect(() => {
-    localStorage.setItem('techmanager_sales', JSON.stringify(salesHistory));
-  }, [salesHistory]);
+    const sessionUser = authUsers.find((u) => u.id === sessionUserId);
+    if (!sessionUser) {
+      localStorage.removeItem(AUTH_SESSION_USER_ID_STORAGE_KEY);
+      setSessionUserId(null);
+      if (user) setUser(null);
+      return;
+    }
 
-  const [financeTransactions, setFinanceTransactions] = useState<any[]>(() => {
-    const saved = localStorage.getItem('techmanager_transactions');
-    return saved ? JSON.parse(saved) : [
-      { id: '1', desc: 'Venda OS-2024-003', val: 250.00, type: 'IN', date: '13/04/2026', status: 'Pago', category: 'Serviços' },
-      { id: '2', desc: 'Compra de Telas - Fornecedor X', val: -1200.00, type: 'OUT', date: '12/04/2026', status: 'Pendente', category: 'Estoque' },
-      { id: '3', desc: 'Aluguel Sala Comercial', val: -2500.00, type: 'OUT', date: '10/04/2026', status: 'Pago', category: 'Infraestrutura' },
-    ];
-  });
+    const hasDifferentIdentity =
+      !user ||
+      user.id !== sessionUser.id ||
+      user.email !== sessionUser.email ||
+      user.name !== sessionUser.name ||
+      user.role !== sessionUser.role ||
+      user.companyId !== sessionUser.companyId;
 
-  useEffect(() => {
-    localStorage.setItem('techmanager_transactions', JSON.stringify(financeTransactions));
-  }, [financeTransactions]);
+    if (hasDifferentIdentity) {
+      setUser(sessionUser);
+    }
+  }, [authUsers, sessionUserId, user]);
 
-  const [teamUsers, setTeamUsers] = useState<User[]>(() => {
-    const saved = localStorage.getItem('techmanager_team');
-    return saved ? JSON.parse(saved) : [
-      { id: '1', name: 'Admin Principal', email: 'admin@techmanager.com', role: 'ADMIN-USER', companyId: '1', privilege: 'Completo', allowedTabs: ['dashboard', 'os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config'] },
-      { id: '2', name: 'Técnico João', email: 'joao@techmanager.com', role: 'USUARIO', companyId: '1', privilege: 'Profissional', allowedTabs: ['dashboard', 'os', 'tarefas'] },
-      { id: '3', name: 'Atendente Maria', email: 'maria@techmanager.com', role: 'USUARIO', companyId: '1', privilege: 'Profissional', allowedTabs: ['dashboard', 'os', 'clientes', 'vendas'] },
-    ];
-  });
+  const [rmaHistory, setRmaHistory] = useState<any[]>([]);
 
-  useEffect(() => {
-    localStorage.setItem('techmanager_team', JSON.stringify(teamUsers));
-  }, [teamUsers]);
+  const [equipmentTypes, setEquipmentTypes] = useState<EquipmentType[]>([]);
 
-  const [rmaHistory, setRmaHistory] = useState<any[]>(() => {
-    const saved = localStorage.getItem('techmanager_rma');
-    return saved ? JSON.parse(saved) : [
-      { id: '1', product: 'Tela iPhone 13', sku: 'TEL-IP13-ORG', reason: 'Defeito na imagem', supplier: 'ABC Peças', status: 'Enviado', date: '10/04/2026' },
-      { id: '2', product: 'Bateria S22', sku: 'BAT-S22-PREM', reason: 'Não carrega', supplier: 'Z Peças', status: 'Concluído', date: '05/04/2026' },
-    ];
-  });
+  const [globalCustomers, setGlobalCustomers] = useState<any[]>([]);
+
+  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+
+  const [printTemplates, setPrintTemplates] = useState<PrintTemplate[]>([]);
 
   useEffect(() => {
-    localStorage.setItem('techmanager_rma', JSON.stringify(rmaHistory));
-  }, [rmaHistory]);
+    let cancelled = false;
 
-  const [equipmentTypes, setEquipmentTypes] = useState<EquipmentType[]>(() => {
-    const saved = localStorage.getItem('techmanager_equipments');
-    return saved ? JSON.parse(saved) : [
-      { id: '1', name: 'Smartphone', defaultDiagnosisDays: 1, defaultCompletionDays: 3, companyId: '1' },
-      { id: '2', name: 'Notebook', defaultDiagnosisDays: 2, defaultCompletionDays: 5, companyId: '1' },
-      { id: '3', name: 'Impressora', defaultDiagnosisDays: 3, defaultCompletionDays: 7, companyId: '1' },
-    ];
-  });
+    const loadAppState = async () => {
+      const applyResolvedState = async (serverState: any = {}) => {
+        const resolveArray = <T,>(serverValue: unknown): T[] => {
+          if (Array.isArray(serverValue)) return serverValue as T[];
+          return [];
+        };
 
-  useEffect(() => {
-    localStorage.setItem('techmanager_equipments', JSON.stringify(equipmentTypes));
-  }, [equipmentTypes]);
+        const resolvedUsers = resolveArray<AuthUser>(serverState?.users);
+        const resolvedCompanies = resolveArray<ManagedCompany>(serverState?.companies);
+        const resolvedOrders = resolveArray<ServiceOrder>(serverState?.orders);
+        const resolvedTasks = resolveArray<any>(serverState?.tasks);
+        const resolvedProducts = resolveArray<any>(serverState?.products);
+        const resolvedSales = resolveArray<any>(serverState?.sales);
+        const resolvedFinance = resolveArray<any>(serverState?.finance);
+        const resolvedTeam = resolveArray<User>(serverState?.team);
+        const resolvedRma = resolveArray<any>(serverState?.rma);
+        const resolvedEquipmentTypes = resolveArray<EquipmentType>(serverState?.equipmentTypes);
+        const resolvedCustomers = sanitizeCustomers(resolveArray<any>(serverState?.customers));
+        const resolvedSuppliers = resolveArray<Supplier>(serverState?.suppliers);
+        const resolvedPrintTemplates = resolveArray<PrintTemplate>(serverState?.printTemplates);
+        const resolvedCompany = hasCompanyContent(serverState?.companySettings)
+          ? { ...EMPTY_COMPANY, ...serverState.companySettings }
+          : companyFromManagedCompany(resolvedCompanies[0]);
 
-  const [globalCustomers, setGlobalCustomers] = useState<any[]>(() => {
-    const saved = localStorage.getItem('techmanager_customers');
-    return saved ? JSON.parse(saved) : [
-      { id: '1', name: 'João Silva', doc: '123.456.789-00', email: 'joao@email.com', phone: '(11) 99999-8888', street: 'Rua A', number: '100', neighborhood: 'Centro', city: 'São Paulo', state: 'SP', zip: '01000-000' },
-      { id: '2', name: 'Maria Oliveira', doc: '987.654.321-11', email: 'maria@email.com', phone: '(11) 97777-6666', street: 'Av B', number: '200', neighborhood: 'Jardins', city: 'Rio de Janeiro', state: 'RJ', zip: '20000-000' },
-      { id: '3', name: 'Tech Solutions LTDA', doc: '12.345.678/0001-99', email: 'contato@tech.com', phone: '(11) 3333-4444', street: 'Rua C', number: '300', neighborhood: 'Industrial', city: 'Curitiba', state: 'PR', zip: '80000-000' },
-    ];
-  });
+        if (cancelled) return;
 
-  useEffect(() => {
-    localStorage.setItem('techmanager_customers', JSON.stringify(globalCustomers));
-  }, [globalCustomers]);
+        setAuthUsers(resolvedUsers);
+        setManagedCompanies(resolvedCompanies);
+        setAllOrders(resolvedOrders);
+        setTasks(resolvedTasks);
+        setAllProducts(resolvedProducts);
+        setSalesHistory(resolvedSales);
+        setFinanceTransactions(resolvedFinance);
+        setTeamUsers(resolvedTeam);
+        setRmaHistory(resolvedRma);
+        setEquipmentTypes(resolvedEquipmentTypes);
+        setGlobalCustomers(resolvedCustomers);
+        setSuppliers(resolvedSuppliers);
+        setPrintTemplates(resolvedPrintTemplates);
+        setCompany(resolvedCompany);
+        setActiveCompany(resolvedCompany);
+        setCompanyLogo(resolvedCompany.logo || null);
+        setIsAppStateLoaded(true);
 
-  const [printTemplates, setPrintTemplates] = useState<PrintTemplate[]>(() => {
-    const saved = localStorage.getItem('techmanager_print_templates');
-    if (saved) return JSON.parse(saved);
-    
-    // Default Templates
-    const defaultLabel: PrintTemplate = {
-      id: 'default-label-os',
-      name: 'Etiqueta de Entrada (O.S)',
-      type: 'Etiqueta',
-      width: 40,
-      height: 25,
-      companyId: '1',
-      elements: [
-        { id: '1', type: 'text', content: 'ENTRADA DE EQUIPAMENTO', x: 2, y: 2, fontSize: 8, fontWeight: 'bold' },
-        { id: '2', type: 'variable', content: '{{os_number}}', x: 2, y: 6, fontSize: 14, fontWeight: 'bold' },
-        { id: '3', type: 'variable', content: '{{customer_name}}', x: 2, y: 12, fontSize: 8 },
-        { id: '4', type: 'variable', content: '{{equipment}}', x: 2, y: 16, fontSize: 8 },
-        { id: '5', type: 'variable', content: '{{os_date}}', x: 2, y: 20, fontSize: 6 },
-        { id: '6', type: 'qr', content: '{{os_number}}', x: 30, y: 12, width: 8, height: 8 }
-      ]
+        // Backend is the single source of truth for business data.
+      };
+
+      try {
+        const response = await axios.get('/api/app-state');
+        await applyResolvedState(response.data || {});
+        setIsBackendStateHydrated(true);
+      } catch (error) {
+        console.error('Erro ao carregar estado do banco:', error);
+        if (!cancelled) {
+          setIsAppStateLoaded(true);
+        }
+      }
     };
 
-    const defaultReceipt: PrintTemplate = {
-      id: 'default-receipt-nonfiscal',
-      name: 'Comprovante Não Fiscal',
-      type: 'Cupom',
-      width: 80,
-      height: 150,
-      companyId: '1',
-      elements: [
-        { id: '1', type: 'text', content: 'TECHMANAGER ASSISTENCIA', x: 20, y: 5, fontSize: 12, fontWeight: 'bold' },
-        { id: '2', type: 'line', content: '', x: 5, y: 12, width: 70, height: 1 },
-        { id: '3', type: 'text', content: 'ORCAMENTO DE SERVICO', x: 22, y: 15, fontSize: 10, fontWeight: 'bold' },
-        { id: '4', type: 'text', content: 'Nº O.S:', x: 5, y: 25, fontSize: 10 },
-        { id: '5', type: 'variable', content: '{{os_number}}', x: 25, y: 25, fontSize: 10, fontWeight: 'bold' },
-        { id: '6', type: 'text', content: 'CLIENTE:', x: 5, y: 32, fontSize: 10 },
-        { id: '7', type: 'variable', content: '{{customer_name}}', x: 25, y: 32, fontSize: 10 },
-        { id: '8', type: 'text', content: 'EQUIP:', x: 5, y: 39, fontSize: 10 },
-        { id: '9', type: 'variable', content: '{{equipment}}', x: 25, y: 39, fontSize: 10 },
-        { id: '10', type: 'line', content: '', x: 5, y: 46, width: 70, height: 1 },
-        { id: '11', type: 'text', content: 'PROBLEMA RELATADO', x: 5, y: 52, fontSize: 10, fontWeight: 'bold' },
-        { id: '12', type: 'variable', content: '{{problem}}', x: 5, y: 60, fontSize: 9 },
-        { id: '13', type: 'text', content: 'ASSINATURA CLIENTE', x: 20, y: 120, fontSize: 10 },
-        { id: '14', type: 'line', content: '', x: 5, y: 115, width: 70, height: 1 }
-      ]
-    };
+    loadAppState();
 
-    return [defaultLabel, defaultReceipt];
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isAppStateLoaded) return;
+    if (!isBackendStateHydrated) return;
+
+    setActiveCompany(company);
+    setCompanyLogo(company.logo || null);
+
+    axios.post('/api/app-state', {
+      users: authUsers,
+      companies: managedCompanies,
+      orders: allOrders,
+      tasks,
+      products: allProducts,
+      sales: salesHistory,
+      finance: financeTransactions,
+      team: teamUsers,
+      rma: rmaHistory,
+      equipmentTypes,
+      customers: globalCustomers,
+      suppliers,
+      printTemplates,
+      companySettings: company,
+    }).catch((error) => {
+      console.error('Erro ao persistir estado do app no banco:', error);
+    });
+  }, [
+    isAppStateLoaded,
+    isBackendStateHydrated,
+    authUsers,
+    managedCompanies,
+    allOrders,
+    tasks,
+    allProducts,
+    salesHistory,
+    financeTransactions,
+    teamUsers,
+    rmaHistory,
+    equipmentTypes,
+    globalCustomers,
+    suppliers,
+    printTemplates,
+    company,
+  ]);
+
+  const [supportSessions, setSupportSessions] = useState<SupportSession[]>(() => {
+    const saved = localStorage.getItem(SUPPORT_SESSIONS_STORAGE_KEY);
+    return saved ? JSON.parse(saved) : [];
   });
 
   useEffect(() => {
-    localStorage.setItem('techmanager_print_templates', JSON.stringify(printTemplates));
-  }, [printTemplates]);
+    localStorage.setItem(SUPPORT_SESSIONS_STORAGE_KEY, JSON.stringify(supportSessions));
+  }, [supportSessions]);
+
+  useEffect(() => {
+    const cleanupSessions = () => {
+      setSupportSessions((prev) => {
+        const validOsIds = new Set(allOrders.map((order) => order.id));
+        const cleaned = pruneSupportSessions(prev, validOsIds);
+        return cleaned.length === prev.length ? prev : cleaned;
+      });
+    };
+    cleanupSessions();
+    const interval = setInterval(cleanupSessions, 1000 * 60 * 30);
+    return () => clearInterval(interval);
+  }, [allOrders]);
 
   // Reset viewingOSId when activeTab changes to fix persistence bug
   useEffect(() => {
     setViewingOSId(null);
   }, [activeTab]);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth >= 1024);
-  const [isMobile, setIsMobile] = useState(window.innerWidth < 1024);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [darkMode, setDarkMode] = useState(() => {
     const saved = localStorage.getItem('techmanager_darkmode');
     return saved ? JSON.parse(saved) : false;
@@ -648,39 +872,41 @@ export default function App() {
   }, [darkMode]);
 
   useEffect(() => {
-    const checkMobile = () => {
-      const mobile = window.innerWidth < 1024;
-      setIsMobile(mobile);
-      if (mobile) {
-        setIsSidebarOpen(false);
-      } else {
-        setIsSidebarOpen(true);
-      }
-    };
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
-    return () => window.removeEventListener('resize', checkMobile);
-  }, []);
-
-  useEffect(() => {
     if (user) {
       if (user.role === 'ADMIN-SAAS') {
-        setActiveTab('saas-dashboard');
+        setActiveTab('superadmin-dashboard');
       } else {
         setActiveTab('dashboard');
       }
     }
   }, [user]);
 
+  const isTechnicalSupportEnabled = user?.role !== 'ADMIN-SAAS';
+
+  const handleLoginSuccess = (loggedUser: User) => {
+    setUser(loggedUser);
+    setSessionUserId(loggedUser.id);
+    localStorage.setItem(AUTH_SESSION_USER_ID_STORAGE_KEY, loggedUser.id);
+  };
+
+  const handleLogout = (showToast = true) => {
+    setUser(null);
+    setSessionUserId(null);
+    localStorage.removeItem(AUTH_SESSION_USER_ID_STORAGE_KEY);
+    if (showToast) {
+      toast.info('Você saiu do sistema.');
+    }
+  };
+
   const menuItems = user?.role === 'ADMIN-SAAS' ? [
-    { id: 'saas-dashboard', label: 'Painel SaaS', icon: LayoutDashboard },
-    { id: 'empresas', label: 'Empresas', icon: Building2 },
-    { id: 'planos', label: 'Planos', icon: PlansIcon },
-    { id: 'logs', label: 'Logs do Sistema', icon: Activity },
-    { id: 'config', label: 'Configurações', icon: Settings },
+    { id: 'superadmin-dashboard', label: 'Painel de Controle', icon: LayoutDashboard },
+    { id: 'superadmin-companies', label: 'Empresas', icon: Building2 },
+    { id: 'superadmin-users', label: 'Usuários', icon: Users },
+    { id: 'superadmin-settings', label: 'Configurações do Sistema', icon: Settings },
   ] : (user?.role === 'ADMIN-USER' ? [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'os', label: 'Ordens de Serviço', icon: Wrench },
+    { id: 'conferencia-os', label: 'Conferencia O.S', icon: ListChecks },
     { id: 'kanban', label: 'Quadro Kanban', icon: Filter },
     { id: 'tarefas', label: 'Tarefas', icon: ListTodo },
     { id: 'clientes', label: 'Clientes', icon: Users },
@@ -691,6 +917,7 @@ export default function App() {
     { id: 'financeiro', label: 'Financeiro', icon: DollarSign },
     { id: 'equipe', label: 'Equipe / Usuários', icon: Users },
     { id: 'impressao', label: 'Personalizar Impressão', icon: PrinterIcon },
+    ...(isTechnicalSupportEnabled ? [{ id: 'suporte-tecnico', label: 'Assistente Técnico', icon: Lightbulb }] : []),
     { id: 'calendario', label: 'Calendário', icon: Calendar },
     { id: 'config', label: 'Configurações', icon: Settings },
   ] : [
@@ -701,38 +928,77 @@ export default function App() {
     { id: 'clientes', label: 'Clientes', icon: Users },
     { id: 'estoque', label: 'Estoque', icon: Package },
     { id: 'whatsapp', label: 'WhatsApp', icon: MessageSquare },
+    ...(isTechnicalSupportEnabled ? [{ id: 'suporte-tecnico', label: 'Assistente Técnico', icon: Lightbulb }] : []),
     { id: 'calendario', label: 'Calendário', icon: Calendar },
     { id: 'config', label: 'Configurações', icon: Settings },
-  ].filter(item => (user?.allowedTabs || []).includes(item.id)));
+  ].filter(item => (user?.allowedTabs || []).includes(item.id) || (item.id === 'suporte-tecnico' && isTechnicalSupportEnabled)));
 
   const renderContent = () => {
     if (viewingOSId) {
       return (
-        <ServiceOrderDetailsView 
-          osId={viewingOSId} 
-          onBack={() => setViewingOSId(null)} 
+        <ServiceOrderDetailsView
+          osId={viewingOSId}
+          onBack={() => setViewingOSId(null)}
           allOrders={allOrders}
           setAllOrders={setAllOrders}
           customSubStatuses={customSubStatuses}
           allProducts={allProducts}
           teamUsers={teamUsers}
+          globalCustomers={globalCustomers}
           user={user}
+          company={company}
         />
       );
     }
 
     switch (activeTab) {
-      case 'saas-dashboard':
-      case 'empresas':
-      case 'planos':
-      case 'logs':
-        return <SaaSAdminView activeTab={activeTab} activeCompany={activeCompany} setActiveCompany={setActiveCompany} allOrders={allOrders} />;
+      case 'superadmin-dashboard':
+        return <SuperAdminDashboardView allUsers={authUsers} />;
+      case 'superadmin-companies':
+        return (
+          <SuperAdminCompaniesView
+            companies={managedCompanies}
+            setCompanies={setManagedCompanies}
+            users={authUsers}
+          />
+        );
+      case 'superadmin-users':
+        return (
+          <SuperAdminUsersView
+            users={authUsers}
+            setUsers={setAuthUsers}
+            setTeamUsers={setTeamUsers}
+            companies={managedCompanies}
+          />
+        );
+      case 'superadmin-settings':
+        return (
+          <SuperAdminSettingsView
+            onFactoryReset={() => {
+              localStorage.removeItem(AUTH_USERS_STORAGE_KEY);
+              localStorage.removeItem('techmanager_team');
+              localStorage.removeItem('techmanager_user');
+              localStorage.removeItem(AUTH_SESSION_USER_ID_STORAGE_KEY);
+              localStorage.removeItem(APP_COMPANIES_STORAGE_KEY);
+              setAuthUsers([]);
+              setTeamUsers([]);
+              setManagedCompanies([]);
+              handleLogout(false);
+            }}
+          />
+        );
       case 'fornecedores':
-        return <SupplierView />;
+        return (
+          <SupplierView
+            suppliers={suppliers}
+            setSuppliers={setSuppliers}
+            activeCompanyId={activeCompany?.id || user?.companyId || '1'}
+          />
+        );
       case 'dashboard':
         return user?.role === 'USUARIO' 
           ? <TechnicianDashboardView onViewOS={(id) => setViewingOSId(id)} allOrders={allOrders} user={user} equipmentTypes={equipmentTypes} setAllOrders={setAllOrders} />
-          : <DashboardView onViewOS={(id) => setViewingOSId(id)} onNavigate={setActiveTab} allOrders={allOrders} />;
+          : <DashboardView onViewOS={(id) => setViewingOSId(id)} onNavigate={setActiveTab} allOrders={allOrders} allProducts={allProducts} salesHistory={salesHistory} financeTransactions={financeTransactions} />;
       case 'os':
         return (
           <OSListView 
@@ -740,11 +1006,19 @@ export default function App() {
             allOrders={allOrders} 
             sortOrder={osSortOrder} 
             teamUsers={teamUsers} 
-            user={user} 
+            user={user as User} 
             equipmentTypes={equipmentTypes} 
+            globalCustomers={globalCustomers}
             setAllOrders={setAllOrders} 
             printTemplates={printTemplates} 
             company={company}
+          />
+        );
+      case 'conferencia-os':
+        return (
+          <OSConferenceView
+            allOrders={allOrders}
+            setAllOrders={setAllOrders}
           />
         );
       case 'kanban':
@@ -761,6 +1035,7 @@ export default function App() {
             setAllProducts={setAllProducts}
             rmaHistory={rmaHistory}
             setRmaHistory={setRmaHistory}
+            salesHistory={salesHistory}
           />
         );
       case 'financeiro':
@@ -793,10 +1068,22 @@ export default function App() {
         return <PrintCustomizationView templates={printTemplates} setTemplates={setPrintTemplates} />;
       case 'whatsapp':
         return <WhatsAppView companyId={user?.companyId || 'default'} />;
+      case 'suporte-tecnico':
+        return (
+          <TechnicalSupportView
+            user={user as User}
+            company={company}
+            allOrders={allOrders}
+            allProducts={allProducts}
+            supportSessions={supportSessions}
+            setSupportSessions={setSupportSessions}
+            isPremiumEnabled={!!isTechnicalSupportEnabled}
+          />
+        );
       case 'config':
         return (
           <SettingsView 
-            user={user} 
+            user={user as User} 
             companyLogo={companyLogo} 
             setCompanyLogo={setCompanyLogo} 
             customSubStatuses={customSubStatuses}
@@ -807,6 +1094,7 @@ export default function App() {
             setEquipmentTypes={setEquipmentTypes}
             teamUsers={teamUsers}
             setTeamUsers={setTeamUsers}
+            companies={managedCompanies}
             company={company}
             setCompany={setCompany}
           />
@@ -824,33 +1112,44 @@ export default function App() {
     }
   };
 
+  if (!isAppStateLoaded) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F8FAFC] p-4">
+        <Card className="w-full max-w-md border-none shadow-xl">
+          <CardHeader>
+            <CardTitle>Carregando dados do sistema</CardTitle>
+            <CardDescription>Sincronizando usuários, empresas e dashboards a partir do banco de dados.</CardDescription>
+          </CardHeader>
+        </Card>
+      </div>
+    );
+  }
+
+  if (!hasSuperAdmin) {
+    return (
+      <SetupView
+        onSetupComplete={(superAdmin) => {
+          setAuthUsers([superAdmin]);
+          setTeamUsers([]);
+          handleLoginSuccess(superAdmin);
+        }}
+      />
+    );
+  }
+
   if (!user) {
-    return <LoginView onLogin={setUser} />;
+    return <LoginView onLogin={handleLoginSuccess} authUsers={authUsers} />;
   }
 
   return (
-    <div className={cn("flex min-h-screen bg-background text-foreground font-sans selection:bg-primary/10 transition-colors duration-300", darkMode && "dark")}>
+    <div className={cn("desktop-app flex min-h-screen bg-background text-foreground font-sans selection:bg-primary/10 transition-colors duration-300", darkMode && "dark")}>
       <Toaster position="top-right" richColors />
-      
-      {/* Backdrop for Mobile */}
-      <AnimatePresence>
-        {isMobile && isSidebarOpen && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={() => setIsSidebarOpen(false)}
-            className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm lg:hidden"
-          />
-        )}
-      </AnimatePresence>
 
       {/* Sidebar */}
       <aside 
         className={cn(
-          "fixed inset-y-0 left-0 z-50 flex flex-col transition-all duration-300 bg-white border-r shadow-sm lg:relative",
-          isSidebarOpen ? "w-64 translate-x-0" : "w-20 -translate-x-full lg:translate-x-0 lg:w-20",
-          !isSidebarOpen && !isMobile && "lg:w-20"
+          "desktop-sidebar fixed inset-y-0 left-0 z-50 flex flex-col transition-all duration-300 bg-white border-r shadow-sm lg:relative",
+          isSidebarOpen ? "w-64 translate-x-0" : "w-20 translate-x-0"
         )}
       >
         <div className="flex items-center justify-between h-16 px-6 border-bottom">
@@ -860,8 +1159,8 @@ export default function App() {
             </div>
             {isSidebarOpen && <span className="text-lg font-bold tracking-tight">TechManager</span>}
           </div>
-          {isMobile && isSidebarOpen && (
-            <Button variant="ghost" size="icon" onClick={() => setIsSidebarOpen(false)} className="lg:hidden">
+          {isSidebarOpen && (
+            <Button variant="ghost" size="icon" onClick={() => setIsSidebarOpen(false)}>
               <X className="w-5 h-5" />
             </Button>
           )}
@@ -876,7 +1175,6 @@ export default function App() {
               active={activeTab === item.id}
               onClick={() => {
                 setActiveTab(item.id);
-                if (isMobile) setIsSidebarOpen(false);
               }}
             />
           ))}
@@ -887,8 +1185,7 @@ export default function App() {
             icon={LogOut}
             label={isSidebarOpen ? "Sair" : ""}
             onClick={() => {
-              setUser(null);
-              toast.info('Você saiu do sistema.');
+              handleLogout();
             }}
           />
         </div>
@@ -935,7 +1232,7 @@ export default function App() {
             <div className="flex items-center gap-3 pl-3 border-l">
               <div className="text-right hidden sm:block">
                 <p className="text-sm font-medium">{user.name}</p>
-                <p className="text-xs text-muted-foreground">{user.role}</p>
+                <p className="text-xs text-muted-foreground">{ROLE_LABELS[user.role] || user.role}</p>
               </div>
               <div className="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center text-primary font-bold">
                 {user.name.split(' ').map(n => n[0]).join('')}
@@ -945,7 +1242,7 @@ export default function App() {
         </header>
 
         {/* Viewport */}
-        <div className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-8">
+        <div className="desktop-content-max flex-1 overflow-y-auto p-4 lg:p-8 space-y-8">
           <AnimatePresence mode="wait">
             <motion.div
               key={activeTab}
@@ -965,6 +1262,581 @@ export default function App() {
 
 // --- Views ---
 
+function SuperAdminDashboardView({ allUsers }: { allUsers: AuthUser[] }) {
+  const totalUsers = allUsers.length;
+  const totalAdmins = allUsers.filter((u) => u.role === 'ADMIN-USER').length;
+  const totalTechnicians = allUsers.filter((u) => u.role === 'USUARIO').length;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Gestão do Aplicativo</h1>
+        <p className="text-muted-foreground">Painel exclusivo do superadmin para gerenciamento da plataforma.</p>
+      </div>
+      <div className="grid gap-4 md:grid-cols-3">
+        <Card>
+          <CardHeader><CardTitle>Total de Usuários</CardTitle></CardHeader>
+          <CardContent><p className="text-3xl font-bold">{totalUsers}</p></CardContent>
+        </Card>
+        <Card>
+          <CardHeader><CardTitle>Admins de Empresa</CardTitle></CardHeader>
+          <CardContent><p className="text-3xl font-bold">{totalAdmins}</p></CardContent>
+        </Card>
+        <Card>
+          <CardHeader><CardTitle>Usuários Técnicos</CardTitle></CardHeader>
+          <CardContent><p className="text-3xl font-bold">{totalTechnicians}</p></CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function SuperAdminCompaniesView({
+  companies,
+  setCompanies,
+  users,
+}: {
+  companies: ManagedCompany[];
+  setCompanies: React.Dispatch<React.SetStateAction<ManagedCompany[]>>;
+  users: AuthUser[];
+}) {
+  const [name, setName] = useState('');
+  const [document, setDocument] = useState('');
+  const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  const filteredCompanies = useMemo(() => {
+    const query = searchTerm.trim().toLowerCase();
+    if (!query) return companies;
+    return companies.filter((company) =>
+      [company.name, company.document || '', company.email || '', company.id]
+        .join(' ')
+        .toLowerCase()
+        .includes(query)
+    );
+  }, [companies, searchTerm]);
+
+  const clearForm = () => {
+    setName('');
+    setDocument('');
+    setEmail('');
+    setPhone('');
+    setEditingId(null);
+  };
+
+  const saveCompany = () => {
+    if (!name.trim()) {
+      toast.error('Nome da empresa é obrigatório.');
+      return;
+    }
+
+    setCompanies((prev) => {
+      const duplicateByName = prev.some(
+        (company) => company.name.toLowerCase() === name.trim().toLowerCase() && company.id !== editingId
+      );
+      if (duplicateByName) {
+        toast.error('Já existe uma empresa com esse nome.');
+        return prev;
+      }
+
+      if (editingId) {
+        return prev.map((company) =>
+          company.id === editingId
+            ? {
+                ...company,
+                name: name.trim(),
+                document: document.trim(),
+                email: email.trim().toLowerCase(),
+                phone: phone.trim(),
+              }
+            : company
+        );
+      }
+
+      return [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          name: name.trim(),
+          document: document.trim(),
+          email: email.trim().toLowerCase(),
+          phone: phone.trim(),
+          active: true,
+          createdAt: new Date().toISOString(),
+        },
+      ];
+    });
+
+    toast.success(editingId ? 'Empresa atualizada.' : 'Empresa cadastrada.');
+    clearForm();
+  };
+
+  const startEdit = (company: ManagedCompany) => {
+    setEditingId(company.id);
+    setName(company.name);
+    setDocument(company.document || '');
+    setEmail(company.email || '');
+    setPhone(company.phone || '');
+  };
+
+  const deleteCompany = (companyId: string) => {
+    const inUse = users.some((u) => u.role !== 'ADMIN-SAAS' && u.companyId === companyId);
+    if (inUse) {
+      toast.error('Esta empresa está vinculada a usuários e não pode ser removida.');
+      return;
+    }
+
+    setCompanies((prev) => {
+      if (prev.length <= 1) {
+        toast.error('É necessário manter pelo menos uma empresa cadastrada.');
+        return prev;
+      }
+      return prev.filter((company) => company.id !== companyId);
+    });
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Empresas</h1>
+        <p className="text-muted-foreground">Cadastre as empresas disponíveis para vincular nos usuários.</p>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{editingId ? 'Editar Empresa' : 'Nova Empresa'}</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid md:grid-cols-2 gap-3">
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome da empresa" />
+            <Input value={document} onChange={(e) => setDocument(e.target.value)} placeholder="CNPJ/Documento (opcional)" />
+            <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="E-mail (opcional)" />
+            <Input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (opcional)" />
+          </div>
+          <div className="flex justify-end gap-2">
+            {editingId && (
+              <Button type="button" variant="outline" onClick={clearForm}>
+                Cancelar
+              </Button>
+            )}
+            <Button type="button" onClick={saveCompany}>
+              {editingId ? 'Salvar Empresa' : 'Cadastrar Empresa'}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Empresas Cadastradas</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex gap-2">
+            <Input
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              placeholder="Pesquisar empresa por nome, documento ou ID"
+            />
+            <Button type="button" variant="outline" onClick={() => setSearchTerm(searchTerm.trim())}>
+              <Search className="w-4 h-4 mr-2" />
+              Pesquisar
+            </Button>
+          </div>
+
+          {filteredCompanies.length === 0 ? (
+            <p className="text-sm text-muted-foreground">Nenhuma empresa encontrada.</p>
+          ) : (
+            filteredCompanies.map((company) => (
+              <div key={company.id} className="rounded-md border p-3 flex items-center justify-between">
+                <div>
+                  <p className="font-medium">{company.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {company.document ? `${company.document}` : 'Sem CNPJ'} {company.email ? `| ${company.email}` : ''}
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <Button type="button" size="sm" variant="outline" onClick={() => startEdit(company)}>
+                    Editar
+                  </Button>
+                  <Button type="button" size="sm" variant="destructive" onClick={() => deleteCompany(company.id)}>
+                    Remover
+                  </Button>
+                </div>
+              </div>
+            ))
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function SuperAdminUsersView({
+  users,
+  setUsers,
+  setTeamUsers,
+  companies,
+}: {
+  users: AuthUser[];
+  setUsers: React.Dispatch<React.SetStateAction<AuthUser[]>>;
+  setTeamUsers: React.Dispatch<React.SetStateAction<User[]>>;
+  companies: ManagedCompany[];
+}) {
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState<User['role']>('USUARIO');
+  const [companyId, setCompanyId] = useState(companies[0]?.id || '');
+  const [companySearch, setCompanySearch] = useState('');
+  const [appliedCompanySearch, setAppliedCompanySearch] = useState('');
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  const visibleCompanies = useMemo(() => {
+    const query = appliedCompanySearch.trim().toLowerCase();
+    if (!query) return companies;
+    return companies.filter((company) =>
+      [company.name, company.document || '', company.id].join(' ').toLowerCase().includes(query)
+    );
+  }, [companies, appliedCompanySearch]);
+
+  useEffect(() => {
+    if (role === 'ADMIN-SAAS') {
+      setCompanyId('app-superadmin');
+      return;
+    }
+
+    if (companyId && companies.some((company) => company.id === companyId)) return;
+    setCompanyId(companies[0]?.id || '');
+  }, [companies, role, companyId]);
+
+  const syncTeamUsers = (nextUsers: AuthUser[]) => {
+    setTeamUsers(
+      nextUsers
+        .filter((u) => u.role !== 'ADMIN-SAAS')
+        .map((u) => ({
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          role: u.role,
+          companyId: u.companyId,
+          privilege: u.role === 'ADMIN-USER' ? 'Completo' : 'Profissional',
+          allowedTabs:
+            u.role === 'ADMIN-USER'
+              ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico']
+              : ['dashboard', 'os', 'tarefas', 'suporte-tecnico'],
+        }))
+    );
+  };
+
+  const clearForm = () => {
+    setName('');
+    setEmail('');
+    setPassword('');
+    setRole('USUARIO');
+    setCompanySearch('');
+    setAppliedCompanySearch('');
+    setCompanyId(companies[0]?.id || '');
+    setEditingId(null);
+  };
+
+  const saveUser = () => {
+    if (!name.trim() || !email.trim()) {
+      toast.error('Nome e e-mail são obrigatórios.');
+      return;
+    }
+    if (!editingId && !password.trim()) {
+      toast.error('Senha é obrigatória para novo usuário.');
+      return;
+    }
+    if (role !== 'ADMIN-SAAS' && !companyId) {
+      toast.error('Selecione uma empresa para o usuário.');
+      return;
+    }
+
+    const resolvedCompanyId = role === 'ADMIN-SAAS' ? 'app-superadmin' : companyId;
+
+    setUsers((prev) => {
+      const duplicate = prev.some((u) => u.email.toLowerCase() === email.trim().toLowerCase() && u.id !== editingId);
+      if (duplicate) {
+        toast.error('Já existe um usuário com esse e-mail.');
+        return prev;
+      }
+
+      const next = editingId
+        ? prev.map((u) =>
+            u.id === editingId
+              ? {
+                  ...u,
+                  name: name.trim(),
+                  email: email.trim().toLowerCase(),
+                  role,
+                  companyId: resolvedCompanyId,
+                  password: password.trim() ? password : u.password,
+                }
+              : u
+          )
+        : [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              name: name.trim(),
+              email: email.trim().toLowerCase(),
+              password: password.trim(),
+              role,
+              companyId: resolvedCompanyId,
+              allowedTabs:
+                role === 'ADMIN-SAAS'
+                  ? ['superadmin-dashboard', 'superadmin-companies', 'superadmin-users', 'superadmin-settings']
+                  : role === 'ADMIN-USER'
+                  ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico']
+                  : ['dashboard', 'os', 'tarefas', 'suporte-tecnico'],
+            } as AuthUser,
+          ];
+
+      syncTeamUsers(next);
+      return next;
+    });
+
+    toast.success(editingId ? 'Usuário atualizado.' : 'Usuário criado.');
+    clearForm();
+  };
+
+  const startEdit = (u: AuthUser) => {
+    setEditingId(u.id);
+    setName(u.name);
+    setEmail(u.email);
+    setPassword('');
+    setRole(u.role);
+    setCompanyId(u.companyId || companies[0]?.id || '');
+  };
+
+  const deleteUser = (id: string) => {
+    setUsers((prev) => {
+      const target = prev.find((u) => u.id === id);
+      if (!target) return prev;
+      if (target.role === 'ADMIN-SAAS' && prev.filter((u) => u.role === 'ADMIN-SAAS').length <= 1) {
+        toast.error('Não é possível remover o único superadmin.');
+        return prev;
+      }
+      const next = prev.filter((u) => u.id !== id);
+      syncTeamUsers(next);
+      return next;
+    });
+    toast.success('Usuário removido.');
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Gerenciar Usuários</h1>
+        <p className="text-muted-foreground">Adicionar, editar e remover usuários do aplicativo.</p>
+      </div>
+
+      <Card>
+        <CardHeader><CardTitle>{editingId ? 'Editar Usuário' : 'Novo Usuário'}</CardTitle></CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid md:grid-cols-2 gap-3">
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome" />
+            <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="E-mail" />
+            <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={editingId ? 'Nova senha (opcional)' : 'Senha'} />
+            <Select value={role} onValueChange={(v) => v && setRole(v as User['role'])}>
+              <SelectTrigger>
+                <SelectValue>{ROLE_LABELS[role] || role}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ADMIN-SAAS">Gerente Geral</SelectItem>
+                <SelectItem value="ADMIN-USER">Gerente de Empresa</SelectItem>
+                <SelectItem value="USUARIO">Técnico</SelectItem>
+              </SelectContent>
+            </Select>
+
+            {role !== 'ADMIN-SAAS' && (
+              <div className="md:col-span-2 space-y-2">
+                <div className="flex gap-2">
+                  <Input
+                    value={companySearch}
+                    onChange={(e) => setCompanySearch(e.target.value)}
+                    placeholder="Pesquisar empresas disponíveis"
+                  />
+                  <Button type="button" variant="outline" onClick={() => setAppliedCompanySearch(companySearch)}>
+                    <Search className="w-4 h-4 mr-2" />
+                    Pesquisar
+                  </Button>
+                </div>
+                <Select value={companyId} onValueChange={(v) => setCompanyId(v || '')}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Selecione uma empresa">
+                      {companies.find(c => c.id === companyId)?.name || 'Selecione uma empresa'}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {visibleCompanies.map((company) => (
+                      <SelectItem key={company.id} value={company.id}>
+                        {company.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {visibleCompanies.length === 0 && (
+                  <p className="text-xs text-muted-foreground">Nenhuma empresa encontrada para o filtro informado.</p>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="flex justify-end gap-2">
+            {editingId && <Button type="button" variant="outline" onClick={clearForm}>Cancelar</Button>}
+            <Button type="button" onClick={saveUser}>{editingId ? 'Salvar' : 'Adicionar Usuário'}</Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle>Usuários Cadastrados</CardTitle></CardHeader>
+        <CardContent className="space-y-2">
+          {users.length === 0 ? (
+            <p className="text-sm text-muted-foreground">Nenhum usuário cadastrado.</p>
+          ) : (
+            users.map((u) => (
+              <div key={u.id} className="rounded-md border p-3 flex items-center justify-between">
+                <div>
+                  <p className="font-medium">{u.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {u.email} | {ROLE_LABELS[u.role] || u.role} {u.role !== 'ADMIN-SAAS' && companies.find(c => c.id === u.companyId) ? `| ${companies.find(c => c.id === u.companyId)?.name}` : ''}
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <Button type="button" size="sm" variant="outline" onClick={() => startEdit(u)}>Editar</Button>
+                  <Button type="button" size="sm" variant="destructive" onClick={() => deleteUser(u.id)}>Remover</Button>
+                </div>
+              </div>
+            ))
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function SuperAdminSettingsView({ onFactoryReset }: { onFactoryReset: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const localBackupKeys = ['techmanager_darkmode', 'techmanager_os_sort'] as const;
+
+  const downloadBackup = async () => {
+    setBusy(true);
+    try {
+      const serverBackup = await axios.get('/api/system/backup');
+      const localStorageDump: Record<string, string> = {};
+      localBackupKeys.forEach((key) => {
+        const value = localStorage.getItem(key);
+        if (value !== null) {
+          localStorageDump[key] = value;
+        }
+      });
+
+      const payload = {
+        createdAt: new Date().toISOString(),
+        version: '1.0.0',
+        localStorage: localStorageDump,
+        serverBackup: serverBackup.data,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = `techmanager-backup-${format(new Date(), 'yyyyMMdd-HHmmss')}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(href);
+      toast.success('Backup gerado.');
+    } catch (error) {
+      console.error('Erro ao gerar backup:', error);
+      toast.error('Falha ao gerar backup.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const restoreBackup = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setBusy(true);
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+
+      if (payload?.localStorage && typeof payload.localStorage === 'object') {
+        Object.entries(payload.localStorage).forEach(([key, value]) => {
+          if (localBackupKeys.includes(key as (typeof localBackupKeys)[number])) {
+            localStorage.setItem(String(key), String(value));
+          }
+        });
+      }
+
+      if (payload?.serverBackup && typeof payload.serverBackup === 'object') {
+        await axios.post('/api/system/restore', payload.serverBackup);
+      } else if (payload?.db && typeof payload.db === 'object') {
+        await axios.post('/api/system/restore', payload);
+      }
+
+      toast.success('Backup restaurado. Recarregando...');
+      setTimeout(() => window.location.reload(), 600);
+    } catch (error) {
+      console.error('Erro ao restaurar backup:', error);
+      toast.error('Falha ao restaurar backup.');
+    } finally {
+      setBusy(false);
+      event.target.value = '';
+    }
+  };
+
+  const resetFactory = async () => {
+    const ok = window.confirm('Confirma reset de fábrica? Isso apagará todos os dados.');
+    if (!ok) return;
+    setBusy(true);
+    try {
+      await axios.post('/api/system/factory-reset', {});
+      Object.keys(localStorage).forEach((k) => {
+        if (k.startsWith('techmanager_')) localStorage.removeItem(k);
+      });
+      toast.success('Aplicativo resetado.');
+      onFactoryReset();
+    } catch (error) {
+      console.error('Erro no reset de fábrica:', error);
+      toast.error('Falha no reset de fábrica.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Configurações do Superadmin</h1>
+        <p className="text-muted-foreground">Backup, restauração e reset de fábrica.</p>
+      </div>
+      <Card>
+        <CardHeader><CardTitle>Backup e Restauração</CardTitle></CardHeader>
+        <CardContent className="flex flex-wrap gap-3">
+          <Button type="button" onClick={downloadBackup} disabled={busy}>Gerar Backup</Button>
+          <label className="inline-flex items-center gap-2 text-xs cursor-pointer border rounded-md px-3 py-2 hover:bg-secondary/30">
+            <UploadCloud className="w-4 h-4" /> Restaurar Backup
+            <input type="file" accept="application/json" className="hidden" onChange={restoreBackup} disabled={busy} />
+          </label>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader><CardTitle>Padrão de Fábrica</CardTitle></CardHeader>
+        <CardContent>
+          <Button type="button" variant="destructive" onClick={resetFactory} disabled={busy}>Resetar Aplicativo</Button>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function ServiceOrderDetailsView({ 
   osId, 
   onBack, 
@@ -973,7 +1845,9 @@ function ServiceOrderDetailsView({
   customSubStatuses,
   allProducts,
   teamUsers,
-  user
+  globalCustomers,
+  user,
+  company
 }: { 
   osId: string, 
   onBack: () => void, 
@@ -982,12 +1856,16 @@ function ServiceOrderDetailsView({
   customSubStatuses: Record<string, string[]>,
   allProducts: any[],
   teamUsers: User[],
-  user: User | null
+  globalCustomers: any[],
+  user: User | null,
+  company: Company
 }) {
   const os = allOrders.find(o => o.id === osId);
   const [status, setStatus] = useState<OSStatus | string>(os?.status || '');
   const [subStatus, setSubStatus] = useState(os?.subStatus || '');
   const [showPaymentDialog, setShowPaymentDialog] = useState(false);
+  const [isPrintViewOpen, setIsPrintViewOpen] = useState(false);
+  const [printAction, setPrintAction] = useState<'print' | 'pdf' | null>(null);
 
   const isOwner = user?.role === 'ADMIN-USER' || user?.role === 'ADMIN-SAAS';
 
@@ -1005,21 +1883,29 @@ function ServiceOrderDetailsView({
 
   const products = allProducts;
 
+  const openPrintView = (action: 'print' | 'pdf') => {
+    setPrintAction(action);
+    setIsPrintViewOpen(true);
+  };
+
   const handlePrint = () => {
-    window.print();
+    openPrintView('print');
   };
 
   const handlePDF = () => {
-    toast.info('Gerando PDF da Ordem de Serviço...');
-    setTimeout(() => {
-      toast.success('PDF gerado com sucesso!');
-    }, 1500);
+    openPrintView('pdf');
   };
 
   const handleEdit = () => {
     setIsUpdating(true);
     setActiveTab('geral');
     toast.info('Modo de edição ativado.');
+  };
+
+  const handleUpdateOS = () => {
+    setIsUpdating(true);
+    setActiveTab('status');
+    toast.info('Painel de atualização da OS aberto.');
   };
 
   const handleFinalize = () => {
@@ -1044,12 +1930,56 @@ function ServiceOrderDetailsView({
     );
   }
 
+  const normalizeValue = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+  const customerRecord =
+    globalCustomers.find((customer) => customer.id === os.customerId) ||
+    globalCustomers.find((customer) => normalizeValue(customer.name || '') === normalizeValue(os.customerName || ''));
+
+  const parseDateTime = (value?: string) => {
+    if (!value) return null;
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return null;
+    return parsed;
+  };
+
   const timeline = [
-    { date: '14/04/2024 11:05', user: 'Sistema', action: 'Status alterado para Aguardando Aprovação', detail: 'Orçamento enviado para o cliente via WhatsApp.' },
-    { date: '14/04/2024 11:00', user: 'Técnico João', action: 'Diagnóstico Concluído', detail: 'Identificada necessidade de substituição da tela frontal.' },
-    { date: '14/04/2024 10:15', user: 'Técnico João', action: 'Início de Análise', detail: 'Equipamento desmontado para verificação interna.' },
-    { date: '14/04/2024 09:30', user: 'Sistema', action: 'OS Aberta', detail: 'Entrada do equipamento na assistência.' },
-  ];
+    {
+      date: parseDateTime(os.updatedAt),
+      user: os.technicianName || teamUsers.find((member) => member.id === os.technicianId)?.name || 'Sistema',
+      action: `Status atual: ${os.status}`,
+      detail: os.subStatus ? `Substatus: ${os.subStatus}` : 'Última atualização registrada da ordem.',
+    },
+    os.diagnosisDate
+      ? {
+          date: parseDateTime(os.diagnosisDate),
+          user: os.technicianName || teamUsers.find((member) => member.id === os.technicianId)?.name || 'Técnico',
+          action: 'Diagnóstico registrado',
+          detail: os.diagnosis || 'Diagnóstico salvo sem detalhes.',
+        }
+      : null,
+    os.completionDeadline
+      ? {
+          date: parseDateTime(os.completionDeadline),
+          user: 'Sistema',
+          action: 'Prazo de conclusão definido',
+          detail: parseDateTime(os.completionDeadline)
+            ? `Prazo previsto para ${format(parseDateTime(os.completionDeadline) as Date, 'dd/MM/yyyy')}.`
+            : 'Prazo de conclusão configurado na ordem.',
+        }
+      : null,
+    {
+      date: parseDateTime(os.createdAt),
+      user: 'Sistema',
+      action: 'OS Aberta',
+      detail: 'Entrada do equipamento registrada no sistema.',
+    },
+  ]
+    .filter((entry): entry is { date: Date | null; user: string; action: string; detail: string } => !!entry)
+    .sort((a, b) => (b.date?.getTime() || 0) - (a.date?.getTime() || 0))
+    .map((entry) => ({
+      ...entry,
+      date: entry.date ? format(entry.date, 'dd/MM/yyyy HH:mm') : 'Data indisponível',
+    }));
 
   return (
     <div className="space-y-6">
@@ -1079,7 +2009,7 @@ function ServiceOrderDetailsView({
               <ShieldCheck className="w-4 h-4" /> Conferir e Finalizar
             </Button>
           )}
-          <Button variant="outline" size="sm" className="gap-2" onClick={() => setIsUpdating(true)}>
+          <Button variant="outline" size="sm" className="gap-2" onClick={handleUpdateOS}>
             <Settings className="w-4 h-4" /> Atualizar OS
           </Button>
           <Button variant="outline" size="sm" className="gap-2" onClick={handlePrint}>
@@ -1109,7 +2039,7 @@ function ServiceOrderDetailsView({
                 </div>
               </CardHeader>
               <CardContent className="pt-6">
-                <Tabs defaultValue="status" className="w-full">
+                <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
                   <TabsList className="grid w-full grid-cols-5 mb-6">
                     <TabsTrigger value="geral">Dados Gerais</TabsTrigger>
                     <TabsTrigger value="status">Status</TabsTrigger>
@@ -1178,7 +2108,7 @@ function ServiceOrderDetailsView({
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                         <div className="space-y-2">
                           <Label>Alterar Status Atual</Label>
-                          <Select value={status} onValueChange={setStatus}>
+                          <Select value={status} onValueChange={(value) => setStatus(value || '')}>
                             <SelectTrigger>
                               <SelectValue placeholder="Selecione o novo status" />
                             </SelectTrigger>
@@ -1193,7 +2123,7 @@ function ServiceOrderDetailsView({
                         {customSubStatuses[status as string] ? (
                           <div className="space-y-2">
                             <Label>Detalhamento (Sub-status)</Label>
-                            <Select value={subStatus} onValueChange={setSubStatus}>
+                            <Select value={subStatus} onValueChange={(value) => setSubStatus(value || '')}>
                               <SelectTrigger>
                                 <SelectValue placeholder="Selecione o detalhamento..." />
                               </SelectTrigger>
@@ -1277,7 +2207,7 @@ function ServiceOrderDetailsView({
                   <TabsContent value="produtos" className="space-y-4">
                     <div className="space-y-4">
                       <div className="flex gap-2">
-                        <Select value={selectedProductId} onValueChange={setSelectedProductId}>
+                        <Select value={selectedProductId} onValueChange={(value) => setSelectedProductId(value || '')}>
                           <SelectTrigger className="flex-1">
                             <SelectValue placeholder="Buscar no estoque..." />
                           </SelectTrigger>
@@ -1366,10 +2296,11 @@ function ServiceOrderDetailsView({
                           <Select 
                             defaultValue={os.technicianId} 
                             onValueChange={(val) => {
-                              const tech = teamUsers.find(u => u.id === val);
+                              const nextTechnicianId = val || '';
+                              const tech = teamUsers.find(u => u.id === nextTechnicianId);
                               setAllOrders(prev => prev.map(o => o.id === osId ? {
                                 ...o,
-                                technicianId: val,
+                                technicianId: nextTechnicianId || undefined,
                                 technicianName: tech?.name || ''
                               } : o));
                               toast.success(`Técnico ${tech?.name || 'Não identificado'} atribuído com sucesso!`);
@@ -1449,17 +2380,17 @@ function ServiceOrderDetailsView({
                 </div>
                 <div>
                   <p className="text-sm font-bold">{os.customerName}</p>
-                  <p className="text-xs text-muted-foreground">ID: {os.customerId}</p>
+                  <p className="text-xs text-muted-foreground">Cliente identificado por nome</p>
                 </div>
               </div>
               <div className="space-y-2 pt-2">
                 <div className="flex items-center gap-2 text-xs">
                   <MessageSquare className="w-3 h-3 text-muted-foreground" />
-                  <span>(11) 99999-8888</span>
+                  <span>{customerRecord?.phone || 'Não informado'}</span>
                 </div>
                 <div className="flex items-center gap-2 text-xs">
                   <FileText className="w-3 h-3 text-muted-foreground" />
-                  <span>123.456.789-00</span>
+                  <span>{customerRecord?.document || 'Não informado'}</span>
                 </div>
               </div>
               <Button variant="outline" className="w-full text-xs h-8 gap-2">
@@ -1506,11 +2437,13 @@ function ServiceOrderDetailsView({
                     variant="outline" 
                     className="h-16 flex flex-col gap-1 font-bold"
                     onClick={() => {
+                      const now = new Date().toISOString();
                       setAllOrders(prev => prev.map(o => o.id === osId ? { 
                         ...o, 
                         status: 'Entregue' as OSStatus, 
                         paymentStatus: 'Pago',
-                        updatedAt: new Date().toISOString() 
+                        paymentDate: now,
+                        updatedAt: now 
                       } : o));
                       setStatus('Entregue');
                       setShowPaymentDialog(false);
@@ -1544,6 +2477,18 @@ function ServiceOrderDetailsView({
           </Card>
         </div>
       </div>
+
+      {isPrintViewOpen && (
+        <OSPrintView
+          os={os}
+          onClose={() => {
+            setIsPrintViewOpen(false);
+            setPrintAction(null);
+          }}
+          company={company}
+          autoAction={printAction}
+        />
+      )}
     </div>
   );
 }
@@ -1579,6 +2524,11 @@ function TechnicianDashboardView({
   const monthDone = myOrders.filter(o => o.status === 'Finalizada' || o.status === 'Entregue').length;
   const waitingParts = myOrders.filter(o => o.status === 'Aguardando peça').length;
   const urgentOrders = myOrders.filter(o => o.priority === 'Urgente').length;
+  const myOrdersStatusData = [
+    { name: 'Em Reparo', value: myOrders.filter(o => o.status === 'Em reparo').length, color: '#3b82f6' },
+    { name: 'Testes', value: myOrders.filter(o => o.status === 'Testes finais').length, color: '#8b5cf6' },
+    { name: 'Aguardando', value: myOrders.filter(o => o.status === 'Aguardando peça' || o.status === 'Aguardando aprovação').length, color: '#f59e0b' },
+  ].filter(item => item.value > 0);
 
   const productivityData = [
     { name: 'Equipe', abertas: allOrders.filter(o => o.status === 'Aberta').length, concluídas: allOrders.filter(o => o.status === 'Finalizada').length },
@@ -1629,11 +2579,7 @@ function TechnicianDashboardView({
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie
-                  data={[
-                    { name: 'Em Reparo', value: 5, color: '#3b82f6' },
-                    { name: 'Testes', value: 3, color: '#8b5cf6' },
-                    { name: 'Aguardando', value: 4, color: '#f59e0b' },
-                  ]}
+                  data={myOrdersStatusData}
                   cx="50%"
                   cy="50%"
                   innerRadius={60}
@@ -1641,9 +2587,9 @@ function TechnicianDashboardView({
                   paddingAngle={5}
                   dataKey="value"
                 >
-                  <Cell fill="#3b82f6" />
-                  <Cell fill="#8b5cf6" />
-                  <Cell fill="#f59e0b" />
+                  {myOrdersStatusData.map((entry, index) => (
+                    <Cell key={`tech-status-${index}`} fill={entry.color} />
+                  ))}
                 </Pie>
                 <Tooltip />
                 <Legend verticalAlign="bottom" height={36} />
@@ -1745,11 +2691,30 @@ function SaaSAdminView({
   setActiveCompany: (c: Company) => void,
   allOrders: ServiceOrder[]
 }) {
-  const [companies, setCompanies] = useState([
-    { id: '1', name: 'Tech Assistência', cnpj: '12.345.678/0001-90', plan: 'Premium', status: 'Ativo', users: 5, os: 156, fiscal: true },
-    { id: '2', name: 'Smart Fix', cnpj: '98.765.432/0001-21', plan: 'Basic', status: 'Ativo', users: 2, os: 45, fiscal: false },
-    { id: '3', name: 'Mega Reparos', cnpj: '11.222.333/0001-44', plan: 'Enterprise', status: 'Inativo', users: 12, os: 890, fiscal: true },
-  ]);
+  const [companies, setCompanies] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (!activeCompany?.id || !activeCompany?.name) {
+      setCompanies([]);
+      return;
+    }
+
+    setCompanies((prev) => {
+      const existing = prev.find((item) => item.id === activeCompany.id);
+      const fallbackPlan = activeCompany.subscriptionPlan || 'Basic';
+      const nextCompany = {
+        id: activeCompany.id,
+        name: activeCompany.name,
+        cnpj: activeCompany.cnpj || '',
+        plan: existing?.plan || fallbackPlan,
+        status: 'Ativo',
+        users: existing?.users || 0,
+        os: allOrders.length,
+        fiscal: Boolean(activeCompany.fiscalEnabled),
+      };
+      return [nextCompany];
+    });
+  }, [activeCompany, allOrders.length]);
 
   const toggleFiscal = (id: string) => {
     setCompanies(prev => prev.map(c => c.id === id ? { ...c, fiscal: !c.fiscal } : c));
@@ -1796,18 +2761,8 @@ function SaaSAdminView({
               <CardDescription>Monitoramento de atividades globais.</CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="space-y-4">
-                {[
-                  { time: '10:45', user: 'Admin SaaS', action: 'Nova empresa cadastrada: Tech Assistência', type: 'info' },
-                  { time: '09:30', user: 'Sistema', action: 'Backup diário concluído com sucesso', type: 'success' },
-                  { time: '08:15', user: 'Admin Empresa', action: 'Alteração de plano: Smart Fix (Basic -> Premium)', type: 'warning' },
-                ].map((log, i) => (
-                  <div key={i} className="flex items-center gap-4 p-3 rounded-lg bg-secondary/30 text-xs">
-                    <span className="font-mono text-muted-foreground">{log.time}</span>
-                    <Badge variant="outline" className="text-[10px]">{log.user}</Badge>
-                    <span className="flex-1">{log.action}</span>
-                  </div>
-                ))}
+              <div className="py-8 text-center text-muted-foreground text-sm">
+                Nenhum log global disponível no momento.
               </div>
             </CardContent>
           </Card>
@@ -1896,9 +2851,9 @@ function SaaSAdminView({
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <StatCard title="Total de Empresas" value="128" icon={Building2} trend={15} color="bg-indigo-500" />
-        <StatCard title="Usuários Ativos" value="1.240" icon={Users} trend={8} color="bg-blue-500" />
-        <StatCard title="Faturamento SaaS" value="R$ 45.800,00" icon={DollarSign} trend={12} color="bg-emerald-500" />
+        <StatCard title="Total de Empresas" value={companies.length.toString()} icon={Building2} color="bg-indigo-500" />
+        <StatCard title="Usuários Ativos" value={companies.reduce((sum, item) => sum + Number(item.users || 0), 0).toString()} icon={Users} color="bg-blue-500" />
+        <StatCard title="Faturamento SaaS" value="R$ 0,00" icon={DollarSign} color="bg-emerald-500" />
         <StatCard title="Aguardando Conferência" value={allOrders.filter(o => o.status === 'Entregue').length.toString()} icon={ShieldCheck} color="bg-amber-500" />
       </div>
 
@@ -1976,19 +2931,49 @@ function SaaSAdminView({
 function DashboardView({ 
   onViewOS, 
   onNavigate, 
-  allOrders 
+  allOrders,
+  allProducts,
+  salesHistory,
+  financeTransactions,
 }: { 
   onViewOS: (id: string) => void, 
   onNavigate: (tab: string) => void,
-  allOrders: ServiceOrder[]
+  allOrders: ServiceOrder[],
+  allProducts: any[],
+  salesHistory: any[],
+  financeTransactions: any[],
 }) {
   const [hasPlayedAlert, setHasPlayedAlert] = useState(false);
 
-  const reminders = [
-    { id: '1', type: 'Vencido', desc: 'Boleto Fornecedor Telas', val: 1200.00, date: '12/04/2026', entity: 'Distribuidora X' },
-    { id: '2', type: 'Vencendo Hoje', desc: 'Aluguel Sala', val: 2500.00, date: '15/04/2026', entity: 'Imobiliária Central' },
-    { id: '3', type: 'Atrasado', desc: 'Energia Elétrica', val: 350.00, date: '10/04/2026', entity: 'Equatorial Energia' },
-  ];
+  const parseRecordDate = (value: string) => {
+    if (!value) return null;
+    if (value.includes('/')) {
+      const [day, month, year] = value.split('/').map(Number);
+      if (!day || !month || !year) return null;
+      return new Date(year, month - 1, day);
+    }
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  };
+
+  const reminders = financeTransactions
+    .filter((item) => item.type === 'OUT' || Number(item.val) < 0 || item.status === 'Pendente')
+    .map((item) => {
+      const dueDate = parseRecordDate(item.date);
+      const daysDiff = dueDate ? differenceInDays(startOfDay(dueDate), startOfDay(new Date())) : 999;
+      const reminderType = daysDiff < 0 ? 'Atrasado' : daysDiff === 0 ? 'Vencendo Hoje' : 'Programado';
+      return {
+        id: item.id,
+        type: reminderType,
+        desc: item.desc,
+        val: Math.abs(Number(item.val) || 0),
+        date: item.date,
+        entity: item.category || 'Financeiro',
+        sortValue: dueDate?.getTime() || Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .sort((a, b) => a.sortValue - b.sortValue)
+    .slice(0, 5);
 
   useEffect(() => {
     if (reminders.length > 0 && !hasPlayedAlert) {
@@ -1998,32 +2983,88 @@ function DashboardView({
     }
   }, [hasPlayedAlert]);
 
-  const data = [
-    { name: 'Seg', os: 12, vendas: 8 },
-    { name: 'Ter', os: 19, vendas: 12 },
-    { name: 'Qua', os: 15, vendas: 10 },
-    { name: 'Qui', os: 22, vendas: 15 },
-    { name: 'Sex', os: 30, vendas: 20 },
-    { name: 'Sáb', os: 18, vendas: 25 },
-    { name: 'Dom', os: 5, vendas: 10 },
-  ];
+  const weeklyData = eachDayOfInterval({ start: addDays(startOfDay(new Date()), -6), end: startOfDay(new Date()) }).map((date) => {
+    const osCount = allOrders.filter((order) => {
+      const createdAt = parseRecordDate(order.createdAt);
+      return createdAt ? isSameDay(createdAt, date) : false;
+    }).length;
 
-  const pieData = [
-    { name: 'Celulares', value: 400, color: '#3b82f6' },
-    { name: 'Impressoras', value: 300, color: '#10b981' },
-    { name: 'Informática', value: 300, color: '#f59e0b' },
-    { name: 'Scanners', value: 200, color: '#8b5cf6' },
-  ];
+    const salesCount = salesHistory.filter((sale) => {
+      const createdAt = parseRecordDate(sale.date);
+      return createdAt ? isSameDay(createdAt, date) : false;
+    }).length;
 
-  const financialData = [
-    { name: 'Jan', receita: 4000, despesa: 2400, lucro: 1600 },
-    { name: 'Fev', receita: 3000, despesa: 1398, lucro: 1602 },
-    { name: 'Mar', receita: 2000, despesa: 9800, lucro: -7800 },
-    { name: 'Abr', receita: 2780, despesa: 3908, lucro: -1128 },
-    { name: 'Mai', receita: 1890, despesa: 4800, lucro: -2910 },
-    { name: 'Jun', receita: 2390, despesa: 3800, lucro: -1410 },
-    { name: 'Jul', receita: 3490, despesa: 4300, lucro: -810 },
-  ];
+    return {
+      name: format(date, 'EEE', { locale: ptBR }),
+      os: osCount,
+      vendas: salesCount,
+    };
+  });
+
+  const piePalette = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444'];
+  const pieData = Object.entries(
+    allOrders.reduce((acc, order) => {
+      const key = order.equipment || 'Não informado';
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>)
+  )
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([name, value], index) => ({ name, value, color: piePalette[index % piePalette.length] }));
+
+  const financialData = Array.from({ length: 6 }, (_, offset) => {
+    const baseDate = addMonths(startOfMonth(new Date()), offset - 5);
+    const monthTransactions = financeTransactions.filter((item) => {
+      const parsed = parseRecordDate(item.date);
+      return parsed && parsed.getMonth() === baseDate.getMonth() && parsed.getFullYear() === baseDate.getFullYear();
+    });
+    const receita = monthTransactions
+      .filter((item) => item.type === 'IN' || Number(item.val) > 0)
+      .reduce((acc, item) => acc + Math.abs(Number(item.val) || 0), 0);
+    const despesa = monthTransactions
+      .filter((item) => item.type === 'OUT' || Number(item.val) < 0)
+      .reduce((acc, item) => acc + Math.abs(Number(item.val) || 0), 0);
+
+    return {
+      name: format(baseDate, 'MMM', { locale: ptBR }),
+      receita,
+      despesa,
+      lucro: receita - despesa,
+    };
+  });
+
+  const monthlyRevenue = financeTransactions
+    .filter((item) => {
+      const parsed = parseRecordDate(item.date);
+      return parsed && parsed.getMonth() === new Date().getMonth() && parsed.getFullYear() === new Date().getFullYear() && (item.type === 'IN' || Number(item.val) > 0);
+    })
+    .reduce((acc, item) => acc + Math.abs(Number(item.val) || 0), 0);
+
+  const todaySalesCount = salesHistory.filter((sale) => {
+    const parsed = parseRecordDate(sale.date);
+    return parsed ? isToday(parsed) : false;
+  }).length;
+
+  const lowStockCount = allProducts.filter((product) => product.stock <= (product.min ?? product.minStock ?? 0)).length;
+
+  const recentTransactions = financeTransactions
+    .slice()
+    .sort((a, b) => {
+      const aTime = parseRecordDate(a.date)?.getTime() || 0;
+      const bTime = parseRecordDate(b.date)?.getTime() || 0;
+      return bTime - aTime;
+    })
+    .slice(0, 10)
+    .map((item) => ({
+      id: item.id,
+      date: item.date || '-',
+      type: item.type === 'OUT' || Number(item.val) < 0 ? 'Despesa' : 'Venda',
+      desc: item.desc || item.description || 'Sem descrição',
+      client: item.customer || item.category || '-',
+      method: item.method || item.status || '-',
+      val: Math.abs(Number(item.val) || 0),
+    }));
 
   return (
     <div className="space-y-8">
@@ -2034,11 +3075,11 @@ function DashboardView({
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-6">
         <StatCard title="OS Abertas" value={allOrders.filter(o => o.status === 'Aberta').length.toString()} icon={Wrench} trend={12} color="bg-blue-500" description="Total de ordens de serviço em andamento no sistema." />
-        <StatCard title="Faturamento Mensal" value="R$ 12.450,00" icon={DollarSign} trend={8} color="bg-emerald-500" description="Soma de todas as vendas e OS finalizadas este mês." />
+        <StatCard title="Faturamento Mensal" value={`R$ ${monthlyRevenue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`} icon={DollarSign} trend={monthlyRevenue > 0 ? 8 : 0} color="bg-emerald-500" description="Soma das entradas registradas no financeiro neste mês." />
         <StatCard title="Prontas / Retirada" value={allOrders.filter(o => o.status === 'Pronta').length.toString()} icon={CheckCircle2} color="bg-emerald-600" description="Equipamentos aguardando o cliente retirar." />
         <StatCard title="Entregue p/ Conferência" value={allOrders.filter(o => o.status === 'Entregue').length.toString()} icon={ShieldCheck} color="bg-amber-500" description="OS entregues que aguardam conferência administrativa." />
-        <StatCard title="Vendas Hoje" value="15" icon={ShoppingCart} trend={-2} color="bg-indigo-500" description="Quantidade de vendas realizadas no PDV hoje." />
-        <StatCard title="Estoque Baixo" value="8" icon={Package} color="bg-rose-500" description="Produtos com quantidade abaixo do limite mínimo." />
+        <StatCard title="Vendas Hoje" value={todaySalesCount.toString()} icon={ShoppingCart} trend={todaySalesCount > 0 ? todaySalesCount : 0} color="bg-indigo-500" description="Quantidade de vendas registradas hoje no banco de dados." />
+        <StatCard title="Estoque Baixo" value={lowStockCount.toString()} icon={Package} color="bg-rose-500" description="Produtos com quantidade abaixo do limite mínimo." />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-7">
@@ -2049,7 +3090,7 @@ function DashboardView({
           </CardHeader>
           <CardContent className="h-[300px]">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={data}>
+              <BarChart data={weeklyData}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                 <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#64748b' }} />
                 <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#64748b' }} />
@@ -2237,7 +3278,7 @@ function DashboardView({
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {MOCK_OS.filter(os => os.status === 'Pronta').map((os) => (
+                {allOrders.filter((os: ServiceOrder) => os.status === 'Pronta').map((os) => (
                 <div key={os.id} className="flex items-center justify-between p-3 border rounded-lg bg-emerald-50/30 border-emerald-100">
                   <div className="flex items-center gap-3">
                     <div className="p-2 rounded-lg bg-emerald-100">
@@ -2256,7 +3297,7 @@ function DashboardView({
                   </div>
                 </div>
               ))}
-              {MOCK_OS.filter(os => os.status === 'Pronta').length === 0 && (
+                {allOrders.filter((os: ServiceOrder) => os.status === 'Pronta').length === 0 && (
                 <p className="text-center text-sm text-muted-foreground py-8 italic">Nenhum equipamento pronto no momento.</p>
               )}
             </div>
@@ -2267,20 +3308,139 @@ function DashboardView({
   );
 }
 
-function OSPrintView({ os, onClose, company }: { os: ServiceOrder, onClose: () => void, company: Company }) {
+function OSPrintView({
+  os,
+  onClose,
+  company,
+  autoAction = null,
+}: {
+  os: ServiceOrder;
+  onClose: () => void;
+  company: Company;
+  autoAction?: 'print' | 'pdf' | null;
+}) {
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const autoTriggered = useRef(false);
+
   const handlePrint = () => {
-    window.print();
+    const target = document.getElementById('os-print-area');
+    if (!target) {
+      toast.error('Nao foi possivel localizar o layout de impressao.');
+      return;
+    }
+
+    const printWindow = window.open('', '_blank', 'width=1200,height=900');
+    if (!printWindow) {
+      window.print();
+      return;
+    }
+
+    const styleNodes = Array.from(document.querySelectorAll('style, link[rel="stylesheet"]'));
+    const styles = styleNodes.map((node) => node.outerHTML).join('');
+    const printableHtml = target.outerHTML;
+
+    printWindow.document.open();
+    printWindow.document.write(`
+      <!doctype html>
+      <html lang="pt-BR">
+        <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>OS ${os.number}</title>
+          ${styles}
+          <style>
+            body {
+              margin: 0;
+              background: #fff;
+            }
+            #os-print-area {
+              width: 210mm !important;
+              max-width: 210mm !important;
+              margin: 0 auto !important;
+              box-shadow: none !important;
+            }
+            .print\\:hidden {
+              display: none !important;
+            }
+            @page {
+              size: A4;
+              margin: 8mm;
+            }
+          </style>
+        </head>
+        <body>
+          ${printableHtml}
+        </body>
+      </html>
+    `);
+    printWindow.document.close();
+
+    printWindow.onload = () => {
+      printWindow.focus();
+      printWindow.print();
+      printWindow.close();
+    };
   };
 
-  const handleDownloadPDF = () => {
-    toast.success('Gerando PDF para download...');
-    setTimeout(() => {
+  const handleDownloadPDF = async () => {
+    const target = document.getElementById('os-print-area');
+    if (!target) {
+      toast.error('Nao foi possivel localizar o layout de impressao.');
+      return;
+    }
+
+    try {
+      setIsGeneratingPdf(true);
+      const canvas = await html2canvas(target, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        width: target.scrollWidth,
+        height: target.scrollHeight,
+      });
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = pdf.internal.pageSize.getHeight();
+      const imgWidth = pdfWidth;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+
+      let heightLeft = imgHeight;
+      let position = 0;
+
+      pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
+      heightLeft -= pdfHeight;
+
+      while (heightLeft > 0) {
+        position = heightLeft - imgHeight;
+        pdf.addPage();
+        pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
+        heightLeft -= pdfHeight;
+      }
+      pdf.save(`os-${os.number}.pdf`);
       toast.success('PDF baixado com sucesso!');
-    }, 1500);
+    } catch (error) {
+      console.error('Erro ao gerar PDF:', error);
+      toast.error('Falha ao gerar o PDF.');
+    } finally {
+      setIsGeneratingPdf(false);
+    }
   };
+
+  useEffect(() => {
+    if (!autoAction || autoTriggered.current) return;
+    autoTriggered.current = true;
+    if (autoAction === 'pdf') {
+      handleDownloadPDF();
+      return;
+    }
+    if (autoAction === 'print') {
+      setTimeout(() => handlePrint(), 150);
+    }
+  }, [autoAction]);
 
   const OSContent = () => (
-    <div className="p-4 md:p-8 print:p-0 bg-white text-black font-sans">
+    <div className="p-4 md:p-8 print:p-0 bg-white text-black font-sans min-h-[1123px]">
       {/* Header */}
       <div className="flex flex-col md:flex-row justify-between items-start gap-4 border-b-2 border-black pb-6 mb-6">
         <div className="flex gap-4 items-center">
@@ -2306,7 +3466,7 @@ function OSPrintView({ os, onClose, company }: { os: ServiceOrder, onClose: () =
           <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-gray-200 pb-1">Dados do Cliente</h3>
           <div>
             <p className="text-sm font-black">{os.customerName}</p>
-            <p className="text-xs text-gray-600">ID Cliente: {os.customerId}</p>
+            <p className="text-xs text-gray-600">Cliente registrado por nome</p>
           </div>
         </div>
         <div className="space-y-2 md:space-y-4">
@@ -2315,6 +3475,7 @@ function OSPrintView({ os, onClose, company }: { os: ServiceOrder, onClose: () =
             <p className="text-sm font-black">{os.equipment}</p>
             <p className="text-xs text-gray-600">{os.brand} {os.model}</p>
             <p className="text-xs text-gray-600 font-mono">S/N: {os.serialNumber}</p>
+            <p className="text-xs text-gray-600">Técnico: {os.technicianName || 'Não atribuído'}</p>
           </div>
         </div>
       </div>
@@ -2334,14 +3495,10 @@ function OSPrintView({ os, onClose, company }: { os: ServiceOrder, onClose: () =
       </div>
 
       {/* Status & Priority */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4 mb-8">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2 md:gap-4 mb-8">
         <div className="border p-2 md:p-3 rounded-lg text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Status</p>
           <p className="text-xs md:text-sm font-black">{os.status}</p>
-        </div>
-        <div className="border p-2 md:p-3 rounded-lg text-center">
-          <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prioridade</p>
-          <p className="text-xs md:text-sm font-black">{os.priority}</p>
         </div>
         <div className="border p-2 md:p-3 rounded-lg text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prazo Diag.</p>
@@ -2424,25 +3581,29 @@ function OSPrintView({ os, onClose, company }: { os: ServiceOrder, onClose: () =
 
   return (
     <Dialog open={!!os} onOpenChange={() => onClose()}>
-      <DialogContent className="max-w-[850px] w-[95vw] max-h-[95vh] overflow-y-auto p-0 border-none bg-white">
-        <div id="os-print-area">
-          <OSContent />
-          
-          {company.osCopiesPerPage === 2 && (
-            <>
-              <div className="border-y-2 border-dashed border-gray-300 my-8 py-4 text-center print:my-4 print:py-2">
-                <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2">
-                  <Scissors className="w-3 h-3" /> Cortar aqui - Via do {company.name} / Via do Cliente
-                </p>
-              </div>
-              <OSContent />
-            </>
-          )}
+      <DialogContent className="os-a4-dialog max-w-none w-[calc(100vw-3rem)] h-[calc(100vh-2.5rem)] overflow-hidden p-0 border-none bg-zinc-100">
+        <div className="os-a4-stage h-[calc(100%-70px)] overflow-auto p-4 lg:p-6">
+          <div id="os-print-area" className="os-a4-paper mx-auto w-full max-w-[794px] bg-white shadow-xl">
+            <OSContent />
+            
+            {company.osCopiesPerPage === 2 && (
+              <>
+                <div className="border-y-2 border-dashed border-gray-300 my-8 py-4 text-center print:my-4 print:py-2">
+                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2">
+                    <Scissors className="w-3 h-3" /> Cortar aqui - Via do {company.name} / Via do Cliente
+                  </p>
+                </div>
+                <OSContent />
+              </>
+            )}
+          </div>
         </div>
 
-        <div className="p-4 bg-gray-100 border-t flex justify-end gap-2 print:hidden">
+        <div className="p-4 bg-gray-100 border-t flex justify-end gap-2 print:hidden shrink-0">
           <Button variant="outline" onClick={onClose}>Fechar</Button>
-          <Button variant="outline" className="gap-2" onClick={handleDownloadPDF}><Download className="w-4 h-4" /> Baixar PDF</Button>
+          <Button variant="outline" className="gap-2" onClick={handleDownloadPDF} disabled={isGeneratingPdf}>
+            <Download className="w-4 h-4" /> {isGeneratingPdf ? 'Gerando PDF...' : 'Baixar PDF'}
+          </Button>
           <Button className="gap-2" onClick={handlePrint}><Printer className="w-4 h-4" /> Imprimir</Button>
         </div>
       </DialogContent>
@@ -2482,6 +3643,7 @@ function OSListView({
   teamUsers,
   user,
   equipmentTypes,
+  globalCustomers,
   setAllOrders,
   printTemplates,
   company
@@ -2492,6 +3654,7 @@ function OSListView({
   teamUsers: User[],
   user: User | null,
   equipmentTypes: EquipmentType[],
+  globalCustomers: Array<{ id: string; name: string; doc?: string; phone?: string; email?: string }>,
   setAllOrders: React.Dispatch<React.SetStateAction<ServiceOrder[]>>,
   printTemplates: PrintTemplate[],
   company: Company
@@ -2499,6 +3662,7 @@ function OSListView({
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isNewCustomerOpen, setIsNewCustomerOpen] = useState(false);
   const [customerSearch, setCustomerSearch] = useState('');
+  const [selectedCustomerId, setSelectedCustomerId] = useState('');
   const [showCustomerResults, setShowCustomerResults] = useState(false);
   const [showPostSavePrintDialog, setShowPostSavePrintDialog] = useState(false);
   const [lastCreatedOS, setLastCreatedOS] = useState<ServiceOrder | null>(null);
@@ -2514,6 +3678,11 @@ function OSListView({
   const [isPrintTemplateDialogOpen, setIsPrintTemplateDialogOpen] = useState(false);
   const [isTemplatePreviewOpen, setIsTemplatePreviewOpen] = useState(false);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
+  const [selectedEquipmentTypeId, setSelectedEquipmentTypeId] = useState('');
+  const [selectedTechnicianId, setSelectedTechnicianId] = useState('');
+  const [installedPrinters, setInstalledPrinters] = useState<string[]>([]);
+  const [isLoadingPrinters, setIsLoadingPrinters] = useState(false);
+  const [selectedEntryPrinter, setSelectedEntryPrinter] = useState('');
 
   const handleTemplatePrint = (os: ServiceOrder) => {
     if (printTemplates.length === 0) {
@@ -2530,6 +3699,23 @@ function OSListView({
     () => printTemplates.find(t => t.id === selectedTemplateId) || null,
     [printTemplates, selectedTemplateId]
   );
+
+  const loadInstalledPrinters = async () => {
+    try {
+      setIsLoadingPrinters(true);
+      const response = await axios.get('/api/system/printers');
+      const printers = Array.isArray(response.data?.printers) ? response.data.printers : [];
+      setInstalledPrinters(printers);
+      if (printers.length > 0 && !selectedEntryPrinter) {
+        setSelectedEntryPrinter(printers[0]);
+      }
+    } catch (error) {
+      console.error('Erro ao carregar impressoras:', error);
+      toast.error('Não foi possível carregar as impressoras instaladas.');
+    } finally {
+      setIsLoadingPrinters(false);
+    }
+  };
   const [newOsItems, setNewOsItems] = useState<OSItem[]>([]);
   const [newItemDesc, setNewItemDesc] = useState('');
   const [newItemPrice, setNewItemPrice] = useState('0');
@@ -2560,14 +3746,11 @@ function OSListView({
 
   const totalOSValue = newOsItems.reduce((acc, curr) => acc + curr.totalPrice, 0);
 
-  const customers = [
-    { id: '1', name: 'João Silva' },
-    { id: '2', name: 'Maria Oliveira' },
-    { id: '3', name: 'Tech Solutions LTDA' }
-  ];
-
-  const filteredCustomers = customers.filter(c => 
-    fuzzyMatch(c.name, customerSearch)
+  const filteredCustomers = globalCustomers.filter(c =>
+    fuzzyMatch(c.name, customerSearch) ||
+    fuzzyMatch(c.doc || '', customerSearch) ||
+    fuzzyMatch(c.phone || '', customerSearch) ||
+    fuzzyMatch(c.email || '', customerSearch)
   );
 
   const filteredOrders = allOrders.filter(os => {
@@ -2619,6 +3802,14 @@ function OSListView({
     const now = new Date();
     const diagDays = eqType?.defaultDiagnosisDays || 1;
     const compDays = eqType?.defaultCompletionDays || 3;
+    const customerName = customerSearch.trim();
+    if (!customerName) {
+      toast.error('Informe o nome do cliente para continuar.');
+      return;
+    }
+    const exactCustomer = selectedCustomerId
+      ? globalCustomers.find((c) => c.id === selectedCustomerId)
+      : globalCustomers.find((c) => c.name.toLowerCase() === customerName.toLowerCase());
 
     const diagDeadline = addDays(now, diagDays).toISOString();
     const compDeadline = addDays(now, compDays).toISOString();
@@ -2626,9 +3817,10 @@ function OSListView({
     const newOS: ServiceOrder = {
       id: Math.random().toString(36).substr(2, 9),
       number: `OS-${new Date().getFullYear()}-${(allOrders.length + 1).toString().padStart(3, '0')}`,
-      customerId: 'custom-id', // Simplified
-      customerName: customerSearch,
-      equipment: (equipment || '').toUpperCase(),
+      customerId: exactCustomer?.id || `manual-${Date.now()}`,
+      customerName,
+      customerPhone: exactCustomer?.phone || '',
+      equipment: (eqType?.name || equipment || '').toUpperCase(),
       brand: (formData.get('brand') as string || '').toUpperCase(),
       model: (formData.get('model') as string || '').toUpperCase(),
       serialNumber: (formData.get('serial') as string || '').toUpperCase(),
@@ -2641,8 +3833,8 @@ function OSListView({
       priority: formData.get('priority') as any,
       value: totalOSValue,
       items: newOsItems,
-      technicianId: formData.get('technicianId') as string,
-      technicianName: teamUsers.find(u => u.id === formData.get('technicianId'))?.name || '',
+      technicianId: (formData.get('technicianId') as string) || selectedTechnicianId,
+      technicianName: teamUsers.find(u => u.id === ((formData.get('technicianId') as string) || selectedTechnicianId))?.name || '',
       diagnosisDeadline: diagDeadline,
       completionDeadline: compDeadline,
       createdAt: now.toISOString(),
@@ -2656,6 +3848,9 @@ function OSListView({
     // Clear form
     setNewOsItems([]);
     setCustomerSearch('');
+    setSelectedCustomerId('');
+    setSelectedEquipmentTypeId('');
+    setSelectedTechnicianId('');
     
     // Open Print Selection Dialog
     setLastCreatedOS(newOS);
@@ -2701,7 +3896,13 @@ function OSListView({
             type="Ordens de Serviço" 
             onImport={(data) => console.log('Importing OS', data)} 
           />
-          <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+          <Dialog open={isDialogOpen} onOpenChange={(open) => {
+            setIsDialogOpen(open);
+            if (!open) {
+              setSelectedEquipmentTypeId('');
+              setSelectedTechnicianId('');
+            }
+          }}>
             <DialogTrigger render={
               <Button className="gap-2"><Plus className="w-4 h-4" /> Nova OS</Button>
             } />
@@ -2723,7 +3924,10 @@ function OSListView({
                         placeholder="Pesquisar cliente..." 
                         className="pl-9 uppercase"
                         value={customerSearch}
-                        onChange={(e) => setCustomerSearch(e.target.value)}
+                        onChange={(e) => {
+                          setCustomerSearch(e.target.value);
+                          setSelectedCustomerId('');
+                        }}
                         onFocus={() => setShowCustomerResults(true)}
                       />
                       {showCustomerResults && customerSearch && filteredCustomers.length > 0 && (
@@ -2734,6 +3938,7 @@ function OSListView({
                               className="px-4 py-2 hover:bg-secondary cursor-pointer text-sm"
                               onClick={() => {
                                 setCustomerSearch(c.name);
+                                setSelectedCustomerId(c.id);
                                 setShowCustomerResults(false);
                               }}
                             >
@@ -2790,8 +3995,10 @@ function OSListView({
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="equipamento">Equipamento</Label>
-                  <Select name="equipmentType" onValueChange={(val) => {
-                    const eqType = equipmentTypes.find(e => e.id === val);
+                  <Select name="equipmentType" value={selectedEquipmentTypeId} onValueChange={(val) => {
+                    const nextValue = val || '';
+                    setSelectedEquipmentTypeId(nextValue);
+                    const eqType = equipmentTypes.find(e => e.id === nextValue);
                     const equipmentInput = document.getElementById('equipamento') as HTMLInputElement;
                     if(equipmentInput) equipmentInput.value = (eqType?.name || '').toUpperCase();
                   }}>
@@ -2808,7 +4015,7 @@ function OSListView({
                 </div>
                 <div className="space-y-2">
                   <Label className="uppercase text-[10px] font-bold">Técnico Responsável</Label>
-                  <Select name="technicianId">
+                  <Select name="technicianId" value={selectedTechnicianId} onValueChange={(val) => setSelectedTechnicianId(val || '')}>
                     <SelectTrigger className="h-10 text-xs w-full">
                       <SelectValue placeholder="SELECIONE UM TÉCNICO..." />
                     </SelectTrigger>
@@ -3171,33 +4378,46 @@ function OSListView({
                         <Eye className="w-4 h-4" />
                       </Button>
                       
-                      <DropdownMenu>
-                        <DropdownMenuTrigger render={
-                          <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Ações da OS">
-                            <MoreVertical className="w-4 h-4" />
-                          </Button>
-                        } />
-                        <DropdownMenuContent align="end" className="w-48 shadow-xl border-none p-1">
-                          <DropdownMenuLabel>Ações da OS</DropdownMenuLabel>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem onClick={() => onViewOS(os.id)}>
-                            <Edit className="w-4 h-4 mr-2" /> Editar OS
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => setSelectedOSForA4Print(os)}>
-                            <FileText className="w-4 h-4 mr-2" /> PDF / Impressão A4
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleTemplatePrint(os)}>
-                            <Printer className="w-4 h-4 mr-2" /> Etiqueta / Cupom
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleShareLink(os)}>
-                            <Share2 className="w-4 h-4 mr-2" /> Compartilhar Link
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem className="text-rose-600" onClick={() => handleDeleteOS(os.id)}>
-                            <Trash2 className="w-4 h-4 mr-2" /> Excluir OS
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8"
+                        onClick={() => setSelectedOSForA4Print(os)}
+                        title="PDF / Impressão A4"
+                        aria-label="PDF / Impressão A4"
+                      >
+                        <FileText className="w-4 h-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8"
+                        onClick={() => handleTemplatePrint(os)}
+                        title="Etiqueta / Cupom"
+                        aria-label="Etiqueta / Cupom"
+                      >
+                        <Printer className="w-4 h-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8"
+                        onClick={() => handleShareLink(os)}
+                        title="Compartilhar Link"
+                        aria-label="Compartilhar Link"
+                      >
+                        <Share2 className="w-4 h-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-rose-600"
+                        onClick={() => handleDeleteOS(os.id)}
+                        title="Excluir OS"
+                        aria-label="Excluir OS"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
                     </div>
                   </td>
                 </tr>
@@ -3347,7 +4567,13 @@ function OSListView({
                 "flex items-center justify-between p-4 rounded-2xl border-2 transition-all cursor-pointer group hover:shadow-md",
                 printCheckboxes.entry ? "border-primary bg-primary/5 shadow-sm" : "border-muted/20 bg-muted/5 hover:border-primary/30"
               )}
-              onClick={() => setPrintCheckboxes(prev => ({ ...prev, entry: !prev.entry }))}
+              onClick={() => {
+                const next = !printCheckboxes.entry;
+                setPrintCheckboxes(prev => ({ ...prev, entry: next }));
+                if (next && installedPrinters.length === 0 && !isLoadingPrinters) {
+                  loadInstalledPrinters();
+                }
+              }}
             >
               <div className="flex items-center gap-4">
                 <div className={cn(
@@ -3368,6 +4594,32 @@ function OSListView({
                 {printCheckboxes.entry && <Check className="w-4 h-4 text-white" strokeWidth={4} />}
               </div>
             </div>
+
+            {printCheckboxes.entry && (
+              <div className="rounded-2xl border bg-secondary/10 p-4 space-y-3">
+                <p className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Impressoras instaladas no sistema</p>
+                {isLoadingPrinters && <p className="text-sm text-muted-foreground">Carregando impressoras...</p>}
+                {!isLoadingPrinters && installedPrinters.length === 0 && (
+                  <p className="text-sm text-muted-foreground">Nenhuma impressora encontrada.</p>
+                )}
+                {!isLoadingPrinters && installedPrinters.length > 0 && (
+                  <div className="max-h-32 overflow-y-auto space-y-2 pr-1">
+                    {installedPrinters.map((printer) => (
+                      <label key={printer} className="flex items-center gap-2 text-sm cursor-pointer">
+                        <input
+                          type="radio"
+                          name="entry-printer"
+                          checked={selectedEntryPrinter === printer}
+                          onChange={() => setSelectedEntryPrinter(printer)}
+                          className="accent-primary"
+                        />
+                        <span>{printer}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div 
               className={cn(
@@ -3405,6 +4657,9 @@ function OSListView({
                 onClick={() => {
                   toast.success('Gerando impressões selecionadas...');
                   setShowPostSavePrintDialog(false);
+                  if (printCheckboxes.entry && selectedEntryPrinter) {
+                    toast.info(`Impressora selecionada: ${selectedEntryPrinter}`);
+                  }
                   if (lastCreatedOS) {
                     setSelectedOSForA4Print(lastCreatedOS);
                   }
@@ -3427,9 +4682,7 @@ function CustomerView({
   customers: any[], 
   setCustomers: React.Dispatch<React.SetStateAction<any[]>> 
 }) {
-  const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [customerSearch, setCustomerSearch] = useState('');
-  const [newCustomer, setNewCustomer] = useState<any>({
+  const emptyCustomer = {
     name: '',
     doc: '',
     email: '',
@@ -3441,7 +4694,11 @@ function CustomerView({
     neighborhood: '',
     city: '',
     state: 'SP'
-  });
+  };
+  const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [customerSearch, setCustomerSearch] = useState('');
+  const [newCustomer, setNewCustomer] = useState<any>(emptyCustomer);
+  const [editingCustomerId, setEditingCustomerId] = useState<string | null>(null);
   
   const filteredCustomers = customers.filter(c => 
     fuzzyMatch(c.name, customerSearch) ||
@@ -3451,22 +4708,42 @@ function CustomerView({
   );
 
   const handleSaveCustomer = () => {
-    if (!newCustomer.name) {
+    if (!newCustomer.name?.trim()) {
       toast.error('Nome do cliente é obrigatório');
       return;
     }
-    const customer = {
-      ...newCustomer,
-      id: Math.random().toString(36).substr(2, 9)
-    };
-    setCustomers(prev => [...prev, customer]);
-    toast.success('Cliente cadastrado com sucesso!');
+
+    if (editingCustomerId) {
+      setCustomers(prev => prev.map((customer) => customer.id === editingCustomerId ? { ...customer, ...newCustomer } : customer));
+      toast.success('Cliente atualizado com sucesso!');
+    } else {
+      const customer = {
+        ...newCustomer,
+        id: Math.random().toString(36).substr(2, 9)
+      };
+      setCustomers(prev => [...prev, customer]);
+      toast.success('Cliente cadastrado com sucesso!');
+    }
+
     setIsDialogOpen(false);
-    setNewCustomer({
-      name: '', doc: '', email: '', phone: '', zip: '',
-      street: '', number: '', complement: '', neighborhood: '',
-      city: '', state: 'SP'
-    });
+    setEditingCustomerId(null);
+    setNewCustomer(emptyCustomer);
+  };
+
+  const handleEditCustomer = (customer: any) => {
+    setNewCustomer({ ...emptyCustomer, ...customer });
+    setEditingCustomerId(customer.id);
+    setIsDialogOpen(true);
+  };
+
+  const handleDeleteCustomer = (customerId: string) => {
+    if (!confirm('Deseja realmente excluir este cliente? Esta ação não pode ser desfeita.')) return;
+    setCustomers(prev => prev.filter((customer) => customer.id !== customerId));
+    if (editingCustomerId === customerId) {
+      setEditingCustomerId(null);
+      setNewCustomer(emptyCustomer);
+    }
+    toast.success('Cliente excluído com sucesso!');
   };
 
   return (
@@ -3488,19 +4765,29 @@ function CustomerView({
           />
           <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
             <DialogTrigger render={
-              <Button className="gap-2"><Plus className="w-4 h-4" /> Novo Cliente</Button>
+              <Button
+                className="gap-2"
+                onClick={() => {
+                  setEditingCustomerId(null);
+                  setNewCustomer(emptyCustomer);
+                }}
+              >
+                <Plus className="w-4 h-4" /> Novo Cliente
+              </Button>
             } />
             <DialogContent className="max-w-2xl px-0 overflow-hidden shadow-2xl rounded-3xl">
               <div className="bg-primary p-6 text-white">
-                <DialogTitle className="text-2xl font-black">Cadastrar Novo Cliente</DialogTitle>
-                <DialogDescription className="text-white/70">Preencha os dados abaixo para registrar um novo cliente no sistema.</DialogDescription>
+                <DialogTitle className="text-2xl font-black">{editingCustomerId ? 'Editar Cliente' : 'Cadastrar Novo Cliente'}</DialogTitle>
+                <DialogDescription className="text-white/70">
+                  {editingCustomerId ? 'Atualize os dados do cliente selecionado.' : 'Preencha os dados abaixo para registrar um novo cliente no sistema.'}
+                </DialogDescription>
               </div>
               
               <div className="grid gap-6 p-8 max-h-[70vh] overflow-y-auto custom-scrollbar">
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="name" className="font-bold">Nome Completo / Razão Social</Label>
-                    <Input id="name" placeholder="Ex: João da Silva" value={newCustomer.name} onChange={e => setNewCustomer({...newCustomer, name: e.target.value})} />
+                      <Input id="name" placeholder="Nome do cliente" value={newCustomer.name} onChange={e => setNewCustomer({...newCustomer, name: e.target.value})} />
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="doc" className="font-bold">CPF / CNPJ</Label>
@@ -3528,7 +4815,7 @@ function CustomerView({
                   </div>
                   <div className="col-span-2 space-y-2">
                     <Label htmlFor="address" className="font-bold">Logradouro (Rua, Av.)</Label>
-                    <Input id="address" placeholder="Ex: Rua das Flores" value={newCustomer.street} onChange={e => setNewCustomer({...newCustomer, street: e.target.value})} />
+                    <Input id="address" placeholder="Logradouro" value={newCustomer.street} onChange={e => setNewCustomer({...newCustomer, street: e.target.value})} />
                   </div>
                 </div>
                 
@@ -3573,8 +4860,20 @@ function CustomerView({
             </div>
 
             <div className="p-6 bg-secondary/10 flex justify-end gap-3 border-t">
-              <Button variant="outline" className="font-bold h-12 px-6" onClick={() => setIsDialogOpen(false)}>Cancelar</Button>
-              <Button className="font-black h-12 px-8" onClick={handleSaveCustomer}>Salvar Cliente</Button>
+              <Button
+                variant="outline"
+                className="font-bold h-12 px-6"
+                onClick={() => {
+                  setIsDialogOpen(false);
+                  setEditingCustomerId(null);
+                  setNewCustomer(emptyCustomer);
+                }}
+              >
+                Cancelar
+              </Button>
+              <Button className="font-black h-12 px-8" onClick={handleSaveCustomer}>
+                {editingCustomerId ? 'Salvar Alterações' : 'Salvar Cliente'}
+              </Button>
             </div>
           </DialogContent>
         </Dialog>
@@ -3619,8 +4918,24 @@ function CustomerView({
                   <td className="px-6 py-4">{c.city}</td>
                   <td className="px-6 py-4">
                     <div className="flex justify-center gap-2">
-                      <Button variant="ghost" size="icon" className="h-8 w-8"><FileText className="w-4 h-4" /></Button>
-                      <Button variant="ghost" size="icon" className="h-8 w-8"><MoreVertical className="w-4 h-4" /></Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8"
+                        title="Editar cliente"
+                        onClick={() => handleEditCustomer(c)}
+                      >
+                        <Edit className="w-4 h-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-rose-600 hover:text-rose-700"
+                        title="Apagar cliente"
+                        onClick={() => handleDeleteCustomer(c.id)}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
                     </div>
                   </td>
                 </tr>
@@ -3638,13 +4953,15 @@ function StockView({
   allProducts, 
   setAllProducts,
   rmaHistory,
-  setRmaHistory
+  setRmaHistory,
+  salesHistory = []
 }: { 
   fiscalEnabled: boolean, 
   allProducts: any[], 
   setAllProducts: React.Dispatch<React.SetStateAction<any[]>>,
   rmaHistory: any[],
-  setRmaHistory: React.Dispatch<React.SetStateAction<any[]>>
+  setRmaHistory: React.Dispatch<React.SetStateAction<any[]>>,
+  salesHistory?: any[]
 }) {
   const [isProductModalOpen, setIsProductModalOpen] = useState(false);
   const [isBuyModalOpen, setIsBuyModalOpen] = useState(false);
@@ -3654,40 +4971,71 @@ function StockView({
   const [bestSellersPeriod, setBestSellersPeriod] = useState('30d');
   const [bestSellersDisplayCount, setBestSellersDisplayCount] = useState(10);
   
-  const [categories, setCategories] = useState([
-    { id: '1', name: 'Peças', type: 'Produto' },
-    { id: '2', name: 'Acessórios', type: 'Produto' },
-    { id: '3', name: 'Mão de Obra', type: 'Serviço' },
-    { id: '4', name: 'Software', type: 'Serviço' },
-  ]);
+  const [categories, setCategories] = useState<{ id: string; name: string; type: string }[]>([]);
 
   const [editingCategory, setEditingCategory] = useState<{id: string, name: string, type: string} | null>(null);
+  const [categoryNameDraft, setCategoryNameDraft] = useState('');
+  const [categoryTypeDraft, setCategoryTypeDraft] = useState<'Produto' | 'Serviço'>('Produto');
 
   const [stockSearch, setStockSearch] = useState('');
   const [stockFilterCategory, setStockFilterCategory] = useState('todas');
   const [editingProduct, setEditingProduct] = useState<any>(null);
+  const [productKind, setProductKind] = useState<'Produto' | 'Serviço'>('Produto');
+  const products = allProducts;
 
-  const products = allProducts; // For compatibility with existing bestSellers calculation if needed
+  useEffect(() => {
+    if (editingCategory) {
+      setCategoryNameDraft(editingCategory.name);
+      setCategoryTypeDraft((editingCategory.type as 'Produto' | 'Serviço') || 'Produto');
+      return;
+    }
+    setCategoryNameDraft('');
+    setCategoryTypeDraft('Produto');
+  }, [editingCategory]);
 
-  const bestSellers = [
-    { id: '1', name: 'Tela iPhone 13 Original', totalSales: 45, value: 38250, cat: 'Peças', cost: 22500 },
-    { id: '2', name: 'Bateria Samsung S22', totalSales: 38, value: 4560, cat: 'Peças', cost: 3040 },
-    { id: '3', name: 'Mão de Obra Reparo Placa', totalSales: 32, value: 9600, cat: 'Mão de Obra', cost: 0 },
-    { id: '4', name: 'Película 3D iPhone', totalSales: 28, value: 840, cat: 'Acessórios', cost: 280 },
-    { id: '5', name: 'Cabo Lightning 1m', totalSales: 25, value: 1250, cat: 'Acessórios', cost: 500 },
-    { id: '6', name: 'Conector de Carga Moto G60', totalSales: 22, value: 550, cat: 'Peças', cost: 220 },
-    { id: '7', name: 'Mão de Obra Troca de Tela', totalSales: 20, value: 4000, cat: 'Mão de Obra', cost: 0 },
-    { id: '8', name: 'Fone de Ouvido Bluetooth', totalSales: 18, value: 2700, cat: 'Acessórios', cost: 1350 },
-    { id: '9', name: 'Capa Silicone iPhone 13', totalSales: 15, value: 750, cat: 'Acessórios', cost: 225 },
-    { id: '10', name: 'Carregador 20W USB-C', totalSales: 12, value: 1800, cat: 'Acessórios', cost: 900 },
-    { id: '11', name: 'Tela iPhone 12', totalSales: 10, value: 7500, cat: 'Peças', cost: 4500 },
-    { id: '12', name: 'Bateria iPhone 11', totalSales: 8, value: 1600, cat: 'Peças', cost: 800 },
-  ].sort((a,b) => b.totalSales - a.totalSales);
+  useEffect(() => {
+    if (!isProductModalOpen) return;
+    if (editingProduct?.type === 'Serviço') {
+      setProductKind('Serviço');
+      return;
+    }
+    setProductKind('Produto');
+  }, [isProductModalOpen, editingProduct]);
 
-  const lowStockProducts = allProducts.filter(p => p.stock <= p.min);
-  const filteredBuyProducts = allProducts.filter(p => 
-    p.name.toLowerCase().includes(buySearch.toLowerCase()) || 
-    p.sku.toLowerCase().includes(buySearch.toLowerCase())
+  useEffect(() => {
+    if (categories.length > 0) return;
+    const unique = Array.from(new Set(allProducts.map((p) => p.cat).filter(Boolean))) as string[];
+    if (unique.length === 0) return;
+    setCategories(unique.map((name) => ({ id: crypto.randomUUID(), name, type: 'Produto' })));
+  }, [allProducts, categories.length]);
+
+  const bestSellers = Object.values(
+    salesHistory.reduce((acc: Record<string, any>, sale: any) => {
+      (sale.items || []).forEach((item: any) => {
+        const existing = acc[item.sku] || {
+          id: item.id || item.sku || crypto.randomUUID(),
+          name: item.name || item.description || 'Item sem nome',
+          totalSales: 0,
+          value: 0,
+          cat: allProducts.find((product) => product.sku === item.sku)?.cat || 'Sem categoria',
+          cost: 0,
+        };
+        const quantity = Number(item.quantity) || 0;
+        const unitPrice = Number(item.price ?? item.unitPrice) || 0;
+        existing.totalSales += quantity;
+        existing.value += quantity * unitPrice;
+        acc[item.sku] = existing;
+      });
+      return acc;
+    }, {})
+  ).sort((a: any, b: any) => b.totalSales - a.totalSales);
+
+  const lowStockProducts = allProducts.filter(p => p.type !== 'Serviço' && p.stock <= p.min);
+  const filteredBuyProducts = allProducts.filter(p =>
+    p.type !== 'Serviço' && (
+      p.name.toLowerCase().includes(buySearch.toLowerCase()) ||
+      p.sku.toLowerCase().includes(buySearch.toLowerCase())
+    )
   );
 
   const filteredStockProducts = allProducts.filter(p => {
@@ -3695,6 +5043,73 @@ function StockView({
     const matchesCategory = stockFilterCategory === 'todas' || p.cat === stockFilterCategory;
     return matchesSearch && matchesCategory;
   });
+
+  const parseSalesDate = (value: string) => {
+    if (!value) return null;
+    if (value.includes('/')) {
+      const [day, month, year] = value.split('/').map(Number);
+      if (!day || !month || !year) return null;
+      const parsed = new Date(year, month - 1, day);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  };
+
+  const now = new Date();
+  const thirtyDaysAgo = addDays(now, -30);
+  const sixtyDaysAgo = addDays(now, -60);
+
+  const salesInLast30Days = salesHistory.filter((sale: any) => {
+    const parsedDate = parseSalesDate(String(sale.date || ''));
+    return parsedDate ? parsedDate >= thirtyDaysAgo && parsedDate <= now : false;
+  });
+
+  const salesInPrevious30Days = salesHistory.filter((sale: any) => {
+    const parsedDate = parseSalesDate(String(sale.date || ''));
+    return parsedDate ? parsedDate >= sixtyDaysAgo && parsedDate < thirtyDaysAgo : false;
+  });
+
+  const sumSalesItems = (sales: any[]) => sales.reduce((acc, sale) => (
+    acc + (sale.items || []).reduce((itemAcc: number, item: any) => itemAcc + (Number(item.quantity) || 0), 0)
+  ), 0);
+
+  const soldLast30Days = sumSalesItems(salesInLast30Days);
+  const soldPrevious30Days = sumSalesItems(salesInPrevious30Days);
+  const stockUnits = products.reduce((acc, product) => acc + (Number(product.stock) || 0), 0);
+  const inventoryTurnover = stockUnits > 0 ? soldLast30Days / stockUnits : 0;
+  const inventoryTrend = soldPrevious30Days > 0
+    ? ((soldLast30Days - soldPrevious30Days) / soldPrevious30Days) * 100
+    : soldLast30Days > 0
+      ? 100
+      : 0;
+
+  const rmaLast30Days = rmaHistory.filter((entry: any) => {
+    const parsedDate = parseSalesDate(String(entry.date || entry.createdAt || ''));
+    return parsedDate ? parsedDate >= thirtyDaysAgo && parsedDate <= now : false;
+  }).length;
+
+  const inventoryAccuracy = soldLast30Days > 0
+    ? Math.max(0, 100 - (rmaLast30Days / soldLast30Days) * 100)
+    : 100;
+
+  const lastMovementBySku = salesHistory.reduce((acc: Record<string, Date>, sale: any) => {
+    const parsedDate = parseSalesDate(String(sale.date || ''));
+    if (!parsedDate) return acc;
+
+    (sale.items || []).forEach((item: any) => {
+      const sku = String(item.sku || '');
+      if (!sku) return;
+      if (!acc[sku] || parsedDate > acc[sku]) {
+        acc[sku] = parsedDate;
+      }
+    });
+
+    return acc;
+  }, {});
+
+  const totalStockValue = products.reduce((acc, p) => acc + (Number(p.price) || 0) * (Number(p.stock) || 0), 0);
+  const stockHealthLabel = inventoryAccuracy >= 90 ? 'Excelente' : inventoryAccuracy >= 75 ? 'Boa' : 'Atencao';
 
   const handleDeleteProduct = (id: string) => {
     if (confirm('Deseja realmente excluir este produto?')) {
@@ -3823,13 +5238,13 @@ function StockView({
               </DialogHeader>
               <div className="space-y-4 py-4">
                 <div className="flex gap-2 p-3 bg-secondary/20 rounded-lg border border-dashed">
-                  <Input 
-                    placeholder={editingCategory ? "Editar categoria..." : "Nova categoria..."} 
-                    className="flex-1 bg-white" 
-                    id="cat-name-input"
-                    defaultValue={editingCategory?.name || ''}
+                  <Input
+                    placeholder={editingCategory ? "Editar categoria..." : "Nova categoria..."}
+                    className="flex-1 bg-white"
+                    value={categoryNameDraft}
+                    onChange={(e) => setCategoryNameDraft(e.target.value)}
                   />
-                  <Select defaultValue={editingCategory?.type || "Produto"}>
+                  <Select value={categoryTypeDraft} onValueChange={(v) => setCategoryTypeDraft((v as 'Produto' | 'Serviço') || 'Produto')}>
                     <SelectTrigger className="w-32 bg-white"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="Produto">Produto</SelectItem>
@@ -3837,23 +5252,28 @@ function StockView({
                     </SelectContent>
                   </Select>
                   <Button size="icon" onClick={() => {
-                    const nameInput = document.getElementById('cat-name-input') as HTMLInputElement;
-                    if (!nameInput.value) return;
+                    const normalizedName = categoryNameDraft.trim();
+                    if (!normalizedName) return;
                     
                     if (editingCategory) {
-                      setCategories(prev => prev.map(c => c.id === editingCategory.id ? { ...c, name: nameInput.value } : c));
+                      setCategories(prev => prev.map(c => c.id === editingCategory.id ? { ...c, name: normalizedName, type: categoryTypeDraft } : c));
                       toast.success('Categoria atualizada!');
                       setEditingCategory(null);
                     } else {
-                      setCategories(prev => [...prev, { id: Math.random().toString(), name: nameInput.value, type: 'Produto' }]);
+                      setCategories(prev => [...prev, { id: Math.random().toString(), name: normalizedName, type: categoryTypeDraft }]);
                       toast.success('Categoria criada!');
                     }
-                    nameInput.value = '';
+                    setCategoryNameDraft('');
+                    setCategoryTypeDraft('Produto');
                   }}>
                     {editingCategory ? <Check className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
                   </Button>
                   {editingCategory && (
-                    <Button size="icon" variant="ghost" onClick={() => setEditingCategory(null)}>
+                    <Button size="icon" variant="ghost" onClick={() => {
+                      setEditingCategory(null);
+                      setCategoryNameDraft('');
+                      setCategoryTypeDraft('Produto');
+                    }}>
                       <X className="w-4 h-4" />
                     </Button>
                   )}
@@ -3926,14 +5346,33 @@ function StockView({
               <form onSubmit={(e) => {
                 e.preventDefault();
                 const formData = new FormData(e.currentTarget);
+                const parsedPrice = Number(formData.get('price')) || 0;
+                const parsedStock = Number(formData.get('stock')) || 0;
+                const parsedMin = Number(formData.get('min')) || 0;
                 const prodData: any = {
                   id: editingProduct?.id || Math.random().toString(36).substr(2, 9),
                   name: formData.get('name') as string,
                   sku: formData.get('sku') as string,
-                  price: Number(formData.get('price')),
-                  stock: Number(formData.get('stock')),
-                  min: Number(formData.get('min')),
+                  type: productKind,
+                  price: parsedPrice,
+                  stock: productKind === 'Produto' ? parsedStock : 0,
+                  min: productKind === 'Produto' ? parsedMin : 0,
                   cat: formData.get('cat') as string,
+                  image: productImage || editingProduct?.image || null,
+                  cost: Number(formData.get('cost') || 0),
+                  freight: Number(formData.get('freight') || 0),
+                  durationMin: Number(formData.get('durationMin') || 0),
+                  commissionRate: Number(formData.get('commissionRate') || 0),
+                  ncm: String(formData.get('ncm') || ''),
+                  cest: String(formData.get('cest') || ''),
+                  origin: String(formData.get('origin') || '0'),
+                  serviceCode: String(formData.get('serviceCode') || ''),
+                  municipalServiceCode: String(formData.get('municipalServiceCode') || ''),
+                  issRate: Number(formData.get('issRate') || 0),
+                  pisRate: Number(formData.get('pisRate') || 0),
+                  cofinsRate: Number(formData.get('cofinsRate') || 0),
+                  withholdingIss: formData.get('withholdingIss') === 'on',
+                  withholdingInss: formData.get('withholdingInss') === 'on',
                 };
 
                 if (editingProduct) {
@@ -3999,44 +5438,77 @@ function StockView({
                         <Input id="prod-sku" name="sku" defaultValue={editingProduct?.sku} placeholder="IPH-14-TEL" required />
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="prod-cat">Categoria</Label>
-                        <Select name="cat" defaultValue={editingProduct?.cat || 'Peças'}>
-                          <SelectTrigger><SelectValue placeholder="Selecione" /></SelectTrigger>
+                        <Label htmlFor="prod-type">Tipo</Label>
+                        <Select value={productKind} onValueChange={(v) => setProductKind((v as 'Produto' | 'Serviço') || 'Produto')}>
+                          <SelectTrigger><SelectValue /></SelectTrigger>
                           <SelectContent>
-                            {categories.map(c => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
+                            <SelectItem value="Produto">Produto</SelectItem>
+                            <SelectItem value="Serviço">Serviço</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-4">
+                    <div className="grid grid-cols-1 gap-4">
                       <div className="space-y-2">
-                        <Label>Valor de Custo (R$)</Label>
-                        <Input type="number" step="0.01" placeholder="0,00" />
-                      </div>
-                      <div className="space-y-2">
-                        <Label>Valor de Frete (R$)</Label>
-                        <Input type="number" step="0.01" placeholder="0,00" />
+                        <Label htmlFor="prod-cat">Categoria</Label>
+                        <Select name="cat" defaultValue={editingProduct?.cat || 'Peças'}>
+                          <SelectTrigger><SelectValue placeholder="Selecione" /></SelectTrigger>
+                          <SelectContent>
+                            {categories
+                              .filter(c => c.type === productKind)
+                              .map(c => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
+                            {categories.filter(c => c.type === productKind).length === 0 && (
+                              <SelectItem value="none" disabled>Nenhuma categoria deste tipo</SelectItem>
+                            )}
+                          </SelectContent>
+                        </Select>
                       </div>
                     </div>
+
+                    {productKind === 'Produto' ? (
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label>Valor de Custo (R$)</Label>
+                          <Input name="cost" type="number" step="0.01" placeholder="0,00" defaultValue={editingProduct?.cost || ''} />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>Valor de Frete (R$)</Label>
+                          <Input name="freight" type="number" step="0.01" placeholder="0,00" defaultValue={editingProduct?.freight || ''} />
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label>Duração (minutos)</Label>
+                          <Input name="durationMin" type="number" min="0" placeholder="60" defaultValue={editingProduct?.durationMin || ''} />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>Comissão Técnica (%)</Label>
+                          <Input name="commissionRate" type="number" step="0.01" min="0" placeholder="0,00" defaultValue={editingProduct?.commissionRate || ''} />
+                        </div>
+                      </div>
+                    )}
 
                     <div className="space-y-2">
                       <Label htmlFor="prod-price">Preço de Venda (R$)</Label>
                       <Input id="prod-price" name="price" type="number" step="0.01" defaultValue={editingProduct?.price} placeholder="0,00" className="font-bold text-primary" required />
                     </div>
 
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="space-y-2">
-                        <Label htmlFor="prod-stock">Qtd Atual</Label>
-                        <Input id="prod-stock" name="stock" type="number" defaultValue={editingProduct?.stock || 0} placeholder="0" required />
+                    {productKind === 'Produto' && (
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label htmlFor="prod-stock">Qtd Atual</Label>
+                          <Input id="prod-stock" name="stock" type="number" defaultValue={editingProduct?.stock || 0} placeholder="0" required />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="prod-min">Qtd Mínima</Label>
+                          <Input id="prod-min" name="min" type="number" defaultValue={editingProduct?.min || 5} placeholder="5" required />
+                        </div>
                       </div>
-                      <div className="space-y-2">
-                        <Label htmlFor="prod-min">Qtd Mínima</Label>
-                        <Input id="prod-min" name="min" type="number" defaultValue={editingProduct?.min || 5} placeholder="5" required />
-                      </div>
-                    </div>
+                    )}
 
-                    {fiscalEnabled && (
+                    {fiscalEnabled && productKind === 'Produto' && (
                       <div className="pt-4 border-t mt-4 space-y-4 animate-in fade-in slide-in-from-top-2">
                          <h4 className="text-[10px] font-black uppercase text-primary tracking-widest flex items-center gap-2">
                            <ShieldCheck className="w-3 h-3" /> Dados Fiscais (NFC-e)
@@ -4044,16 +5516,16 @@ function StockView({
                          <div className="grid grid-cols-2 gap-4">
                            <div className="space-y-2">
                              <Label className="text-xs">NCM</Label>
-                             <Input name="ncm" placeholder="Ex: 8517.13.00" className="h-8 text-xs" />
+                             <Input name="ncm" placeholder="Ex: 8517.13.00" className="h-8 text-xs" defaultValue={editingProduct?.ncm || ''} />
                            </div>
                            <div className="space-y-2">
                              <Label className="text-xs">CEST</Label>
-                             <Input name="cest" placeholder="Ex: 21.053.01" className="h-8 text-xs" />
+                             <Input name="cest" placeholder="Ex: 21.053.01" className="h-8 text-xs" defaultValue={editingProduct?.cest || ''} />
                            </div>
                          </div>
                          <div className="space-y-2">
                            <Label className="text-xs">Origem da Mercadoria</Label>
-                           <Select name="origin" defaultValue="0">
+                           <Select name="origin" defaultValue={editingProduct?.origin || '0'}>
                              <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
                              <SelectContent>
                                <SelectItem value="0">0 - Nacional</SelectItem>
@@ -4062,6 +5534,48 @@ function StockView({
                              </SelectContent>
                            </Select>
                          </div>
+                      </div>
+                    )}
+
+                    {fiscalEnabled && productKind === 'Serviço' && (
+                      <div className="pt-4 border-t mt-4 space-y-4 animate-in fade-in slide-in-from-top-2">
+                        <h4 className="text-[10px] font-black uppercase text-primary tracking-widest flex items-center gap-2">
+                          <ShieldCheck className="w-3 h-3" /> Dados Fiscais de Serviço
+                        </h4>
+                        <div className="grid grid-cols-2 gap-4">
+                          <div className="space-y-2">
+                            <Label className="text-xs">Código do Serviço (LC 116)</Label>
+                            <Input name="serviceCode" placeholder="Ex: 14.01" className="h-8 text-xs" defaultValue={editingProduct?.serviceCode || ''} />
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-xs">Código Municipal</Label>
+                            <Input name="municipalServiceCode" placeholder="Ex: 0107" className="h-8 text-xs" defaultValue={editingProduct?.municipalServiceCode || ''} />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-3 gap-4">
+                          <div className="space-y-2">
+                            <Label className="text-xs">ISS (%)</Label>
+                            <Input name="issRate" type="number" step="0.01" placeholder="0,00" className="h-8 text-xs" defaultValue={editingProduct?.issRate || ''} />
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-xs">PIS (%)</Label>
+                            <Input name="pisRate" type="number" step="0.01" placeholder="0,00" className="h-8 text-xs" defaultValue={editingProduct?.pisRate || ''} />
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-xs">COFINS (%)</Label>
+                            <Input name="cofinsRate" type="number" step="0.01" placeholder="0,00" className="h-8 text-xs" defaultValue={editingProduct?.cofinsRate || ''} />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-4">
+                          <label className="flex items-center gap-2 text-xs font-medium">
+                            <input type="checkbox" name="withholdingIss" defaultChecked={!!editingProduct?.withholdingIss} className="accent-primary" />
+                            Retém ISS
+                          </label>
+                          <label className="flex items-center gap-2 text-xs font-medium">
+                            <input type="checkbox" name="withholdingInss" defaultChecked={!!editingProduct?.withholdingInss} className="accent-primary" />
+                            Retém INSS
+                          </label>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -4086,10 +5600,10 @@ function StockView({
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-xs font-black uppercase tracking-widest opacity-80">Valor Total em Estoque</p>
-                <h3 className="text-3xl font-black mt-1">R$ 45.200,00</h3>
+                 <h3 className="text-3xl font-black mt-1">R$ {totalStockValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
                 <div className="flex items-center gap-2 mt-4 bg-white/20 px-3 py-1 rounded-full w-fit">
                    <TrendingUp className="w-4 h-4" />
-                   <span className="text-[10px] font-black uppercase">Saúde: Excelente</span>
+                   <span className="text-[10px] font-black uppercase">Saude: {stockHealthLabel}</span>
                 </div>
                 <p className="text-[10px] text-white/70 mt-3 leading-tight">
                   Valor total investido em mercadorias disponíveis para venda.
@@ -4102,9 +5616,10 @@ function StockView({
 
         <StatCard 
           title="Giro de Estoque" 
-          value="4.2x / mês" 
+          value={`${inventoryTurnover.toFixed(1)}x / mês`} 
           icon={RefreshCw} 
           color="bg-blue-600" 
+          trend={Number.isFinite(inventoryTrend) ? Math.round(inventoryTrend) : 0}
           description="Velocidade com que o estoque é renovado. Ideal entre 3x e 6x." 
         />
         
@@ -4421,8 +5936,14 @@ function StockView({
                 <CardTitle className="text-sm font-medium text-muted-foreground">Giro de Estoque</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">2.4x</div>
-                <p className="text-xs text-emerald-600 mt-1 flex items-center gap-1"><TrendingUp className="w-3 h-3" /> +12% este mês</p>
+                <div className="text-2xl font-bold">{inventoryTurnover.toFixed(2)}x</div>
+                <p className={cn(
+                  'text-xs mt-1 flex items-center gap-1',
+                  inventoryTrend >= 0 ? 'text-emerald-600' : 'text-rose-600'
+                )}>
+                  {inventoryTrend >= 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+                  {inventoryTrend >= 0 ? '+' : ''}{inventoryTrend.toFixed(1)}% vs. últimos 30 dias
+                </p>
               </CardContent>
             </Card>
             <Card className="border-none shadow-sm">
@@ -4430,8 +5951,8 @@ function StockView({
                 <CardTitle className="text-sm font-medium text-muted-foreground">Acuracidade</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">98.5%</div>
-                <p className="text-xs text-muted-foreground mt-1">Baseado na última contagem</p>
+                <div className="text-2xl font-bold">{inventoryAccuracy.toFixed(1)}%</div>
+                <p className="text-xs text-muted-foreground mt-1">Baseado em vendas e ocorrências de RMA dos últimos 30 dias</p>
               </CardContent>
             </Card>
           </div>
@@ -4470,7 +5991,7 @@ function StockView({
                         <td className="px-6 py-4">R$ {p.price.toFixed(2)}</td>
                         <td className="px-6 py-4 font-bold">{p.stock}</td>
                         <td className="px-6 py-4 font-black">R$ {(p.price * p.stock).toFixed(2)}</td>
-                        <td className="px-6 py-4 text-xs text-muted-foreground">14/04/2026</td>
+                        <td className="px-6 py-4 text-xs text-muted-foreground">{lastMovementBySku[p.sku] ? format(lastMovementBySku[p.sku], 'dd/MM/yyyy') : 'Sem movimentação'}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -4530,43 +6051,153 @@ function FinanceView({
   const [newIncCatName, setNewIncCatName] = useState('');
   const [newIncCatIcon, setNewIncCatIcon] = useState<any>(Tag);
 
-  const [expenseCategories, setExpenseCategories] = useState([
-    { id: '1', name: 'Estoque', icon: Package },
-    { id: '2', name: 'Infraestrutura', icon: Building2 },
-    { id: '3', name: 'Marketing', icon: Globe },
-    { id: '4', name: 'Pessoal', icon: Users },
-    { id: '5', name: 'Impostos e Taxas', icon: FileText },
-  ]);
+  const [expenseCategories, setExpenseCategories] = useState<{ id: string; name: string; icon: any }[]>([]);
+  const [incomeCategories, setIncomeCategories] = useState<{ id: string; name: string; icon: any }[]>([]);
+  const [expenseForm, setExpenseForm] = useState({
+    desc: '',
+    val: '',
+    date: new Date().toISOString().split('T')[0],
+    dueDay: '10',
+    category: '',
+  });
+  const [incomeForm, setIncomeForm] = useState({
+    desc: '',
+    val: '',
+    date: new Date().toISOString().split('T')[0],
+    category: '',
+  });
 
-  const [incomeCategories, setIncomeCategories] = useState([
-    { id: '1', name: 'Vendas de Produtos', icon: ShoppingCart },
-    { id: '2', name: 'Serviços', icon: Wrench },
-    { id: '3', name: 'Contratos', icon: ShieldCheck },
-  ]);
+  useEffect(() => {
+    if (expenseCategories.length === 0) {
+      const names = Array.from(
+        new Set(
+          transactions
+            .filter((item) => item.type === 'OUT' || Number(item.val) < 0)
+            .map((item) => item.category)
+            .filter(Boolean)
+        )
+      ) as string[];
+      if (names.length > 0) {
+        setExpenseCategories(names.map((name) => ({ id: crypto.randomUUID(), name, icon: Tag })));
+      }
+    }
 
-  const payable = [
-    { id: '1', desc: 'Fornecedor de Peças ABC', val: 1500.00, due: '20/04/2026', status: 'Pendente' },
-    { id: '2', desc: 'Energia Elétrica', val: 350.00, due: '18/04/2026', status: 'Atrasado' },
-    { id: '3', desc: 'Internet Fibra', val: 120.00, due: '25/04/2026', status: 'Pendente' },
-  ];
+    if (incomeCategories.length === 0) {
+      const names = Array.from(
+        new Set(
+          transactions
+            .filter((item) => item.type === 'IN' || Number(item.val) > 0)
+            .map((item) => item.category)
+            .filter(Boolean)
+        )
+      ) as string[];
+      if (names.length > 0) {
+        setIncomeCategories(names.map((name) => ({ id: crypto.randomUUID(), name, icon: Tag })));
+      }
+    }
+  }, [transactions, expenseCategories.length, incomeCategories.length]);
 
-  const receivable = [
-    { id: '1', desc: 'OS-2024-015 - Reparo Notebook', val: 450.00, due: '17/04/2026', status: 'Pendente', customer: 'Carlos Eduardo' },
-    { id: '2', desc: 'Venda Acessórios - Maria', val: 180.00, due: '16/04/2026', status: 'Pendente', customer: 'Maria Souza' },
-  ];
+  const payable = transactions.filter((item) => item.type === 'OUT' || Number(item.val) < 0);
 
-  const fixedExpenses = [
-    { id: '1', desc: 'Aluguel', val: 2500.00, dueDay: 10, category: 'Infraestrutura' },
-    { id: '2', desc: 'Internet', val: 120.00, dueDay: 15, category: 'Infraestrutura' },
-    { id: '3', desc: 'Energia', val: 350.00, dueDay: 20, category: 'Infraestrutura' },
-    { id: '4', desc: 'Salário Técnico', val: 3200.00, dueDay: 5, category: 'Pessoal' },
-  ];
+  const receivable = transactions.filter((item) => item.type === 'IN' || Number(item.val) > 0);
+
+  const fixedExpenses = payable.filter((item) => item.category && item.isFixed).map((item) => ({
+    id: item.id,
+    desc: item.desc,
+    val: Math.abs(Number(item.val) || 0),
+    dueDay: Number(item.dueDay) || (item.date && String(item.date).includes('/') ? Number(String(item.date).split('/')[0]) : 0),
+    category: item.category || 'Sem categoria',
+  }));
+
+  const handleSaveExpense = () => {
+    const amount = Number(expenseForm.val);
+    if (!expenseForm.desc.trim() || !amount || amount <= 0) {
+      toast.error('Informe descrição e valor válido para a despesa.');
+      return;
+    }
+    const payload: any = {
+      id: crypto.randomUUID(),
+      type: 'OUT',
+      desc: expenseForm.desc.trim(),
+      category: expenseForm.category || 'Sem categoria',
+      status: 'Pendente',
+      val: -Math.abs(amount),
+      date: expenseType === 'fixa' ? `01/${String(new Date().getMonth() + 1).padStart(2, '0')}/${new Date().getFullYear()}` : expenseForm.date,
+      due: expenseType === 'fixa' ? `Todo dia ${expenseForm.dueDay}` : expenseForm.date,
+      dueDay: expenseType === 'fixa' ? Number(expenseForm.dueDay || 1) : undefined,
+      isFixed: expenseType === 'fixa',
+      method: expenseType === 'fixa' ? 'Recorrente' : 'Avulsa',
+    };
+    setTransactions((prev) => [payload, ...prev]);
+    toast.success(expenseType === 'fixa' ? 'Despesa fixa cadastrada!' : 'Despesa registrada!');
+    setExpenseForm({
+      desc: '',
+      val: '',
+      date: new Date().toISOString().split('T')[0],
+      dueDay: '10',
+      category: '',
+    });
+    setIsExpenseModalOpen(false);
+  };
+
+  const handleSaveIncome = () => {
+    const amount = Number(incomeForm.val);
+    if (!incomeForm.desc.trim() || !amount || amount <= 0) {
+      toast.error('Informe descrição e valor válido para a receita.');
+      return;
+    }
+    const payload: any = {
+      id: crypto.randomUUID(),
+      type: 'IN',
+      desc: incomeForm.desc.trim(),
+      category: incomeForm.category || 'Sem categoria',
+      status: 'Pago',
+      val: Math.abs(amount),
+      date: incomeForm.date,
+      due: incomeForm.date,
+      method: 'Entrada Manual',
+    };
+    setTransactions((prev) => [payload, ...prev]);
+    toast.success('Receita registrada com sucesso!');
+    setIncomeForm({
+      desc: '',
+      val: '',
+      date: new Date().toISOString().split('T')[0],
+      category: '',
+    });
+    setIsIncomeModalOpen(false);
+  };
+
+  const markTransactionAsPaid = (id: string) => {
+    setTransactions((prev) => prev.map((item) => item.id === id ? { ...item, status: 'Pago', paidAt: new Date().toISOString() } : item));
+    toast.success('Despesa marcada como paga.');
+  };
+
+  const markTransactionAsReceived = (id: string) => {
+    setTransactions((prev) => prev.map((item) => item.id === id ? { ...item, status: 'Recebido', receivedAt: new Date().toISOString() } : item));
+    toast.success('Receita marcada como recebida.');
+  };
+
+  const recentTransactions = transactions
+    .slice()
+    .sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime())
+    .slice(0, 10)
+    .map((item) => ({
+      id: item.id,
+      date: item.date || '-',
+      type: item.type === 'OUT' || Number(item.val) < 0 ? 'Despesa' : 'Venda',
+      desc: item.desc || 'Sem descrição',
+      client: item.customer || item.category || '-',
+      method: item.method || item.status || '-',
+      val: Math.abs(Number(item.val) || 0),
+    }));
 
   // Cálculos de Saúde Financeira
-  const totalCash = 8450; 
-  const totalReceivable = receivable.reduce((acc, curr) => acc + curr.val, 0);
-  const totalPayable = payable.reduce((acc, curr) => acc + curr.val, 0);
-  const stockValue = 45200; 
+  const totalCash = transactions.reduce((acc, curr) => acc + Number(curr.val || 0), 0);
+  const totalReceivable = receivable.reduce((acc, curr) => acc + Math.abs(Number(curr.val) || 0), 0);
+  const totalPayable = payable.reduce((acc, curr) => acc + Math.abs(Number(curr.val) || 0), 0);
+  const fixedExpensesTotal = fixedExpenses.reduce((acc, curr) => acc + curr.val, 0);
+  const stockValue = 0;
 
   const currentAssets = totalCash + totalReceivable + stockValue;
   const currentLiabilities = totalPayable;
@@ -4606,35 +6237,40 @@ function FinanceView({
                 
                 <div className="space-y-2">
                   <Label>Descrição</Label>
-                  <Input placeholder={expenseType === 'fixa' ? "Ex: Aluguel da Loja" : "Ex: Compra de ferramentas"} />
+                  <Input
+                    placeholder={expenseType === 'fixa' ? "Ex: Aluguel da Loja" : "Ex: Compra de ferramentas"}
+                    value={expenseForm.desc}
+                    onChange={(e) => setExpenseForm((prev) => ({ ...prev, desc: e.target.value }))}
+                  />
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label>Valor (R$)</Label>
-                    <Input type="number" placeholder="0,00" />
+                    <Input type="number" placeholder="0,00" value={expenseForm.val} onChange={(e) => setExpenseForm((prev) => ({ ...prev, val: e.target.value }))} />
                   </div>
                   <div className="space-y-2">
                     <Label>{expenseType === 'fixa' ? "Dia do Vencimento" : "Data do Pagamento"}</Label>
                     {expenseType === 'fixa' ? (
-                      <Input type="number" min="1" max="31" placeholder="Ex: 10" />
+                      <Input type="number" min="1" max="31" placeholder="Ex: 10" value={expenseForm.dueDay} onChange={(e) => setExpenseForm((prev) => ({ ...prev, dueDay: e.target.value }))} />
                     ) : (
-                      <Input type="date" defaultValue={new Date().toISOString().split('T')[0]} />
+                      <Input type="date" value={expenseForm.date} onChange={(e) => setExpenseForm((prev) => ({ ...prev, date: e.target.value }))} />
                     )}
                   </div>
                 </div>
 
                 <div className="space-y-2">
                   <Label>Categoria</Label>
-                  <Select>
+                  <Select value={expenseForm.category} onValueChange={(v) => setExpenseForm((prev) => ({ ...prev, category: v || '' }))}>
                     <SelectTrigger><SelectValue placeholder="Selecione" /></SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="estoque">Estoque</SelectItem>
-                      <SelectItem value="infra">Infraestrutura</SelectItem>
-                      <SelectItem value="marketing">Marketing</SelectItem>
-                      <SelectItem value="pessoal">Pessoal</SelectItem>
-                      <SelectItem value="impostos">Impostos e Taxas</SelectItem>
-                      <SelectItem value="outros">Outros</SelectItem>
+                      {expenseCategories.length > 0 ? (
+                        expenseCategories.map((cat) => (
+                          <SelectItem key={cat.id} value={cat.name}>{cat.name}</SelectItem>
+                        ))
+                      ) : (
+                        <SelectItem value="none" disabled>Nenhuma categoria cadastrada</SelectItem>
+                      )}
                     </SelectContent>
                   </Select>
                 </div>
@@ -4649,10 +6285,7 @@ function FinanceView({
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setIsExpenseModalOpen(false)}>Cancelar</Button>
-                <Button className="bg-rose-600 hover:bg-rose-700" onClick={() => {
-                  toast.success(expenseType === 'fixa' ? 'Despesa fixa cadastrada!' : 'Despesa registrada!');
-                  setIsExpenseModalOpen(false);
-                }}>Salvar {expenseType === 'fixa' ? 'Despesa Fixa' : 'Despesa'}</Button>
+                <Button className="bg-rose-600 hover:bg-rose-700" onClick={handleSaveExpense}>Salvar {expenseType === 'fixa' ? 'Despesa Fixa' : 'Despesa'}</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
@@ -4671,36 +6304,37 @@ function FinanceView({
               <div className="grid gap-4 py-4">
                 <div className="space-y-2">
                   <Label>Descrição</Label>
-                  <Input placeholder="Ex: Venda de serviço avulso" />
+                  <Input placeholder="Ex: Venda de serviço avulso" value={incomeForm.desc} onChange={(e) => setIncomeForm((prev) => ({ ...prev, desc: e.target.value }))} />
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label>Valor (R$)</Label>
-                    <Input type="number" placeholder="0,00" />
+                    <Input type="number" placeholder="0,00" value={incomeForm.val} onChange={(e) => setIncomeForm((prev) => ({ ...prev, val: e.target.value }))} />
                   </div>
                   <div className="space-y-2">
                     <Label>Data</Label>
-                    <Input type="date" defaultValue={new Date().toISOString().split('T')[0]} />
+                    <Input type="date" value={incomeForm.date} onChange={(e) => setIncomeForm((prev) => ({ ...prev, date: e.target.value }))} />
                   </div>
                 </div>
                 <div className="space-y-2">
                   <Label>Categoria</Label>
-                  <Select>
+                  <Select value={incomeForm.category} onValueChange={(v) => setIncomeForm((prev) => ({ ...prev, category: v || '' }))}>
                     <SelectTrigger><SelectValue placeholder="Selecione" /></SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="vendas">Vendas de Produtos</SelectItem>
-                      <SelectItem value="servicos">Serviços</SelectItem>
-                      <SelectItem value="outros">Outros</SelectItem>
+                      {incomeCategories.length > 0 ? (
+                        incomeCategories.map((cat) => (
+                          <SelectItem key={cat.id} value={cat.name}>{cat.name}</SelectItem>
+                        ))
+                      ) : (
+                        <SelectItem value="none" disabled>Nenhuma categoria cadastrada</SelectItem>
+                      )}
                     </SelectContent>
                   </Select>
                 </div>
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setIsIncomeModalOpen(false)}>Cancelar</Button>
-                <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={() => {
-                  toast.success('Receita registrada com sucesso!');
-                  setIsIncomeModalOpen(false);
-                }}>Salvar Receita</Button>
+                <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={handleSaveIncome}>Salvar Receita</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
@@ -4708,14 +6342,14 @@ function FinanceView({
       </div>
 
       <div className="grid gap-4 md:grid-cols-4">
-        <StatCard title="Saldo Atual" value="R$ 8.450,00" icon={DollarSign} color="bg-blue-600" />
-        <StatCard title="A Receber" value="R$ 3.200,00" icon={ChevronRight} color="bg-emerald-500" />
-        <StatCard title="A Pagar" value="R$ 1.850,00" icon={X} color="bg-rose-500" />
-        <StatCard title="Custos Fixos" value="R$ 6.170,00" icon={Clock} color="bg-amber-600" />
+        <StatCard title="Saldo Atual" value={`R$ ${totalCash.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`} icon={DollarSign} color="bg-blue-600" />
+        <StatCard title="A Receber" value={`R$ ${totalReceivable.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`} icon={ChevronRight} color="bg-emerald-500" />
+        <StatCard title="A Pagar" value={`R$ ${totalPayable.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`} icon={X} color="bg-rose-500" />
+        <StatCard title="Custos Fixos" value={`R$ ${fixedExpensesTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`} icon={Clock} color="bg-amber-600" />
       </div>
 
       <Tabs defaultValue="fluxo" className="w-full">
-        <TabsList className="grid w-full grid-cols-6 lg:w-[900px]">
+        <TabsList className="grid w-full grid-cols-7 lg:w-[900px]">
           <TabsTrigger value="fluxo">Fluxo de Caixa</TabsTrigger>
           <TabsTrigger value="pagar">Contas a Pagar</TabsTrigger>
           <TabsTrigger value="receber">Contas a Receber</TabsTrigger>
@@ -4791,7 +6425,7 @@ function FinanceView({
                         R$ {p.val.toFixed(2)}
                       </td>
                       <td className="px-6 py-4 text-right">
-                        <Button size="sm" variant="outline" className="h-8 text-xs">Pagar</Button>
+                        <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => markTransactionAsPaid(p.id)}>Pagar</Button>
                       </td>
                     </tr>
                   ))}
@@ -4830,7 +6464,7 @@ function FinanceView({
                         R$ {r.val.toFixed(2)}
                       </td>
                       <td className="px-6 py-4 text-right">
-                        <Button size="sm" variant="outline" className="h-8 text-xs">Receber</Button>
+                        <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => markTransactionAsReceived(r.id)}>Receber</Button>
                       </td>
                     </tr>
                   ))}
@@ -5213,13 +6847,8 @@ function FinanceView({
                     </tr>
                   </thead>
                   <tbody className="divide-y">
-                    {[
-                      { date: '15/04/2026 14:30', type: 'Venda', desc: 'Tela iPhone 13 + Película', client: 'João Silva', method: 'PIX', val: 885.00 },
-                      { date: '15/04/2026 11:20', type: 'Serviço', desc: 'Reparo Placa Mãe OS-001', client: 'Maria Oliveira', method: 'Cartão', val: 450.00 },
-                      { date: '14/04/2026 16:45', type: 'Venda', desc: 'Cabo HDMI 2m', client: 'Consumidor Final', method: 'Dinheiro', val: 45.00 },
-                      { date: '14/04/2026 09:15', type: 'Serviço', desc: 'Limpeza Preventiva OS-002', client: 'Pedro Santos', method: 'PIX', val: 120.00 },
-                    ].map((row, i) => (
-                      <tr key={i} className="hover:bg-secondary/10 transition-colors">
+                    {recentTransactions.map((row) => (
+                      <tr key={row.id} className="hover:bg-secondary/10 transition-colors">
                         <td className="px-6 py-4 text-xs text-muted-foreground font-mono">{row.date}</td>
                         <td className="px-6 py-4">
                           <Badge variant={row.type === 'Venda' ? 'default' : 'secondary'} className="text-[9px] uppercase">
@@ -5232,6 +6861,13 @@ function FinanceView({
                         <td className="px-6 py-4 text-right font-black text-primary">R$ {row.val.toFixed(2)}</td>
                       </tr>
                     ))}
+                    {recentTransactions.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="px-6 py-8 text-center text-sm text-muted-foreground italic">
+                          Nenhuma transação registrada no banco de dados até o momento.
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -5597,7 +7233,7 @@ function UserManagementView({
                 <div className="space-y-2">
                   <Label htmlFor="role">Tipo de Conta</Label>
                   <Select name="role" defaultValue={editingUser?.role || 'USUARIO'}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectTrigger><SelectValue placeholder={ROLE_LABELS[editingUser?.role || 'USUARIO'] || editingUser?.role || 'Técnico'} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="ADMIN-USER">Administrador</SelectItem>
                       <SelectItem value="USUARIO">Colaborador</SelectItem>
@@ -5815,14 +7451,7 @@ function POSView({
     fuzzyMatch(c.name, customerSearch) || (c.doc && fuzzyMatch(c.doc, customerSearch))
   ) : [];
 
-  const products = [
-    { id: '1', name: 'Tela iPhone 13 Original', sku: 'TEL-IP13-ORG', price: 850.00 },
-    { id: '2', name: 'Bateria Samsung S22', sku: 'BAT-S22-PREM', price: 120.00 },
-    { id: '3', name: 'Cabo HDMI 2.0 2m', sku: 'CAB-HDMI-2M', price: 45.00 },
-    { id: '4', name: 'Conector de Carga Moto G60', sku: 'CON-G60', price: 25.00 },
-    { id: '5', name: 'Película de Vidro 3D', sku: 'PEL-3D-GEN', price: 35.00 },
-    { id: '6', name: 'Capa Anti-Impacto Transparente', sku: 'CAP-TR-GEN', price: 40.00 },
-  ];
+  const products = allProducts;
 
   const filteredProducts = products.filter(p => 
     fuzzyMatch(p.name, search) || 
@@ -6909,6 +8538,686 @@ function POSView({
     </div>
   );
 }
+function TechnicalSupportView({
+  user,
+  company,
+  allOrders,
+  allProducts,
+  supportSessions,
+  setSupportSessions,
+  isPremiumEnabled,
+}: {
+  user: User;
+  company: Company;
+  allOrders: ServiceOrder[];
+  allProducts: any[];
+  supportSessions: SupportSession[];
+  setSupportSessions: React.Dispatch<React.SetStateAction<SupportSession[]>>;
+  isPremiumEnabled: boolean;
+}) {
+  const companyScope = user.companyId || company.id || 'default';
+  const [selectedOsId, setSelectedOsId] = useState('');
+  const [orderSearch, setOrderSearch] = useState('');
+  const [showOrderResults, setShowOrderResults] = useState(false);
+  const [selectedSector, setSelectedSector] = useState<TechnicalSector>('Outro');
+  const [selectedLevel, setSelectedLevel] = useState<TechnicalLevel>(1);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(supportSessions[0]?.id || null);
+  const [message, setMessage] = useState('');
+  const [attachments, setAttachments] = useState<SupportAttachment[]>([]);
+  const [isSending, setIsSending] = useState(false);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const [saasAiConfig, setSaasAiConfig] = useState<AIProviderConfig>({ providerCatalogs: [], agentPrompts: [] });
+  const [companyAiConfig, setCompanyAiConfig] = useState<AIProviderConfig>({
+    providerCatalogs: [],
+    companyDefaultProvider: 'openai',
+    companyModelSource: 'provider-default',
+  });
+
+  const activeSession = supportSessions.find((session) => session.id === activeSessionId) || null;
+  const activeOrder = activeSession ? allOrders.find((order) => order.id === activeSession.osId) || null : null;
+  const activeOrders = allOrders.filter((order) => order.status !== 'Finalizada' && order.status !== 'Cancelada');
+
+  const tokenize = (text: string) =>
+    String(text || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(' ')
+      .map((t) => t.trim())
+      .filter((t) => t.length > 2);
+
+  const buildShortHistory = (session: SupportSession | null): string => {
+    if (!session) return 'Sem historico recente.';
+    return session.messages
+      .slice(-6)
+      .map((item) => `${item.role === 'agent' ? 'Agente' : 'Tecnico'}: ${String(item.text || '').replace(/\s+/g, ' ').trim().slice(0, 180)}`)
+      .join(' | ');
+  };
+
+  const findCompatibleProducts = (order: ServiceOrder, userMessageText: string) => {
+    const equipmentTokens = new Set(tokenize(`${order.equipment} ${order.brand} ${order.model}`));
+    const intentTokens = new Set(tokenize(userMessageText));
+    return allProducts
+      .map((item) => {
+        const productText = `${item.name || ''} ${item.sku || ''}`;
+        const productTokens = tokenize(productText);
+        const equipmentHits = productTokens.filter((token) => equipmentTokens.has(token)).length;
+        const intentHits = productTokens.filter((token) => intentTokens.has(token)).length;
+        const score = equipmentHits * 2 + intentHits;
+        return {
+          item,
+          score,
+          compatibilityReason:
+            equipmentHits > 0
+              ? `coincidencia com equipamento/modelo (${equipmentHits})`
+              : intentHits > 0
+              ? `coincidencia com solicitacao tecnica (${intentHits})`
+              : '',
+        };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10)
+      .map((entry) => ({
+        name: entry.item.name,
+        sku: entry.item.sku,
+        price: Number(entry.item.price || 0),
+        stock: Number(entry.item.stock || 0),
+        compatibilityReason: entry.compatibilityReason,
+      }));
+  };
+
+  useEffect(() => {
+    axios
+      .get('/api/ai/provider-config?scope=global')
+      .then((res) => {
+        setSaasAiConfig({
+          openaiApiKey: res.data?.openaiApiKey || '',
+          groqApiKey: res.data?.groqApiKey || '',
+          geminiApiKey: res.data?.geminiApiKey || '',
+          claudeApiKey: res.data?.claudeApiKey || '',
+          providerCatalogs: Array.isArray(res.data?.providerCatalogs) ? res.data.providerCatalogs : [],
+          agentPrompts: Array.isArray(res.data?.agentPrompts) ? res.data.agentPrompts : [],
+          updatedAt: res.data?.updatedAt || '',
+        });
+      })
+      .catch((err) => console.error('Erro ao carregar config global IA:', err));
+
+    axios
+      .get(`/api/ai/provider-config?scope=${encodeURIComponent(companyScope)}`)
+      .then((res) => {
+        setCompanyAiConfig({
+          openaiApiKey: res.data?.openaiApiKey || '',
+          groqApiKey: res.data?.groqApiKey || '',
+          geminiApiKey: res.data?.geminiApiKey || '',
+          claudeApiKey: res.data?.claudeApiKey || '',
+          providerCatalogs: Array.isArray(res.data?.providerCatalogs) ? res.data.providerCatalogs : [],
+          companyDefaultProvider: (res.data?.companyDefaultProvider || 'openai') as AIProvider,
+          companyDefaultModel: res.data?.companyDefaultModel || '',
+          companyModelSource: res.data?.companyModelSource === 'preset' ? 'preset' : 'provider-default',
+          updatedAt: res.data?.updatedAt || '',
+        });
+      })
+      .catch((err) => console.error('Erro ao carregar config empresa IA:', err));
+  }, [companyScope]);
+
+  useEffect(() => {
+    if (!activeSessionId && supportSessions.length > 0) {
+      setActiveSessionId(supportSessions[0].id);
+    }
+    if (activeSessionId && !supportSessions.some((s) => s.id === activeSessionId)) {
+      setActiveSessionId(supportSessions[0]?.id || null);
+    }
+  }, [supportSessions, activeSessionId]);
+
+  useEffect(() => {
+    if (!selectedOsId) return;
+    const order = allOrders.find((item) => item.id === selectedOsId);
+    if (!order) return;
+    setSelectedSector(detectTechnicalSector(order.equipment));
+    setSelectedLevel(
+      inferTechnicalLevel({
+        defect: order.defect,
+        diagnosis: order.diagnosis,
+        equipment: `${order.equipment} ${order.brand} ${order.model}`,
+      })
+    );
+  }, [selectedOsId, allOrders]);
+
+  useEffect(() => {
+    if (!activeSession) return;
+    setSelectedSector(activeSession.sector);
+    setSelectedLevel(activeSession.level);
+    setOrderSearch(activeSession.customerName);
+    setSelectedOsId(activeSession.osId);
+  }, [activeSession?.id]);
+
+  const selectedSaasCatalog =
+    (saasAiConfig.providerCatalogs || []).find((item) => item.id === company.aiSaasCatalogId) ||
+    (saasAiConfig.providerCatalogs || [])[0] ||
+    null;
+
+  const findFirstConfiguredProvider = (config?: AIProviderConfig): AIProvider | null => {
+    if (!config) return null;
+    if (String(config.openaiApiKey || '').trim()) return 'openai';
+    if (String(config.groqApiKey || '').trim()) return 'groq';
+    if (String(config.geminiApiKey || '').trim()) return 'gemini';
+    if (String(config.claudeApiKey || '').trim()) return 'claude';
+    return null;
+  };
+
+  const configuredProvider: AIProvider =
+    company.aiAssistantMode === 'company-own'
+      ? company.aiProvider || companyAiConfig.companyDefaultProvider || findFirstConfiguredProvider(companyAiConfig) || 'openai'
+      : selectedSaasCatalog?.provider || company.aiProvider || findFirstConfiguredProvider(saasAiConfig) || 'openai';
+
+  const configuredModel: string | undefined =
+    company.aiAssistantMode === 'company-own'
+      ? company.aiModelSource === 'preset'
+        ? company.aiModel || companyAiConfig.companyDefaultModel || undefined
+        : undefined
+      : selectedSaasCatalog?.models?.find((m) => m.value === company.aiModel)?.value ||
+        selectedSaasCatalog?.models?.[0]?.value;
+  const activeSupportPrompts = useMemo(() => {
+    const plan = (company.subscriptionPlan || 'Basic') as SubscriptionPlan;
+    return (saasAiConfig.agentPrompts || []).filter((prompt) => {
+      if (!prompt?.isActive) return false;
+      if (prompt.area !== 'suporte-tecnico') return false;
+      if (!Array.isArray(prompt.plans) || prompt.plans.length === 0) return true;
+      return prompt.plans.includes(plan);
+    });
+  }, [saasAiConfig.agentPrompts, company.subscriptionPlan]);
+
+  const filteredOrderOptions = useMemo(() => {
+    if (!orderSearch.trim()) return activeOrders.slice(0, 25);
+    return activeOrders.filter((order) =>
+      fuzzyMatch(order.customerName, orderSearch) ||
+      fuzzyMatch(order.number, orderSearch) ||
+      fuzzyMatch(order.equipment, orderSearch) ||
+      fuzzyMatch(order.brand, orderSearch) ||
+      fuzzyMatch(order.model, orderSearch)
+    );
+  }, [activeOrders, orderSearch]);
+
+  const ordersById = useMemo(() => {
+    const map = new Map<string, ServiceOrder>();
+    allOrders.forEach((order) => map.set(order.id, order));
+    return map;
+  }, [allOrders]);
+
+  useEffect(() => {
+    const container = chatScrollRef.current;
+    if (!container) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+  }, [activeSessionId, activeSession?.messages.length, isSending]);
+
+  const selectOrderForContext = (order: ServiceOrder) => {
+    setSelectedOsId(order.id);
+    setOrderSearch(order.customerName);
+    setShowOrderResults(false);
+    setSelectedSector(detectTechnicalSector(order.equipment));
+    setSelectedLevel(
+      inferTechnicalLevel({
+        defect: order.defect,
+        diagnosis: order.diagnosis,
+        equipment: `${order.equipment} ${order.brand} ${order.model}`,
+      })
+    );
+  };
+
+  const resolveRuntimeScope = () => (company.aiAssistantMode === 'company-own' ? companyScope : 'global');
+
+  const startOrOpenSession = () => {
+    if (!selectedOsId) {
+      toast.error('Selecione uma O.S. para iniciar o suporte.');
+      return;
+    }
+    const order = allOrders.find((item) => item.id === selectedOsId);
+    if (!order) {
+      toast.error('O.S. não encontrada.');
+      return;
+    }
+
+    const existing = supportSessions.find((session) => session.osId === selectedOsId);
+    if (existing) {
+      setActiveSessionId(existing.id);
+      setSelectedSector(existing.sector);
+      setSelectedLevel(existing.level);
+      toast.info('Contexto da O.S. reaberto.');
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const inferredSector = selectedSector === 'Outro' ? detectTechnicalSector(order.equipment) : selectedSector;
+    const inferredLevel = inferTechnicalLevel({
+      defect: order.defect,
+      diagnosis: order.diagnosis,
+      equipment: `${order.equipment} ${order.brand} ${order.model}`,
+    });
+
+    const created: SupportSession = {
+      id: crypto.randomUUID(),
+      osId: order.id,
+      osNumber: order.number,
+      customerName: order.customerName,
+      equipment: `${order.equipment} ${order.brand} ${order.model}`.trim(),
+      sector: inferredSector,
+      level: inferredLevel,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      expiresAt: getSupportExpiryDate(nowIso),
+      messages: [
+        {
+          id: crypto.randomUUID(),
+          role: 'agent',
+          text: `Contexto técnico iniciado para ${order.number} (${order.customerName}).`,
+          createdAt: nowIso,
+          agents: getRecommendedAgents(inferredSector, inferredLevel, order.defect),
+        },
+      ],
+    };
+
+    setSupportSessions((prev) => [created, ...prev]);
+    setActiveSessionId(created.id);
+    setSelectedSector(created.sector);
+    setSelectedLevel(created.level);
+    toast.success('Suporte técnico iniciado com contexto da O.S.');
+  };
+
+  const handleAttachmentChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    const mapped: SupportAttachment[] = files.map((file) => ({
+      id: crypto.randomUUID(),
+      name: file.name,
+      mimeType: file.type || 'application/octet-stream',
+      size: file.size,
+      category: file.type.startsWith('image/') ? 'image' : 'document',
+    }));
+    setAttachments(mapped);
+  };
+
+  const sendSupportRequest = async () => {
+    if (isSending) return;
+    if (!activeSession) {
+      toast.error('Inicie um contexto de suporte técnico antes de enviar.');
+      return;
+    }
+    if (!message.trim() && attachments.length === 0) {
+      toast.error('Digite a solicitação ou anexe um arquivo.');
+      return;
+    }
+
+    const order = allOrders.find((item) => item.id === activeSession.osId);
+    if (!order) {
+      toast.error('Esta O.S. foi removida.');
+      return;
+    }
+
+    const runtimeProvider = configuredProvider;
+    const runtimeModel = configuredModel;
+    const runtimeScope = resolveRuntimeScope();
+    const nowIso = new Date().toISOString();
+    const userMessageText = message.trim() || 'Solicitação com anexos enviados.';
+    const agents = getRecommendedAgents(selectedSector, selectedLevel, `${order.defect} ${message}`);
+    const compatibleInventory = findCompatibleProducts(order, userMessageText);
+
+    const needsSpecsLookup =
+      /(especifica|ficha tecnica|configurac|spec|caracteristica|liquido metal|metal liquido|cpu|gpu|processador|refrigerac|cooler|heatsink|thermal|pasta termica)/i.test(
+        userMessageText
+      );
+    const needsPartsLookup = /(peca|pe[çc]a|compat|upgrade|memoria|ssd|hd|bateria|teclado|tela|fonte|carregador)/i.test(
+      userMessageText
+    );
+
+    let webReferences: Array<{ title: string; url: string; snippet?: string }> = [];
+    if (needsSpecsLookup || (needsPartsLookup && compatibleInventory.length === 0)) {
+      const lookupQuery = needsSpecsLookup
+        ? `${order.equipment} ${order.brand} ${order.model} especificacoes tecnicas`
+        : `pecas compativeis ${order.equipment} ${order.brand} ${order.model} ${userMessageText}`;
+      try {
+        const webRes = await axios.post('/api/ai/web-search', { query: lookupQuery, limit: 6 });
+        webReferences = Array.isArray(webRes.data?.results)
+          ? webRes.data.results
+              .map((item: any) => ({
+                title: String(item?.title || '').trim(),
+                url: String(item?.url || '').trim(),
+                snippet: String(item?.snippet || '').trim(),
+              }))
+              .filter((item: { title: string; url: string }) => item.title && item.url)
+          : [];
+      } catch (lookupError) {
+        console.error('Erro na busca web de apoio técnico:', lookupError);
+      }
+    }
+
+    const sourceLabel =
+      compatibleInventory.length > 0 && webReferences.length > 0
+        ? 'estoque local + web'
+        : compatibleInventory.length > 0
+        ? 'estoque local'
+        : webReferences.length > 0
+        ? 'web'
+        : 'contexto técnico interno';
+
+    const basePrompt = buildTechnicalPrompt({
+      companyName: company.name,
+      technicianName: user.name,
+      os: order,
+      sector: selectedSector,
+      level: selectedLevel,
+      userMessage: userMessageText,
+      attachments,
+      shortHistory: buildShortHistory(activeSession),
+      inventory: allProducts.map((item) => ({
+        name: item.name,
+        sku: item.sku,
+        price: Number(item.price || 0),
+        stock: Number(item.stock || 0),
+      })),
+      compatibleInventory,
+      webReferences,
+    });
+    const supportPromptDirectives = activeSupportPrompts
+      .map(
+        (item) =>
+          `Prompt customizado (${item.title}): ${MANDATORY_PROMPT_HELP_DIRECTIVE}\n${String(item.prompt || '').trim()}`
+      )
+      .join('\n\n');
+    const prompt = supportPromptDirectives ? `${basePrompt}\n\n${supportPromptDirectives}` : basePrompt;
+
+    const technicianMessage: SupportMessage = {
+      id: crypto.randomUUID(),
+      role: 'technician',
+      text: userMessageText,
+      createdAt: nowIso,
+      attachments,
+    };
+
+    setSupportSessions((prev) =>
+      prev.map((session) =>
+        session.id === activeSession.id
+          ? {
+              ...session,
+              sector: selectedSector,
+              level: selectedLevel,
+              updatedAt: nowIso,
+              expiresAt: getSupportExpiryDate(nowIso),
+              messages: [...session.messages, technicianMessage],
+            }
+          : session
+      )
+    );
+    setMessage('');
+    setAttachments([]);
+    setIsSending(true);
+
+    try {
+      const response = await axios.post('/api/ai/technical-support/query', {
+        scope: runtimeScope,
+        provider: runtimeProvider,
+        model: runtimeModel,
+        prompt,
+        userMessage: userMessageText,
+        sessionId: activeSession.id,
+        osId: order.id,
+        webContext: webReferences,
+        temperature: 0.25,
+      });
+      const aiText = String(response.data?.text || '').trim();
+      if (!aiText) throw new Error('Resposta vazia do provider.');
+
+      const agentMessage: SupportMessage = {
+        id: crypto.randomUUID(),
+        role: 'agent',
+        text: aiText,
+        createdAt: new Date().toISOString(),
+        agents,
+      };
+
+      setSupportSessions((prev) =>
+        prev.map((session) =>
+          session.id === activeSession.id
+            ? { ...session, updatedAt: new Date().toISOString(), expiresAt: getSupportExpiryDate(), messages: [...session.messages, agentMessage] }
+            : session
+        )
+      );
+      toast.success(`Resposta dos agentes recebida (${sourceLabel}).`);
+    } catch (error: any) {
+      const fallbackText = buildMockAgentResponse({
+        os: order,
+        sector: selectedSector,
+        level: selectedLevel,
+        message: userMessageText,
+        recommendedAgents: agents,
+        attachments,
+      });
+      const apiError = error?.response?.data?.detail || error?.response?.data?.error || error?.message || 'Falha ao consultar provider de IA.';
+      const agentMessage: SupportMessage = {
+        id: crypto.randomUUID(),
+        role: 'agent',
+        text: fallbackText,
+        createdAt: new Date().toISOString(),
+        agents,
+      };
+      setSupportSessions((prev) =>
+        prev.map((session) =>
+          session.id === activeSession.id
+            ? { ...session, updatedAt: new Date().toISOString(), expiresAt: getSupportExpiryDate(), messages: [...session.messages, agentMessage] }
+            : session
+        )
+      );
+      toast.error(`Fallback local aplicado (${sourceLabel}): ${String(apiError).slice(0, 120)}`);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  if (!isPremiumEnabled) {
+    return (
+      <div className="space-y-6">
+        <h1 className="text-3xl font-bold tracking-tight">Assistente Técnico</h1>
+        <Card className="border-none shadow-sm">
+          <CardContent className="py-10 text-center space-y-3">
+            <ShieldAlert className="w-12 h-12 mx-auto text-amber-500" />
+            <p className="font-semibold">Funcao disponivel apenas para contas da empresa.</p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  const selectedOrder = selectedOsId ? allOrders.find((item) => item.id === selectedOsId) || null : null;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Assistente Técnico</h1>
+        <p className="text-muted-foreground">Acompanhamento completo do defeito até a entrega com nível técnico automático.</p>
+      </div>
+
+      <Card className="border-none shadow-sm">
+        <CardHeader>
+          <CardTitle>Novo Contexto de Atendimento IA</CardTitle>
+          <CardDescription>Digite o nome do cliente para localizar a O.S. com busca inteligente.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+          <div className="space-y-2 lg:col-span-2">
+            <Label>Ordem de Serviço</Label>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <Input
+                value={orderSearch}
+                onChange={(e) => {
+                  setOrderSearch(e.target.value);
+                  setSelectedOsId('');
+                  setShowOrderResults(true);
+                }}
+                onFocus={() => setShowOrderResults(true)}
+                onBlur={() => setTimeout(() => setShowOrderResults(false), 120)}
+                className="pl-9"
+                placeholder="Cliente, número da O.S. ou equipamento"
+              />
+              {showOrderResults && filteredOrderOptions.length > 0 && (
+                <div className="absolute z-50 mt-1 max-h-52 w-full overflow-y-auto rounded-md border bg-background shadow-lg">
+                  {filteredOrderOptions.map((order) => (
+                    <button
+                      key={order.id}
+                      type="button"
+                      className="w-full px-3 py-2 text-left text-sm hover:bg-secondary/40"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => selectOrderForContext(order)}
+                    >
+                      <span className="font-semibold">{order.customerName}</span>
+                      <span className="text-muted-foreground"> • {order.number} • {order.equipment}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            {selectedOrder && <p className="text-xs text-muted-foreground">O.S. selecionada: {selectedOrder.number} • {selectedOrder.customerName}</p>}
+          </div>
+          <div className="space-y-2">
+            <Label>Setor Técnico</Label>
+            <Select value={selectedSector} onValueChange={(value) => setSelectedSector(value as TechnicalSector)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="Notebook-PC-AllinOne">Notebook, PC e All-in-One</SelectItem>
+                <SelectItem value="Celulares-Tablets">Celulares e Tablets</SelectItem>
+                <SelectItem value="Impressoras-Scanners">Impressoras e Scanners</SelectItem>
+                <SelectItem value="Televisores">Televisores</SelectItem>
+                <SelectItem value="Outro">Outro</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label>Nível Técnico (Automático)</Label>
+            <div className="h-10 rounded-md border bg-secondary/20 px-3 flex items-center justify-between">
+              <span className="text-sm font-medium">N{selectedLevel}</span>
+              <Badge variant="outline" className="text-[10px]">AUTO</Badge>
+            </div>
+          </div>
+          <div className="lg:col-span-4 flex justify-end">
+            <Button type="button" onClick={startOrOpenSession} className="gap-2"><MessageSquare className="w-4 h-4" /> Iniciar / Abrir Contexto</Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+        <Card className="border-none shadow-sm xl:col-span-1">
+          <CardHeader>
+            <CardTitle className="text-base">Contextos Ativos</CardTitle>
+            <CardDescription>Expiram automaticamente em {SUPPORT_RETENTION_DAYS} dias.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {supportSessions.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Nenhum contexto criado ainda.</p>
+            ) : (
+              supportSessions
+                .slice()
+                .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+                .map((session) => (
+                  <div
+                    key={session.id}
+                    className={cn(
+                      'rounded-lg border p-3 space-y-2 cursor-pointer transition-colors',
+                      activeSessionId === session.id ? 'border-primary bg-primary/5' : 'hover:bg-secondary/20'
+                    )}
+                    onClick={() => setActiveSessionId(session.id)}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <p className="font-semibold text-sm">{session.osNumber}</p>
+                        <p className="text-xs text-muted-foreground">{session.customerName}</p>
+                      </div>
+                      <Badge variant="outline" className="text-[10px]">N{session.level}</Badge>
+                    </div>
+                    <p className="text-xs text-muted-foreground">{session.equipment}</p>
+                    <p className="text-xs text-muted-foreground">
+                      Defeito: {(ordersById.get(session.osId)?.defect || 'Defeito não registrado.').slice(0, 120)}
+                    </p>
+                  </div>
+                ))
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="border-none shadow-sm xl:col-span-2">
+          <CardHeader>
+            <CardTitle className="text-base">Chat de Suporte IA</CardTitle>
+            <CardDescription>
+              {activeSession ? `OS ${activeSession.osNumber} - ${activeSession.customerName}` : 'Selecione ou inicie um contexto para conversar com os agentes.'}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {!activeSession ? (
+              <div className="rounded-lg border border-dashed p-8 text-center text-muted-foreground">Nenhum contexto ativo selecionado.</div>
+            ) : (
+              <>
+                <div className="rounded-lg border bg-secondary/10 p-3 text-xs space-y-1">
+                  <p><strong>Cliente:</strong> {activeSession.customerName}</p>
+                  <p><strong>Equipamento:</strong> {activeSession.equipment}</p>
+                  <p><strong>Status da O.S.:</strong> {activeOrder?.status || 'n/a'}</p>
+                </div>
+
+                <div ref={chatScrollRef} className="max-h-[420px] overflow-y-auto space-y-3 pr-1">
+                  {activeSession.messages.map((item) => (
+                    <div key={item.id} className={cn('flex', item.role === 'agent' ? 'justify-start' : 'justify-end')}>
+                      <div
+                        className={cn(
+                          'max-w-[90%] rounded-2xl border px-4 py-3 shadow-sm',
+                          item.role === 'agent' ? 'bg-primary/5 border-primary/20' : 'bg-card'
+                        )}
+                      >
+                        <div className="flex items-center justify-between mb-2 gap-3">
+                          <p className="text-xs font-semibold uppercase tracking-wide">
+                            {item.role === 'agent' ? 'Agentes IA' : 'Usuario'}
+                          </p>
+                          <span className="text-[10px] text-muted-foreground">{format(new Date(item.createdAt), 'dd/MM HH:mm')}</span>
+                        </div>
+                        <p className="text-sm whitespace-pre-wrap">{item.text}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="space-y-3 border-t pt-4">
+                  <div className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+                    Configuracao de IA aplicada automaticamente conforme definido em <strong>Configuracoes &gt; API &gt; Agentes IA</strong>.
+                  </div>
+
+                  <textarea
+                    value={message}
+                    onChange={(e) => setMessage(e.target.value)}
+                    rows={4}
+                    className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                    placeholder="Descreva o caso, testes já executados e onde travou no reparo..."
+                  />
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="inline-flex items-center gap-2 text-xs cursor-pointer border rounded-md px-3 py-2 hover:bg-secondary/30">
+                      <UploadCloud className="w-4 h-4" />
+                      Anexar documento/imagem
+                      <input type="file" multiple accept="image/*,.pdf,.doc,.docx,.txt" className="hidden" onChange={handleAttachmentChange} />
+                    </label>
+                    {attachments.map((file) => (
+                      <Badge key={file.id} variant="outline" className="text-[10px]">{file.name}</Badge>
+                    ))}
+                  </div>
+                  <div className="flex justify-end">
+                    <Button type="button" onClick={sendSupportRequest} className="gap-2" disabled={isSending}>
+                      <MessageSquare className="w-4 h-4" /> {isSending ? 'Consultando IA...' : 'Enviar para Agentes'}
+                    </Button>
+                  </div>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 function SettingsView({ 
   user, 
   companyLogo, 
@@ -6921,6 +9230,7 @@ function SettingsView({
   setEquipmentTypes,
   teamUsers,
   setTeamUsers,
+  companies,
   company,
   setCompany
 }: { 
@@ -6935,6 +9245,7 @@ function SettingsView({
   setEquipmentTypes: React.Dispatch<React.SetStateAction<EquipmentType[]>>,
   teamUsers: User[],
   setTeamUsers: React.Dispatch<React.SetStateAction<User[]>>,
+  companies: ManagedCompany[],
   company: Company,
   setCompany: React.Dispatch<React.SetStateAction<Company>>
 }) {
@@ -6949,9 +9260,163 @@ function SettingsView({
     serverUrl: '',
     apiKey: ''
   });
+  const [aiProviderConfig, setAiProviderConfig] = useState<AIProviderConfig>({
+    openaiApiKey: '',
+    groqApiKey: '',
+    geminiApiKey: '',
+    claudeApiKey: '',
+    providerCatalogs: [],
+    agentPrompts: [],
+    updatedAt: '',
+  });
+  const [companyAiProviderConfig, setCompanyAiProviderConfig] = useState<AIProviderConfig>({
+    openaiApiKey: '',
+    groqApiKey: '',
+    geminiApiKey: '',
+    claudeApiKey: '',
+    providerCatalogs: [],
+    companyAgentPlatforms: [],
+    companyDefaultProvider: company.aiProvider || 'openai',
+    companyDefaultModel: company.aiModel || '',
+    companyModelSource: company.aiModelSource || 'provider-default',
+    updatedAt: '',
+  });
+  const [isSavingAiProviderConfig, setIsSavingAiProviderConfig] = useState(false);
+  const [isSavingCompanyAiProviderConfig, setIsSavingCompanyAiProviderConfig] = useState(false);
+  const [newCatalogName, setNewCatalogName] = useState('');
+  const [newCatalogProvider, setNewCatalogProvider] = useState<AIProvider>('openai');
+  const [newCatalogClientId, setNewCatalogClientId] = useState<string>('');
+  const [newPromptTitle, setNewPromptTitle] = useState('');
+  const [newPromptArea, setNewPromptArea] = useState<AIAgentPromptArea>('suporte-tecnico');
+  const [newPromptPlans, setNewPromptPlans] = useState<SubscriptionPlan[]>(['Basic', 'Premium', 'Enterprise']);
+  const [newPromptBody, setNewPromptBody] = useState('');
+  const [newPromptStatus, setNewPromptStatus] = useState<'ATIVADO' | 'DESATIVADO'>('ATIVADO');
+  const [editingPromptId, setEditingPromptId] = useState<string | null>(null);
+
+  const [newCompanyPlatformName, setNewCompanyPlatformName] = useState('');
+  const [newCompanyPlatformProvider, setNewCompanyPlatformProvider] = useState<AIProvider>('openai');
+  const [newCompanyPlatformApiKey, setNewCompanyPlatformApiKey] = useState('');
+  const [newCompanyPlatformModel, setNewCompanyPlatformModel] = useState('provider-default');
+  const [isNewUserDialogOpen, setIsNewUserDialogOpen] = useState(false);
+  const [newUserForm, setNewUserForm] = useState({
+    name: '',
+    email: '',
+    role: 'USUARIO' as User['role'],
+  });
 
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [isGeneratingQr, setIsGeneratingQr] = useState(false);
+
+  const saasClientOptions = useMemo(
+    () => companies.map((companyItem) => ({ id: companyItem.id, name: companyItem.name })),
+    [companies]
+  );
+
+  useEffect(() => {
+    if (newCatalogClientId && saasClientOptions.some((item) => item.id === newCatalogClientId)) {
+      return;
+    }
+    setNewCatalogClientId(saasClientOptions[0]?.id || '');
+  }, [newCatalogClientId, saasClientOptions]);
+
+  const isNumericText = (value?: string) => /^\d+$/.test(String(value || '').trim());
+
+  const resolveClientDisplayName = (client: AICatalogClient): string => {
+    const rawName = String(client.name || '').trim();
+    const companyIdFromName = isNumericText(rawName) ? rawName : undefined;
+    const resolvedCompanyId = client.companyId || companyIdFromName;
+    const mappedName = saasClientOptions.find((item) => item.id === resolvedCompanyId)?.name;
+
+    if (rawName && !isNumericText(rawName) && rawName !== (client.companyId || '')) {
+      return rawName;
+    }
+    if (mappedName) return mappedName;
+    return rawName && !isNumericText(rawName) ? rawName : 'Cliente sem nome';
+  };
+
+  const handleCreateTeamUser = () => {
+    const name = newUserForm.name.trim();
+    const email = newUserForm.email.trim().toLowerCase();
+    if (!name || !email) {
+      toast.error('Preencha nome e e-mail para criar o usuário.');
+      return;
+    }
+    const emailExists = teamUsers.some((member) => member.email.toLowerCase() === email);
+    if (emailExists) {
+      toast.error('Já existe um usuário com este e-mail.');
+      return;
+    }
+
+    setTeamUsers(prev => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        name,
+        email,
+        role: newUserForm.role,
+        companyId: company.id || '1',
+        allowedEquipmentIds: [],
+        allowedTabs: newUserForm.role === 'ADMIN-USER'
+          ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico']
+          : ['dashboard', 'os', 'tarefas', 'suporte-tecnico'],
+      }
+    ]);
+
+    toast.success('Usuário cadastrado com sucesso!');
+    setNewUserForm({ name: '', email: '', role: 'USUARIO' });
+    setIsNewUserDialogOpen(false);
+  };
+
+  const normalizeCatalogClients = (catalogs: AIProviderCatalog[] = []): AIProviderCatalog[] =>
+    catalogs.map((catalog) => ({
+      ...catalog,
+      assignedClients: (catalog.assignedClients || []).map((client) => {
+        const rawName = String(client.name || '').trim();
+        const companyIdFromName = isNumericText(rawName) ? rawName : undefined;
+        const resolvedCompanyId = client.companyId || companyIdFromName;
+        return {
+          ...client,
+          companyId: resolvedCompanyId,
+          name: resolveClientDisplayName({ ...client, companyId: resolvedCompanyId }),
+        };
+      }),
+    }));
+
+  const ensurePromptDirective = (text: string) => {
+    const normalized = String(text || '').trim();
+    if (!normalized) return MANDATORY_PROMPT_HELP_DIRECTIVE;
+    if (normalized.toLowerCase().includes('próximo passo') || normalized.toLowerCase().includes('proximo passo')) {
+      return normalized;
+    }
+    return `${MANDATORY_PROMPT_HELP_DIRECTIVE}\n${normalized}`.trim();
+  };
+
+  const normalizeAgentPrompts = (prompts: AIAgentPromptTemplate[] = []): AIAgentPromptTemplate[] =>
+    prompts.map((prompt) => ({
+      ...prompt,
+      title: String(prompt.title || '').trim() || 'Prompt sem título',
+      area: (prompt.area || 'suporte-tecnico') as AIAgentPromptArea,
+      prompt: ensurePromptDirective(String(prompt.prompt || '').trim()),
+      isActive: Boolean(prompt.isActive),
+      plans: Array.isArray(prompt.plans) && prompt.plans.length > 0 ? prompt.plans : ['Basic', 'Premium', 'Enterprise'],
+      updatedAt: prompt.updatedAt || new Date().toISOString(),
+    }));
+
+  const normalizeCompanyAgentPlatforms = (platforms: CompanyAgentPlatform[] = []): CompanyAgentPlatform[] => {
+    const normalized = platforms.map((platform) => ({
+      ...platform,
+      name: String(platform.name || '').trim() || AI_PROVIDER_LABELS[platform.provider],
+      provider: platform.provider || 'openai',
+      apiKey: String(platform.apiKey || '').trim(),
+      modelSource: platform.modelSource === 'preset' ? 'preset' : 'provider-default',
+      model: String(platform.model || '').trim(),
+      isActive: Boolean(platform.isActive),
+      updatedAt: platform.updatedAt || new Date().toISOString(),
+    }));
+    if (normalized.some((item) => item.isActive)) return normalized;
+    if (normalized.length === 0) return normalized;
+    return normalized.map((item, idx) => ({ ...item, isActive: idx === 0 }));
+  };
 
   useEffect(() => {
     fetch(`/api/whatsapp/config?companyId=${user.companyId || 'default'}`)
@@ -6959,6 +9424,56 @@ function SettingsView({
       .then(data => setWsConfig(data))
       .catch(err => console.error('Erro ao buscar config WhatsApp:', err));
   }, [user.companyId]);
+
+  useEffect(() => {
+    axios
+      .get('/api/ai/provider-config?scope=global')
+      .then((res) => {
+        setAiProviderConfig({
+          openaiApiKey: res.data?.openaiApiKey || '',
+          groqApiKey: res.data?.groqApiKey || '',
+          geminiApiKey: res.data?.geminiApiKey || '',
+          claudeApiKey: res.data?.claudeApiKey || '',
+          providerCatalogs: normalizeCatalogClients(Array.isArray(res.data?.providerCatalogs) ? res.data.providerCatalogs : []),
+          agentPrompts: normalizeAgentPrompts(Array.isArray(res.data?.agentPrompts) ? res.data.agentPrompts : []),
+          updatedAt: res.data?.updatedAt || '',
+        });
+      })
+      .catch((err) => console.error('Erro ao carregar config global IA:', err));
+  }, []);
+
+  useEffect(() => {
+    if (isSaaS) return;
+    const scope = user.companyId || company.id || 'default';
+    axios
+      .get(`/api/ai/provider-config?scope=${encodeURIComponent(scope)}`)
+      .then((res) => {
+        setCompanyAiProviderConfig({
+          openaiApiKey: res.data?.openaiApiKey || '',
+          groqApiKey: res.data?.groqApiKey || '',
+          geminiApiKey: res.data?.geminiApiKey || '',
+          claudeApiKey: res.data?.claudeApiKey || '',
+          providerCatalogs: Array.isArray(res.data?.providerCatalogs) ? res.data.providerCatalogs : [],
+          companyAgentPlatforms: normalizeCompanyAgentPlatforms(
+            Array.isArray(res.data?.companyAgentPlatforms) ? res.data.companyAgentPlatforms : []
+          ),
+          companyDefaultProvider: (res.data?.companyDefaultProvider || company.aiProvider || 'openai') as AIProvider,
+          companyDefaultModel: res.data?.companyDefaultModel || company.aiModel || '',
+          companyModelSource: res.data?.companyModelSource === 'preset' ? 'preset' : (company.aiModelSource || 'provider-default'),
+          updatedAt: res.data?.updatedAt || '',
+        });
+      })
+      .catch((err) => console.error('Erro ao carregar config IA da empresa:', err));
+  }, [isSaaS, user.companyId, company.id, company.aiProvider, company.aiModel, company.aiModelSource]);
+
+  useEffect(() => {
+    if (isSaaS) return;
+    if (company.aiAssistantMode !== 'saas-managed') return;
+    if (company.aiSaasCatalogId) return;
+    const firstCatalog = aiProviderConfig.providerCatalogs?.[0];
+    if (!firstCatalog) return;
+    setCompany((prev) => ({ ...prev, aiSaasCatalogId: firstCatalog.id }));
+  }, [isSaaS, company.aiAssistantMode, company.aiSaasCatalogId, aiProviderConfig.providerCatalogs, setCompany]);
 
   const saveWsConfig = async () => {
     try {
@@ -6968,6 +9483,339 @@ function SettingsView({
       toast.error('Erro ao salvar configuração.');
     }
   };
+
+  const saveAiProviderConfig = async () => {
+    setIsSavingAiProviderConfig(true);
+    try {
+      const normalizedCatalogs = normalizeCatalogClients(aiProviderConfig.providerCatalogs || []);
+      const normalizedPrompts = normalizeAgentPrompts(aiProviderConfig.agentPrompts || []);
+      const payload = {
+        ...aiProviderConfig,
+        providerCatalogs: normalizedCatalogs,
+        agentPrompts: normalizedPrompts,
+        scope: 'global',
+        updatedAt: new Date().toISOString(),
+      };
+      await axios.post('/api/ai/provider-config', payload);
+      setAiProviderConfig((prev) => ({
+        ...prev,
+        providerCatalogs: normalizedCatalogs,
+        agentPrompts: normalizedPrompts,
+        updatedAt: payload.updatedAt,
+      }));
+      toast.success('Chaves e listas de IA salvas.');
+    } catch (err) {
+      console.error('Erro ao salvar config global IA:', err);
+      toast.error('Erro ao salvar configuração global de IA.');
+    } finally {
+      setIsSavingAiProviderConfig(false);
+    }
+  };
+
+  const saveCompanyAiConfig = async () => {
+    setIsSavingCompanyAiProviderConfig(true);
+    try {
+      const scope = user.companyId || company.id || 'default';
+      const normalizedPlatforms = normalizeCompanyAgentPlatforms(companyAiProviderConfig.companyAgentPlatforms || []);
+      const activePlatform = normalizedPlatforms.find((item) => item.isActive) || null;
+      const resolvedProvider = activePlatform?.provider || company.aiProvider || companyAiProviderConfig.companyDefaultProvider || 'openai';
+      const resolvedModelSource =
+        activePlatform?.modelSource === 'preset' && activePlatform.model ? 'preset' : 'provider-default';
+      const resolvedModel = resolvedModelSource === 'preset' ? String(activePlatform?.model || '').trim() : '';
+
+      let openaiApiKey = String(companyAiProviderConfig.openaiApiKey || '').trim();
+      let groqApiKey = String(companyAiProviderConfig.groqApiKey || '').trim();
+      let geminiApiKey = String(companyAiProviderConfig.geminiApiKey || '').trim();
+      let claudeApiKey = String(companyAiProviderConfig.claudeApiKey || '').trim();
+
+      if (activePlatform?.apiKey) {
+        if (activePlatform.provider === 'openai') openaiApiKey = activePlatform.apiKey;
+        if (activePlatform.provider === 'groq') groqApiKey = activePlatform.apiKey;
+        if (activePlatform.provider === 'gemini') geminiApiKey = activePlatform.apiKey;
+        if (activePlatform.provider === 'claude') claudeApiKey = activePlatform.apiKey;
+      }
+
+      const payload = {
+        ...companyAiProviderConfig,
+        openaiApiKey,
+        groqApiKey,
+        geminiApiKey,
+        claudeApiKey,
+        companyAgentPlatforms: normalizedPlatforms,
+        scope,
+        companyDefaultProvider: resolvedProvider,
+        companyDefaultModel: resolvedModel || company.aiModel || companyAiProviderConfig.companyDefaultModel || '',
+        companyModelSource: resolvedModelSource,
+        updatedAt: new Date().toISOString(),
+      };
+      await axios.post('/api/ai/provider-config', payload);
+      setCompanyAiProviderConfig((prev) => ({
+        ...prev,
+        openaiApiKey,
+        groqApiKey,
+        geminiApiKey,
+        claudeApiKey,
+        companyAgentPlatforms: normalizedPlatforms,
+        companyDefaultProvider: resolvedProvider,
+        companyDefaultModel: resolvedModel,
+        companyModelSource: resolvedModelSource,
+        updatedAt: payload.updatedAt,
+      }));
+      setCompany((prev) => ({
+        ...prev,
+        aiProvider: resolvedProvider,
+        aiModelSource: resolvedModelSource,
+        aiModel: resolvedModel,
+      }));
+      toast.success('Configura??o de IA da empresa salva e aplicada aos t?cnicos.');
+    } catch (err) {
+      console.error('Erro ao salvar IA da empresa:', err);
+      toast.error('Erro ao salvar configura??o de IA da empresa.');
+    } finally {
+      setIsSavingCompanyAiProviderConfig(false);
+    }
+  };
+
+  const addGlobalProviderCatalog = () => {
+    const listName = newCatalogName.trim();
+    if (!listName) {
+      toast.error('Informe o nome da lista.');
+      return;
+    }
+    const models = AI_PROVIDER_MODEL_OPTIONS[newCatalogProvider] || [];
+    const initialClient = saasClientOptions.find((client) => client.id === newCatalogClientId);
+    const assignedClients: AICatalogClient[] = initialClient
+      ? [{ id: crypto.randomUUID(), companyId: initialClient.id, name: initialClient.name }]
+      : [];
+    const catalog: AIProviderCatalog = {
+      id: crypto.randomUUID(),
+      listName,
+      provider: newCatalogProvider,
+      models,
+      assignedClients,
+      includedInPlan: true,
+      updatedAt: new Date().toISOString(),
+    };
+    setAiProviderConfig((prev) => ({ ...prev, providerCatalogs: [...(prev.providerCatalogs || []), catalog] }));
+    setNewCatalogName('');
+    toast.success(`Lista "${listName}" criada.`);
+  };
+
+  const updateGlobalProviderCatalogName = (catalogId: string, nextListName: string) => {
+    const trimmed = nextListName.trim();
+    if (!trimmed) {
+      toast.error('Informe um nome para a lista.');
+      return;
+    }
+    setAiProviderConfig((prev) => ({
+      ...prev,
+      providerCatalogs: (prev.providerCatalogs || []).map((item) =>
+        item.id === catalogId ? { ...item, listName: trimmed, updatedAt: new Date().toISOString() } : item
+      ),
+    }));
+    toast.success('Nome da lista atualizado.');
+  };
+
+  const addClientToCatalog = (catalogId: string, companyId: string) => {
+    const companyOption = saasClientOptions.find((item) => item.id === companyId);
+    if (!companyOption) return;
+
+    let added = false;
+    setAiProviderConfig((prev) => ({
+      ...prev,
+      providerCatalogs: (prev.providerCatalogs || []).map((item) => {
+        if (item.id !== catalogId) return item;
+        const currentClients = item.assignedClients || [];
+        if (currentClients.some((client) => client.companyId === companyId)) return item;
+        added = true;
+        return {
+          ...item,
+          assignedClients: [...currentClients, { id: crypto.randomUUID(), companyId: companyOption.id, name: companyOption.name }],
+          updatedAt: new Date().toISOString(),
+        };
+      }),
+    }));
+    if (added) {
+      toast.success(`Cliente "${companyOption.name}" vinculado à lista.`);
+      return;
+    }
+    toast.info('Cliente já vinculado a esta lista.');
+  };
+
+  const updateCatalogClientName = (catalogId: string, clientId: string, nextName: string) => {
+    const trimmed = nextName.trim();
+    if (!trimmed) {
+      toast.error('Informe o nome do cliente.');
+      return;
+    }
+    setAiProviderConfig((prev) => ({
+      ...prev,
+      providerCatalogs: (prev.providerCatalogs || []).map((item) => {
+        if (item.id !== catalogId) return item;
+        return {
+          ...item,
+          assignedClients: (item.assignedClients || []).map((client) =>
+            client.id === clientId ? { ...client, name: trimmed } : client
+          ),
+          updatedAt: new Date().toISOString(),
+        };
+      }),
+    }));
+    toast.success('Cliente atualizado.');
+  };
+
+  const removeClientFromCatalog = (catalogId: string, clientId: string) => {
+    setAiProviderConfig((prev) => ({
+      ...prev,
+      providerCatalogs: (prev.providerCatalogs || []).map((item) =>
+        item.id === catalogId
+          ? {
+              ...item,
+              assignedClients: (item.assignedClients || []).filter((client) => client.id !== clientId),
+              updatedAt: new Date().toISOString(),
+            }
+          : item
+      ),
+    }));
+    toast.success('Cliente removido da lista.');
+  };
+
+  const removeGlobalProviderCatalog = (catalogId: string) => {
+    setAiProviderConfig((prev) => ({
+      ...prev,
+      providerCatalogs: (prev.providerCatalogs || []).filter((item) => item.id !== catalogId),
+    }));
+    toast.success('Lista removida.');
+  };
+
+  const togglePromptPlan = (plan: SubscriptionPlan) => {
+    setNewPromptPlans((prev) => (prev.includes(plan) ? prev.filter((item) => item !== plan) : [...prev, plan]));
+  };
+
+  const createAgentPrompt = () => {
+    const title = String(newPromptTitle || '').trim();
+    const promptText = String(newPromptBody || '').trim();
+    if (!title) {
+      toast.error('Informe o título do prompt.');
+      return;
+    }
+    if (!promptText) {
+      toast.error('Informe o conteúdo do prompt.');
+      return;
+    }
+    const plans = newPromptPlans.length > 0 ? newPromptPlans : ['Basic', 'Premium', 'Enterprise'];
+    const created: AIAgentPromptTemplate = {
+      id: crypto.randomUUID(),
+      title,
+      area: newPromptArea,
+      prompt: ensurePromptDirective(promptText),
+      isActive: newPromptStatus === 'ATIVADO',
+      plans,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    setAiProviderConfig((prev) => ({
+      ...prev,
+      agentPrompts: normalizeAgentPrompts([...(prev.agentPrompts || []), created]),
+    }));
+    setNewPromptTitle('');
+    setNewPromptBody('');
+    setNewPromptArea('suporte-tecnico');
+    setNewPromptPlans(['Basic', 'Premium', 'Enterprise']);
+    setNewPromptStatus('ATIVADO');
+    toast.success('Prompt criado para o plano selecionado.');
+  };
+
+  const saveExistingPrompt = (promptId: string) => {
+    setAiProviderConfig((prev) => ({
+      ...prev,
+      agentPrompts: normalizeAgentPrompts((prev.agentPrompts || []).map((item) => (item.id === promptId ? { ...item, updatedAt: new Date().toISOString() } : item))),
+    }));
+    setEditingPromptId(null);
+    toast.success('Prompt atualizado.');
+  };
+
+  const removeAgentPrompt = (promptId: string) => {
+    setAiProviderConfig((prev) => ({
+      ...prev,
+      agentPrompts: (prev.agentPrompts || []).filter((item) => item.id !== promptId),
+    }));
+    if (editingPromptId === promptId) setEditingPromptId(null);
+    toast.success('Prompt removido.');
+  };
+
+  const addCompanyAgentPlatform = () => {
+    const name = String(newCompanyPlatformName || '').trim();
+    const apiKey = String(newCompanyPlatformApiKey || '').trim();
+    if (!name) {
+      toast.error('Informe o nome da plataforma.');
+      return;
+    }
+    if (!apiKey) {
+      toast.error('Informe a API Key da plataforma.');
+      return;
+    }
+    const platform: CompanyAgentPlatform = {
+      id: crypto.randomUUID(),
+      name,
+      provider: newCompanyPlatformProvider,
+      apiKey,
+      modelSource: newCompanyPlatformModel === 'provider-default' ? 'provider-default' : 'preset',
+      model: newCompanyPlatformModel === 'provider-default' ? '' : newCompanyPlatformModel,
+      isActive: (companyAiProviderConfig.companyAgentPlatforms || []).length === 0,
+      updatedAt: new Date().toISOString(),
+    };
+    setCompanyAiProviderConfig((prev) => ({
+      ...prev,
+      companyAgentPlatforms: normalizeCompanyAgentPlatforms([...(prev.companyAgentPlatforms || []), platform]),
+    }));
+    setNewCompanyPlatformName('');
+    setNewCompanyPlatformApiKey('');
+    setNewCompanyPlatformProvider('openai');
+    setNewCompanyPlatformModel('provider-default');
+    toast.success('Plataforma de agentes adicionada.');
+  };
+
+  const setActiveCompanyAgentPlatform = (platformId: string) => {
+    setCompanyAiProviderConfig((prev) => {
+      const currentPlatforms = prev.companyAgentPlatforms || [];
+      const nextPlatforms = normalizeCompanyAgentPlatforms(
+        currentPlatforms.map((item) => ({ ...item, isActive: item.id === platformId, updatedAt: new Date().toISOString() }))
+      );
+      const active = nextPlatforms.find((item) => item.isActive);
+      if (active) {
+        setCompany((companyPrev) => ({
+          ...companyPrev,
+          aiProvider: active.provider,
+          aiModelSource: active.modelSource,
+          aiModel: active.modelSource === 'preset' ? String(active.model || '').trim() : '',
+        }));
+        setTeamUsers((teamPrev) => [...teamPrev]);
+      }
+      return { ...prev, companyAgentPlatforms: nextPlatforms };
+    });
+    toast.success('Plataforma ativa aplicada para toda a equipe técnica.');
+  };
+
+  const removeCompanyAgentPlatform = (platformId: string) => {
+    setCompanyAiProviderConfig((prev) => ({
+      ...prev,
+      companyAgentPlatforms: normalizeCompanyAgentPlatforms((prev.companyAgentPlatforms || []).filter((item) => item.id !== platformId)),
+    }));
+    toast.success('Plataforma removida.');
+  };
+
+  const handleApiKeyPaste =
+    (
+      field: 'openaiApiKey' | 'groqApiKey' | 'geminiApiKey' | 'claudeApiKey',
+      setter: React.Dispatch<React.SetStateAction<AIProviderConfig>>
+    ) =>
+    (e: React.ClipboardEvent<HTMLInputElement>) => {
+      const text = e.clipboardData.getData('text');
+      if (!text) return;
+      e.preventDefault();
+      setter((prev) => ({ ...prev, [field]: text.trim() }));
+    };
 
   const generateQr = async () => {
     setIsGeneratingQr(true);
@@ -7024,13 +9872,16 @@ function SettingsView({
       reader.readAsDataURL(file);
     }
   };
+
+  const saasCatalogOptions = aiProviderConfig.providerCatalogs || [];
+  const selectedSaasCatalogForCompany =
+    saasCatalogOptions.find((catalog) => catalog.id === company.aiSaasCatalogId) || saasCatalogOptions[0] || null;
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Configurações</h1>
-        <p className="text-muted-foreground">
-          {isSaaS ? 'Gerencie as preferências globais do sistema SaaS.' : 'Gerencie as preferências do sistema e dados da empresa.'}
-        </p>
+        <p className="text-muted-foreground">Gerencie as configurações gerais do sistema e integrações.</p>
       </div>
 
       <Tabs defaultValue={isSaaS ? "geral" : "empresa"} className="w-full">
@@ -7046,7 +9897,7 @@ function SettingsView({
               <TabsTrigger value="config-sistema">Config. Sistema</TabsTrigger>
               <TabsTrigger value="equipamentos">Equipamentos</TabsTrigger>
               {isAdminUser && <TabsTrigger value="substatus">Sub-status</TabsTrigger>}
-              <TabsTrigger value="whatsapp-config">API WhatsApp</TabsTrigger>
+              <TabsTrigger value="whatsapp-config">API</TabsTrigger>
               <TabsTrigger value="usuarios">Usuários</TabsTrigger>
               <TabsTrigger value="import-export">Importar/Exportar</TabsTrigger>
             </>
@@ -7117,8 +9968,396 @@ function SettingsView({
                   <CardDescription>Gerencie tokens de acesso e integrações externas.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="p-4 bg-secondary/30 rounded-lg border border-dashed border-muted-foreground/20">
-                    <p className="text-sm text-muted-foreground italic">Módulo de segurança avançada em desenvolvimento.</p>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label>OpenAI / ChatGPT API Key</Label>
+                      <Input
+                        type="password"
+                        placeholder="sk-..."
+                        value={aiProviderConfig.openaiApiKey || ''}
+                        onChange={(e) => setAiProviderConfig((prev) => ({ ...prev, openaiApiKey: e.target.value }))}
+                        onPaste={handleApiKeyPaste('openaiApiKey', setAiProviderConfig)}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Groq API Key</Label>
+                      <Input
+                        type="password"
+                        placeholder="gsk_..."
+                        value={aiProviderConfig.groqApiKey || ''}
+                        onChange={(e) => setAiProviderConfig((prev) => ({ ...prev, groqApiKey: e.target.value }))}
+                        onPaste={handleApiKeyPaste('groqApiKey', setAiProviderConfig)}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Google Gemini API Key</Label>
+                      <Input
+                        type="password"
+                        placeholder="AIza..."
+                        value={aiProviderConfig.geminiApiKey || ''}
+                        onChange={(e) => setAiProviderConfig((prev) => ({ ...prev, geminiApiKey: e.target.value }))}
+                        onPaste={handleApiKeyPaste('geminiApiKey', setAiProviderConfig)}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Anthropic Claude API Key</Label>
+                      <Input
+                        type="password"
+                        placeholder="sk-ant-..."
+                        value={aiProviderConfig.claudeApiKey || ''}
+                        onChange={(e) => setAiProviderConfig((prev) => ({ ...prev, claudeApiKey: e.target.value }))}
+                        onPaste={handleApiKeyPaste('claudeApiKey', setAiProviderConfig)}
+                        autoComplete="off"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border p-4 space-y-4">
+                    <div className="space-y-1">
+                      <h3 className="text-sm font-semibold">Listas de IA oferecidas no plano</h3>
+                      <p className="text-xs text-muted-foreground">Crie listas por provedor e gerencie clientes vinculados em cada lista.</p>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                      <Input
+                        placeholder="Nome da lista (ex: OpenAI Plano)"
+                        value={newCatalogName}
+                        onChange={(e) => setNewCatalogName(e.target.value)}
+                      />
+                      <Select value={newCatalogProvider} onValueChange={(value) => setNewCatalogProvider(value as AIProvider)}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="openai">OpenAI (ChatGPT)</SelectItem>
+                          <SelectItem value="groq">Groq</SelectItem>
+                          <SelectItem value="gemini">Gemini</SelectItem>
+                          <SelectItem value="claude">Claude</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Select value={newCatalogClientId} onValueChange={setNewCatalogClientId}>
+                        <SelectTrigger><SelectValue placeholder="Cliente inicial" /></SelectTrigger>
+                        <SelectContent>
+                          {saasClientOptions.map((client) => (
+                            <SelectItem key={`initial-${client.id}`} value={client.id}>{client.name}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <Button onClick={addGlobalProviderCatalog}>Criar Lista</Button>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {(aiProviderConfig.providerCatalogs || []).length === 0 ? (
+                        <p className="text-sm text-muted-foreground">Nenhuma lista criada ainda.</p>
+                      ) : (
+                        (aiProviderConfig.providerCatalogs || []).map((catalog) => (
+                          <div key={catalog.id} className="rounded-lg border p-3 space-y-3">
+                            <div className="flex items-start justify-between gap-2">
+                              <p className="text-xs text-muted-foreground">
+                                {AI_PROVIDER_LABELS[catalog.provider]} • {catalog.models?.length || 0} modelos
+                              </p>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-[10px] text-rose-500"
+                                onClick={() => removeGlobalProviderCatalog(catalog.id)}
+                              >
+                                Apagar Lista
+                              </Button>
+                            </div>
+
+                            <div className="flex gap-2">
+                              <Input
+                                value={catalog.listName}
+                                onChange={(e) =>
+                                  setAiProviderConfig((prev) => ({
+                                    ...prev,
+                                    providerCatalogs: (prev.providerCatalogs || []).map((item) =>
+                                      item.id === catalog.id ? { ...item, listName: e.target.value } : item
+                                    ),
+                                  }))
+                                }
+                              />
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-9"
+                                onClick={() => updateGlobalProviderCatalogName(catalog.id, catalog.listName)}
+                              >
+                                Salvar Nome
+                              </Button>
+                            </div>
+
+                            <div className="flex flex-wrap gap-2">
+                              {(catalog.models || []).slice(0, 8).map((model) => (
+                                <Badge key={model.value} variant="outline" className="text-[10px]">
+                                  {model.label}
+                                </Badge>
+                              ))}
+                            </div>
+
+                            <div className="space-y-2 border-t pt-3">
+                              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                <Select value={newCatalogClientId} onValueChange={setNewCatalogClientId}>
+                                  <SelectTrigger><SelectValue placeholder="Selecionar cliente" /></SelectTrigger>
+                                  <SelectContent>
+                                    {saasClientOptions.map((clientOption) => (
+                                      <SelectItem key={`${catalog.id}-${clientOption.id}`} value={clientOption.id}>
+                                        {clientOption.name}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                                <Button
+                                  variant="outline"
+                                  className="md:col-span-2"
+                                  onClick={() => addClientToCatalog(catalog.id, newCatalogClientId)}
+                                >
+                                  Vincular Cliente
+                                </Button>
+                              </div>
+
+                              {(catalog.assignedClients || []).length === 0 ? (
+                                <p className="text-xs text-muted-foreground">Nenhum cliente vinculado.</p>
+                              ) : (
+                                (catalog.assignedClients || []).map((client) => (
+                                  <div key={client.id} className="grid grid-cols-1 md:grid-cols-3 gap-2 items-center">
+                                    <Input
+                                      value={resolveClientDisplayName(client)}
+                                      onChange={(e) =>
+                                        setAiProviderConfig((prev) => ({
+                                          ...prev,
+                                          providerCatalogs: (prev.providerCatalogs || []).map((item) => {
+                                            if (item.id !== catalog.id) return item;
+                                            return {
+                                              ...item,
+                                              assignedClients: (item.assignedClients || []).map((assigned) =>
+                                                assigned.id === client.id ? { ...assigned, name: e.target.value } : assigned
+                                              ),
+                                            };
+                                          }),
+                                        }))
+                                      }
+                                    />
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      onClick={() => updateCatalogClientName(catalog.id, client.id, resolveClientDisplayName(client))}
+                                    >
+                                      Editar Cliente
+                                    </Button>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="text-rose-500"
+                                      onClick={() => removeClientFromCatalog(catalog.id, client.id)}
+                                    >
+                                      Apagar Cliente
+                                    </Button>
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border p-4 space-y-4">
+                    <div className="space-y-1">
+                      <h3 className="text-sm font-semibold">Prompts de Agentes por Area</h3>
+                      <p className="text-xs text-muted-foreground">
+                        Crie prompts incluidos no plano, defina area, status e planos permitidos.
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      <Input
+                        placeholder="Titulo do prompt"
+                        value={newPromptTitle}
+                        onChange={(e) => setNewPromptTitle(e.target.value)}
+                      />
+                      <Select value={newPromptArea} onValueChange={(value) => setNewPromptArea(value as AIAgentPromptArea)}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          {(Object.keys(AGENT_PROMPT_AREA_LABELS) as AIAgentPromptArea[]).map((area) => (
+                            <SelectItem key={area} value={area}>{AGENT_PROMPT_AREA_LABELS[area]}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <Select value={newPromptStatus} onValueChange={(value) => setNewPromptStatus(value as 'ATIVADO' | 'DESATIVADO')}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="ATIVADO">ATIVADO</SelectItem>
+                          <SelectItem value="DESATIVADO">DESATIVADO</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <textarea
+                      value={newPromptBody}
+                      onChange={(e) => setNewPromptBody(e.target.value)}
+                      rows={4}
+                      className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                      placeholder="Descreva como os agentes devem agir nesta area..."
+                    />
+
+                    <div className="flex flex-wrap gap-2">
+                      {PLAN_OPTIONS.map((plan) => {
+                        const selected = newPromptPlans.includes(plan);
+                        return (
+                          <Button
+                            key={plan}
+                            type="button"
+                            size="sm"
+                            variant={selected ? 'default' : 'outline'}
+                            onClick={() => togglePromptPlan(plan)}
+                          >
+                            {plan}
+                          </Button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="flex justify-end">
+                      <Button onClick={createAgentPrompt}>Criar Novo Prompt</Button>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-3">
+                      {(aiProviderConfig.agentPrompts || []).length === 0 ? (
+                        <p className="text-sm text-muted-foreground">Nenhum prompt criado ainda.</p>
+                      ) : (
+                        (aiProviderConfig.agentPrompts || []).map((promptItem) => (
+                          <div key={promptItem.id} className="rounded-lg border p-3 space-y-2">
+                            <div className="flex items-start justify-between gap-2">
+                              <div>
+                                <p className="font-semibold text-sm">{promptItem.title}</p>
+                                <p className="text-xs text-muted-foreground">
+                                  Area: {AGENT_PROMPT_AREA_LABELS[promptItem.area]} - Status: {promptItem.isActive ? 'ATIVADO' : 'DESATIVADO'} - Planos: {(promptItem.plans || []).join(', ')}
+                                </p>
+                              </div>
+                              <div className="flex gap-2">
+                                <Button variant="outline" size="sm" onClick={() => setEditingPromptId(editingPromptId === promptItem.id ? null : promptItem.id)}>
+                                  Modificar
+                                </Button>
+                                <Button variant="ghost" size="sm" className="text-rose-500" onClick={() => removeAgentPrompt(promptItem.id)}>
+                                  Apagar
+                                </Button>
+                              </div>
+                            </div>
+
+                            {editingPromptId === promptItem.id && (
+                              <div className="space-y-2 border-t pt-3">
+                                <Input
+                                  value={promptItem.title}
+                                  onChange={(e) =>
+                                    setAiProviderConfig((prev) => ({
+                                      ...prev,
+                                      agentPrompts: (prev.agentPrompts || []).map((item) =>
+                                        item.id === promptItem.id ? { ...item, title: e.target.value } : item
+                                      ),
+                                    }))
+                                  }
+                                />
+                                <Select
+                                  value={promptItem.area}
+                                  onValueChange={(value) =>
+                                    setAiProviderConfig((prev) => ({
+                                      ...prev,
+                                      agentPrompts: (prev.agentPrompts || []).map((item) =>
+                                        item.id === promptItem.id ? { ...item, area: value as AIAgentPromptArea } : item
+                                      ),
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger><SelectValue /></SelectTrigger>
+                                  <SelectContent>
+                                    {(Object.keys(AGENT_PROMPT_AREA_LABELS) as AIAgentPromptArea[]).map((area) => (
+                                      <SelectItem key={promptItem.id + '-' + area} value={area}>{AGENT_PROMPT_AREA_LABELS[area]}</SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                                <Select
+                                  value={promptItem.isActive ? 'ATIVADO' : 'DESATIVADO'}
+                                  onValueChange={(value) =>
+                                    setAiProviderConfig((prev) => ({
+                                      ...prev,
+                                      agentPrompts: (prev.agentPrompts || []).map((item) =>
+                                        item.id === promptItem.id ? { ...item, isActive: value === 'ATIVADO' } : item
+                                      ),
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger><SelectValue /></SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="ATIVADO">ATIVADO</SelectItem>
+                                    <SelectItem value="DESATIVADO">DESATIVADO</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                                <textarea
+                                  value={promptItem.prompt}
+                                  onChange={(e) =>
+                                    setAiProviderConfig((prev) => ({
+                                      ...prev,
+                                      agentPrompts: (prev.agentPrompts || []).map((item) =>
+                                        item.id === promptItem.id ? { ...item, prompt: e.target.value } : item
+                                      ),
+                                    }))
+                                  }
+                                  rows={6}
+                                  className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                                />
+                                <div className="flex flex-wrap gap-2">
+                                  {PLAN_OPTIONS.map((plan) => {
+                                    const selected = (promptItem.plans || []).includes(plan);
+                                    return (
+                                      <Button
+                                        key={promptItem.id + '-' + plan}
+                                        type="button"
+                                        size="sm"
+                                        variant={selected ? 'default' : 'outline'}
+                                        onClick={() =>
+                                          setAiProviderConfig((prev) => ({
+                                            ...prev,
+                                            agentPrompts: (prev.agentPrompts || []).map((item) =>
+                                              item.id === promptItem.id
+                                                ? {
+                                                    ...item,
+                                                    plans: selected
+                                                      ? (item.plans || []).filter((p) => p !== plan)
+                                                      : [...(item.plans || []), plan],
+                                                  }
+                                                : item
+                                            ),
+                                          }))
+                                        }
+                                      >
+                                        {plan}
+                                      </Button>
+                                    );
+                                  })}
+                                </div>
+                                <div className="flex justify-end">
+                                  <Button size="sm" onClick={() => saveExistingPrompt(promptItem.id)}>Salvar Modificacao</Button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">
+                    {aiProviderConfig.updatedAt
+                      ? `Última atualização: ${format(new Date(aiProviderConfig.updatedAt), "dd/MM/yyyy 'às' HH:mm")}`
+                      : 'Nenhuma chave de IA salva ainda.'}
+                  </div>
+                  <div className="flex justify-end">
+                    <Button onClick={saveAiProviderConfig} disabled={isSavingAiProviderConfig} className="gap-2">
+                      {isSavingAiProviderConfig && <RefreshCw className="w-4 h-4 animate-spin" />}
+                      Salvar Chaves e Listas de IA
+                    </Button>
                   </div>
                 </CardContent>
               </Card>
@@ -7520,108 +10759,341 @@ function SettingsView({
         </TabsContent>
 
         <TabsContent value="whatsapp-config" className="mt-6 space-y-6">
-          <Card className="border-none shadow-sm">
-            <CardHeader className="flex flex-row items-center justify-between">
-              <div>
-                <CardTitle>Conexão WhatsApp (Gateway)</CardTitle>
-                <CardDescription>Conecte o número via QR Code usando seu próprio Gateway.</CardDescription>
-              </div>
-              <div className={cn("p-2 rounded-full", qrCode ? "bg-emerald-100" : "bg-amber-100")}>
-                {qrCode ? <Check className="w-5 h-5 text-emerald-600" /> : <Clock className="w-5 h-5 text-amber-600" />}
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              <div className="grid md:grid-cols-2 gap-8">
-                <div className="space-y-6">
+          <Tabs defaultValue="api-whatsapp" className="w-full">
+            <TabsList className="grid w-full max-w-md grid-cols-2">
+              <TabsTrigger value="api-whatsapp">WHATSAPP</TabsTrigger>
+              <TabsTrigger value="api-agentes">AGENTES IA</TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="api-whatsapp" className="mt-6">
+              <Card className="border-none shadow-sm">
+                <CardHeader className="flex flex-row items-center justify-between">
+                  <div>
+                    <CardTitle>Conexao WhatsApp (Gateway)</CardTitle>
+                    <CardDescription>Conecte o numero via QR Code usando seu proprio Gateway.</CardDescription>
+                  </div>
+                  <div className={cn("p-2 rounded-full", qrCode ? "bg-emerald-100" : "bg-amber-100")}>
+                    {qrCode ? <Check className="w-5 h-5 text-emerald-600" /> : <Clock className="w-5 h-5 text-amber-600" />}
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                  <div className="grid md:grid-cols-2 gap-8">
+                    <div className="space-y-6">
+                      <div className="space-y-2">
+                        <Label>URL do Servidor Gateway (Evolution API)</Label>
+                        <Input
+                          placeholder="Ex: https://api.seudominio.com"
+                          value={wsConfig.serverUrl}
+                          onChange={(e) => setWsConfig({ ...wsConfig, serverUrl: e.target.value })}
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <Label>Chave de API do Gateway (Global API Key)</Label>
+                        <Input
+                          type="password"
+                          placeholder="Sua chave secreta..."
+                          value={wsConfig.apiKey}
+                          onChange={(e) => setWsConfig({ ...wsConfig, apiKey: e.target.value })}
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <Label>Nome da Instancia (Opcional)</Label>
+                        <Input
+                          placeholder="Ex: tecnico-01"
+                          value={wsConfig.instanceName}
+                          onChange={(e) => setWsConfig({ ...wsConfig, instanceName: e.target.value })}
+                        />
+                        <p className="text-[10px] text-muted-foreground italic">Use um nome unico para esta empresa.</p>
+                      </div>
+
+                      <div className="flex gap-3 pt-4">
+                        <Button onClick={saveWsConfig} className="flex-1 gap-2">
+                          <CheckCircle2 className="w-4 h-4" /> Salvar Credenciais
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col items-center justify-center border-2 border-dashed rounded-2xl p-6 bg-secondary/5">
+                      <h3 className="text-sm font-bold mb-4">Escaneie o QR Code</h3>
+                      {qrCode ? (
+                        <div className="relative group overflow-hidden rounded-xl border-4 border-white shadow-xl">
+                          <img src={qrCode} alt="QR Code" className="w-[200px] h-[200px]" />
+                          <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                             <Button size="sm" variant="secondary" onClick={generateQr}>Atualizar</Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="w-[200px] h-[200px] bg-secondary/50 rounded-xl flex flex-col items-center justify-center text-center p-4">
+                          <QrCode className="w-12 h-12 opacity-10 mb-2" />
+                          <p className="text-[10px] text-muted-foreground">Configure as credenciais e clique em gerar.</p>
+                        </div>
+                      )}
+
+                      <Button
+                        variant="outline"
+                        className="mt-6 w-full gap-2"
+                        onClick={generateQr}
+                        disabled={isGeneratingQr || !wsConfig.serverUrl}
+                      >
+                        {isGeneratingQr ? <RefreshCw className="w-4 h-4 animate-spin" /> : <QrCode className="w-4 h-4" />}
+                        {qrCode ? 'Gerar Novo QR Code' : 'Gerar Primeiro QR Code'}
+                      </Button>
+                      <p className="text-[9px] text-muted-foreground mt-2 text-center">
+                        Abra o WhatsApp no celular &gt; Aparelhos Conectados &gt; Conectar Aparelho.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-4 bg-primary/5 rounded-xl border border-dashed text-[11px] space-y-2">
+                    <p className="font-bold text-primary flex items-center gap-2">INFORMACOES TECNICAS:</p>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <span className="text-muted-foreground">URL Webhook (no Gateway):</span>
+                        <code className="bg-white px-2 py-0.5 rounded block truncate border mt-1">
+                          {window.location.origin}/api/whatsapp/webhook
+                        </code>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Status do Servico:</span>
+                        <div className="flex items-center gap-2 mt-1">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                          <span className="font-bold text-emerald-600">Conectado ao Gateway</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            <TabsContent value="api-agentes" className="mt-6 space-y-6">
+              <Card className="border-none shadow-sm">
+                <CardHeader>
+                  <CardTitle>Agentes IA</CardTitle>
+                  <CardDescription>
+                    Defina a origem da IA e, no modo proprio, configure multiplas plataformas e ative apenas uma para toda a equipe tecnica.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
                   <div className="space-y-2">
-                    <Label>URL do Servidor Gateway (Evolution API)</Label>
-                    <Input 
-                      placeholder="Ex: https://api.seudominio.com" 
-                      value={wsConfig.serverUrl}
-                      onChange={(e) => setWsConfig({...wsConfig, serverUrl: e.target.value})}
-                    />
+                    <Label>Origem do Assistente IA</Label>
+                    <Select
+                      value={company.aiAssistantMode || 'saas-managed'}
+                      onValueChange={(value) =>
+                        setCompany((prev) => ({
+                          ...prev,
+                          aiAssistantMode: value as Company['aiAssistantMode'],
+                          aiSaasCatalogId: value === 'saas-managed' ? (prev.aiSaasCatalogId || saasCatalogOptions[0]?.id || '') : '',
+                        }))
+                      }
+                    >
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="saas-managed">Usar assistente IA fornecido pelo SaaS Admin</SelectItem>
+                        <SelectItem value="company-own">Usar chave API propria da empresa</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
 
-                  <div className="space-y-2">
-                    <Label>Chave de API do Gateway (Global API Key)</Label>
-                    <Input 
-                      type="password"
-                      placeholder="Sua chave secreta..." 
-                      value={wsConfig.apiKey}
-                      onChange={(e) => setWsConfig({...wsConfig, apiKey: e.target.value})}
-                    />
-                  </div>
+                  {company.aiAssistantMode !== 'company-own' ? (
+                    <div className="space-y-4 rounded-lg border p-3">
+                      <div className="space-y-2">
+                        <Label>Lista IA selecionada no plano</Label>
+                        <Select
+                          value={company.aiSaasCatalogId || selectedSaasCatalogForCompany?.id || ''}
+                          onValueChange={(value) => setCompany((prev) => ({ ...prev, aiSaasCatalogId: value }))}
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="Selecione a lista publicada pelo SaaS Admin" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {saasCatalogOptions.map((catalog) => (
+                              <SelectItem key={catalog.id} value={catalog.id}>
+                                {catalog.listName} - {AI_PROVIDER_LABELS[catalog.provider]}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
 
-                  <div className="space-y-2">
-                    <Label>Nome da Instância (Opcional)</Label>
-                    <Input 
-                      placeholder="Ex: tecnico-01" 
-                      value={wsConfig.instanceName}
-                      onChange={(e) => setWsConfig({...wsConfig, instanceName: e.target.value})}
-                    />
-                    <p className="text-[10px] text-muted-foreground italic">Use um nome único para esta empresa.</p>
-                  </div>
+                      {selectedSaasCatalogForCompany ? (
+                        <div className="rounded-md border border-dashed p-2 text-xs text-muted-foreground">
+                          {selectedSaasCatalogForCompany.models?.length || 0} modelos disponiveis para a equipe.
+                        </div>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">Nenhuma lista disponivel no momento.</p>
+                      )}
 
-                  <div className="flex gap-3 pt-4">
-                    <Button onClick={saveWsConfig} className="flex-1 gap-2">
-                      <CheckCircle2 className="w-4 h-4" /> Salvar Credenciais
-                    </Button>
-                  </div>
-                </div>
-
-                <div className="flex flex-col items-center justify-center border-2 border-dashed rounded-2xl p-6 bg-secondary/5">
-                  <h3 className="text-sm font-bold mb-4">Escaneie o QR Code</h3>
-                  {qrCode ? (
-                    <div className="relative group overflow-hidden rounded-xl border-4 border-white shadow-xl">
-                      <img src={qrCode} alt="QR Code" className="w-[200px] h-[200px]" />
-                      <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                         <Button size="sm" variant="secondary" onClick={generateQr}>Atualizar</Button>
+                      <div className="flex justify-end">
+                        <Button onClick={saveCompanyAiConfig} disabled={isSavingCompanyAiProviderConfig} className="gap-2">
+                          {isSavingCompanyAiProviderConfig && <RefreshCw className="w-4 h-4 animate-spin" />}
+                          Salvar IA da Empresa
+                        </Button>
                       </div>
                     </div>
                   ) : (
-                    <div className="w-[200px] h-[200px] bg-secondary/50 rounded-xl flex flex-col items-center justify-center text-center p-4">
-                      <QrCode className="w-12 h-12 opacity-10 mb-2" />
-                      <p className="text-[10px] text-muted-foreground">Configure as credenciais e clique em gerar.</p>
+                    <div className="space-y-4 rounded-lg border p-3">
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                        <Input
+                          placeholder="Nome da plataforma"
+                          value={newCompanyPlatformName}
+                          onChange={(e) => setNewCompanyPlatformName(e.target.value)}
+                        />
+                        <Select
+                          value={newCompanyPlatformProvider}
+                          onValueChange={(value) => {
+                            setNewCompanyPlatformProvider(value as AIProvider);
+                            setNewCompanyPlatformModel('provider-default');
+                          }}
+                        >
+                          <SelectTrigger><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="openai">OpenAI (ChatGPT)</SelectItem>
+                            <SelectItem value="groq">Groq</SelectItem>
+                            <SelectItem value="gemini">Gemini</SelectItem>
+                            <SelectItem value="claude">Claude</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Input
+                          type="password"
+                          placeholder="API Key da plataforma"
+                          value={newCompanyPlatformApiKey}
+                          onChange={(e) => setNewCompanyPlatformApiKey(e.target.value)}
+                          autoComplete="off"
+                        />
+                        <Select value={newCompanyPlatformModel} onValueChange={setNewCompanyPlatformModel}>
+                          <SelectTrigger><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="provider-default">Modelo padr?o do provedor</SelectItem>
+                            {(AI_PROVIDER_MODEL_OPTIONS[newCompanyPlatformProvider] || []).map((item) => (
+                              <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      <div className="flex justify-end">
+                        <Button onClick={addCompanyAgentPlatform}>Adicionar Plataforma</Button>
+                      </div>
+
+                      <div className="space-y-3">
+                        {(companyAiProviderConfig.companyAgentPlatforms || []).length === 0 ? (
+                          <p className="text-sm text-muted-foreground">Nenhuma plataforma cadastrada.</p>
+                        ) : (
+                          (companyAiProviderConfig.companyAgentPlatforms || []).map((platform) => (
+                            <div key={platform.id} className="rounded-lg border p-3 space-y-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <p className="text-sm font-semibold">{platform.name}</p>
+                                <Badge variant={platform.isActive ? 'default' : 'outline'} className="text-[10px]">
+                                  {platform.isActive ? 'ATIVA' : 'INATIVA'}
+                                </Badge>
+                              </div>
+
+                              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                <Input
+                                  value={platform.name}
+                                  onChange={(e) =>
+                                    setCompanyAiProviderConfig((prev) => ({
+                                      ...prev,
+                                      companyAgentPlatforms: (prev.companyAgentPlatforms || []).map((item) =>
+                                        item.id === platform.id ? { ...item, name: e.target.value } : item
+                                      ),
+                                    }))
+                                  }
+                                />
+                                <Select
+                                  value={platform.provider}
+                                  onValueChange={(value) =>
+                                    setCompanyAiProviderConfig((prev) => ({
+                                      ...prev,
+                                      companyAgentPlatforms: (prev.companyAgentPlatforms || []).map((item) =>
+                                        item.id === platform.id ? { ...item, provider: value as AIProvider, model: '', modelSource: 'provider-default' } : item
+                                      ),
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger><SelectValue /></SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="openai">OpenAI (ChatGPT)</SelectItem>
+                                    <SelectItem value="groq">Groq</SelectItem>
+                                    <SelectItem value="gemini">Gemini</SelectItem>
+                                    <SelectItem value="claude">Claude</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                                <Input
+                                  type="password"
+                                  value={platform.apiKey}
+                                  placeholder="API Key"
+                                  onChange={(e) =>
+                                    setCompanyAiProviderConfig((prev) => ({
+                                      ...prev,
+                                      companyAgentPlatforms: (prev.companyAgentPlatforms || []).map((item) =>
+                                        item.id === platform.id ? { ...item, apiKey: e.target.value } : item
+                                      ),
+                                    }))
+                                  }
+                                  autoComplete="off"
+                                />
+                              </div>
+
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                <Select
+                                  value={platform.modelSource === 'preset' ? (platform.model || 'provider-default') : 'provider-default'}
+                                  onValueChange={(value) =>
+                                    setCompanyAiProviderConfig((prev) => ({
+                                      ...prev,
+                                      companyAgentPlatforms: (prev.companyAgentPlatforms || []).map((item) =>
+                                        item.id === platform.id
+                                          ? {
+                                              ...item,
+                                              modelSource: value === 'provider-default' ? 'provider-default' : 'preset',
+                                              model: value === 'provider-default' ? '' : value,
+                                            }
+                                          : item
+                                      ),
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger><SelectValue /></SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="provider-default">Modelo padr?o do provedor</SelectItem>
+                                    {(AI_PROVIDER_MODEL_OPTIONS[platform.provider] || []).map((item) => (
+                                      <SelectItem key={platform.id + '-' + item.value} value={item.value}>{item.label}</SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                                <div className="flex gap-2">
+                                  <Button variant={platform.isActive ? 'default' : 'outline'} className="flex-1" onClick={() => setActiveCompanyAgentPlatform(platform.id)}>
+                                    {platform.isActive ? 'Plataforma Ativa' : 'Ativar'}
+                                  </Button>
+                                  <Button variant="ghost" className="text-rose-500" onClick={() => removeCompanyAgentPlatform(platform.id)}>
+                                    Remover
+                                  </Button>
+                                </div>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+
+                      <div className="rounded-md border border-dashed p-2 text-xs text-muted-foreground">
+                        Ao ativar uma plataforma, ela passa a valer para todos os t?cnicos da empresa.
+                      </div>
+
+                      <div className="flex justify-end">
+                        <Button onClick={saveCompanyAiConfig} disabled={isSavingCompanyAiProviderConfig} className="gap-2">
+                          {isSavingCompanyAiProviderConfig && <RefreshCw className="w-4 h-4 animate-spin" />}
+                          Salvar IA da Empresa
+                        </Button>
+                      </div>
                     </div>
                   )}
-                  
-                  <Button 
-                    variant="outline" 
-                    className="mt-6 w-full gap-2" 
-                    onClick={generateQr}
-                    disabled={isGeneratingQr || !wsConfig.serverUrl}
-                  >
-                    {isGeneratingQr ? <RefreshCw className="w-4 h-4 animate-spin" /> : <QrCode className="w-4 h-4" />}
-                    {qrCode ? 'Gerar Novo QR Code' : 'Gerar Primeiro QR Code'}
-                  </Button>
-                  <p className="text-[9px] text-muted-foreground mt-2 text-center">
-                    Abra o WhatsApp no celular &gt; Aparelhos Conectados &gt; Conectar Aparelho.
-                  </p>
-                </div>
-              </div>
-
-              <div className="p-4 bg-primary/5 rounded-xl border border-dashed text-[11px] space-y-2">
-                <p className="font-bold text-primary flex items-center gap-2">
-                   INFORMAÇÕES TÉCNICAS:
-                </p>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <span className="text-muted-foreground">URL Webhook (no Gateway):</span>
-                    <code className="bg-white px-2 py-0.5 rounded block truncate border mt-1">
-                      {window.location.origin}/api/whatsapp/webhook
-                    </code>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">Status do Serviço:</span>
-                    <div className="flex items-center gap-2 mt-1">
-                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                      <span className="font-bold text-emerald-600">Conectado ao Gateway</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+                </CardContent>
+              </Card>
+            </TabsContent>
+          </Tabs>
         </TabsContent>
 
         <TabsContent value="usuarios" className="mt-6">
@@ -7783,16 +11255,43 @@ function SettingsView({
             </div>
             <div className="p-4 border-t bg-secondary/20 flex justify-between items-center">
               <p className="text-xs text-muted-foreground">Total de {teamUsers.length} usuários</p>
-              <Button size="sm" className="gap-2" onClick={() => {
-                const name = prompt('Nome do Usuário:');
-                const email = prompt('E-mail do Usuário:');
-                if(name && email) {
-                  setTeamUsers(prev => [...prev, { id: Math.random().toString(), name, email, role: 'USUARIO', companyId: '1', allowedEquipmentIds: [] }]);
-                  toast.success('Usuário convidado!');
-                }
-              }}>
-                <Plus className="w-4 h-4" /> Novo Usuário
-              </Button>
+              <Dialog open={isNewUserDialogOpen} onOpenChange={setIsNewUserDialogOpen}>
+                <DialogTrigger render={
+                  <Button size="sm" className="gap-2">
+                    <Plus className="w-4 h-4" /> Novo Usuário
+                  </Button>
+                } />
+                <DialogContent className="sm:max-w-[480px]">
+                  <DialogHeader>
+                    <DialogTitle>Novo Usuário</DialogTitle>
+                    <DialogDescription>Crie um novo usuário para acesso ao sistema.</DialogDescription>
+                  </DialogHeader>
+                  <div className="grid gap-4 py-4">
+                    <div className="space-y-2">
+                      <Label>Nome</Label>
+                      <Input value={newUserForm.name} onChange={(e) => setNewUserForm((prev) => ({ ...prev, name: e.target.value }))} placeholder="Nome completo" />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>E-mail</Label>
+                      <Input type="email" value={newUserForm.email} onChange={(e) => setNewUserForm((prev) => ({ ...prev, email: e.target.value }))} placeholder="nome@empresa.com" />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Perfil</Label>
+                      <Select value={newUserForm.role} onValueChange={(value) => setNewUserForm((prev) => ({ ...prev, role: value as User['role'] }))}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="USUARIO">Técnico</SelectItem>
+                          <SelectItem value="ADMIN-USER">Administrador</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                  <DialogFooter>
+                    <Button variant="outline" onClick={() => setIsNewUserDialogOpen(false)}>Cancelar</Button>
+                    <Button onClick={handleCreateTeamUser}>Salvar Usuário</Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
             </div>
           </Card>
         </TabsContent>
@@ -8460,16 +11959,22 @@ function ImportDataModal({ title, type, onImport }: { title: string, type: 'Clie
   );
 }
 
-function SupplierView() {
+function SupplierView({
+  suppliers,
+  setSuppliers,
+  activeCompanyId,
+}: {
+  suppliers: Supplier[],
+  setSuppliers: React.Dispatch<React.SetStateAction<Supplier[]>>,
+  activeCompanyId: string,
+}) {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [search, setSearch] = useState('');
-  const [suppliers, setSuppliers] = useState<Supplier[]>([
-    { id: '1', name: 'Peças Express', document: '12.345.678/0001-90', email: 'vendas@pecasexpress.com', phone: '(11) 3333-5555', address: 'Av. Industrial, 500', companyId: '1', contactName: 'Ricardo', category: 'Peças' },
-    { id: '2', name: 'Distribuidora Tech', document: '98.765.432/0001-11', email: 'contato@distribtech.com', phone: '(11) 4444-6666', address: 'Rua das Fábricas, 1200', companyId: '1', contactName: 'Carla', category: 'Ferramentas' },
-  ]);
   const [editingSupplier, setEditingSupplier] = useState<Supplier | null>(null);
 
-  const filtered = suppliers.filter(s => 
+  const companySuppliers = suppliers.filter((supplier) => supplier.companyId === activeCompanyId);
+
+  const filtered = companySuppliers.filter(s => 
     fuzzyMatch(s.name, search) || fuzzyMatch(s.document, search) || fuzzyMatch(s.contactName || '', search)
   );
 
@@ -8511,7 +12016,7 @@ function SupplierView() {
                 setSuppliers(prev => prev.map(s => s.id === editingSupplier.id ? { ...s, ...data } : s));
                 toast.success('Fornecedor atualizado!');
               } else {
-                setSuppliers(prev => [...prev, { id: Math.random().toString(), ...data, companyId: '1' } as any]);
+                setSuppliers(prev => [...prev, { id: Math.random().toString(), ...data, companyId: activeCompanyId } as any]);
                 toast.success('Fornecedor cadastrado!');
               }
               setIsDialogOpen(false);
@@ -8627,6 +12132,126 @@ function SupplierView() {
   );
 }
 
+function OSConferenceView({
+  allOrders,
+  setAllOrders,
+}: {
+  allOrders: ServiceOrder[];
+  setAllOrders: React.Dispatch<React.SetStateAction<ServiceOrder[]>>;
+}) {
+  const [activeTab, setActiveTab] = useState('os');
+  const deliveredOrders = allOrders.filter((os) => os.status === 'Entregue');
+
+  const handleFinalize = (id: string) => {
+    setAllOrders((prev) =>
+      prev.map((os) =>
+        os.id === id
+          ? { ...os, status: 'Finalizada' as OSStatus, updatedAt: new Date().toISOString() }
+          : os
+      )
+    );
+    toast.success('OS finalizada na conferencia.');
+  };
+
+  const handleFinanceInfo = (os: ServiceOrder) => {
+    const paymentDate = os.paymentDate ? format(new Date(os.paymentDate), 'dd/MM/yyyy') : 'Nao informado';
+    const paymentStatus = os.paymentStatus || 'Pendente';
+    toast.info(`Pagamento: ${paymentDate}`, {
+      description: `Status: ${paymentStatus}`,
+    });
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Conferencia O.S</h1>
+        <p className="text-muted-foreground">Conferencia de ordem de servico, pedido de compra e pedido de orcamento.</p>
+      </div>
+
+      <Tabs value={activeTab} onValueChange={setActiveTab}>
+        <TabsList className="grid w-full grid-cols-3">
+          <TabsTrigger value="os">Ordens de Servico</TabsTrigger>
+          <TabsTrigger value="compras">Pedido de Compra</TabsTrigger>
+          <TabsTrigger value="orcamentos">Pedido de Orcamento</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="os" className="space-y-4">
+          <Card className="border-none shadow-sm overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-left">
+                <thead className="text-xs uppercase bg-secondary/50 text-muted-foreground">
+                  <tr>
+                    <th className="px-6 py-4 font-semibold">OS</th>
+                    <th className="px-6 py-4 font-semibold">Cliente</th>
+                    <th className="px-6 py-4 font-semibold">Equipamento</th>
+                    <th className="px-6 py-4 font-semibold">Entregue em</th>
+                    <th className="px-6 py-4 font-semibold">Pagamento</th>
+                    <th className="px-6 py-4 font-semibold text-center">Acoes</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {deliveredOrders.length > 0 ? (
+                    deliveredOrders.map((os) => (
+                      <tr key={os.id} className="hover:bg-secondary/20 transition-all">
+                        <td className="px-6 py-4 font-bold text-primary">{os.number}</td>
+                        <td className="px-6 py-4">{os.customerName}</td>
+                        <td className="px-6 py-4">
+                          <div className="flex flex-col">
+                            <span>{os.equipment}</span>
+                            <span className="text-xs text-muted-foreground">{os.brand} {os.model}</span>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 text-xs">
+                          {os.updatedAt ? format(new Date(os.updatedAt), 'dd/MM/yyyy') : '-'}
+                        </td>
+                        <td className="px-6 py-4 text-xs">
+                          {os.paymentDate ? format(new Date(os.paymentDate), 'dd/MM/yyyy') : 'Nao informado'}
+                        </td>
+                        <td className="px-6 py-4">
+                          <div className="flex items-center justify-center gap-2">
+                            <Button variant="outline" size="sm" className="gap-2" onClick={() => handleFinanceInfo(os)}>
+                              <Banknote className="w-4 h-4" /> Financeiro
+                            </Button>
+                            <Button size="sm" className="gap-2" onClick={() => handleFinalize(os.id)}>
+                              <CheckCircle2 className="w-4 h-4" /> Finalizar
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={6} className="px-6 py-12 text-center text-muted-foreground italic">
+                        Nenhuma OS com status Entregue aguardando conferencia.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="compras">
+          <Card className="border-none shadow-sm">
+            <CardContent className="py-12 text-center text-muted-foreground">
+              Nenhum pedido de compra em conferencia no momento.
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="orcamentos">
+          <Card className="border-none shadow-sm">
+            <CardContent className="py-12 text-center text-muted-foreground">
+              Nenhum pedido de orcamento em conferencia no momento.
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
+
 function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate, data: ServiceOrder, onClose: () => void }) {
   const [isPrinting, setIsPrinting] = useState(false);
 
@@ -8634,11 +12259,19 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
     // If it's a direct print call, we might want to trigger it immediately after rendering
   }, []);
 
+  const cssLineStyle = (style?: 'solid' | 'dashed' | 'dotted' | 'double') => {
+    if (style === 'dashed') return 'dashed';
+    if (style === 'dotted') return 'dotted';
+    if (style === 'double') return 'double';
+    return 'solid';
+  };
+
   const replaceVariables = (content: string) => {
     let result = content;
     const variables: Record<string, any> = {
       '{{os_number}}': data.number,
       '{{customer_name}}': data.customerName,
+      '{{customer_phone}}': data.customerPhone || '-',
       '{{equipment}}': data.equipment,
       '{{brand}}': data.brand,
       '{{model}}': data.model,
@@ -8674,6 +12307,9 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
             style={{ 
               width: `${template.width}mm`, 
               height: `${template.height}mm`,
+              border: template.showBorder
+                ? `${template.borderThickness || 0.5}mm ${cssLineStyle(template.borderStyle)} #111`
+                : 'none',
               padding: 0,
               margin: 0,
               position: 'relative'
@@ -8686,12 +12322,14 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
                 top: `${el.y}mm`,
                 fontSize: `${el.fontSize || 12}pt`,
                 fontWeight: el.fontWeight as any,
+                textAlign: (el.textAlign || 'left') as any,
                 width: el.width ? `${el.width}mm` : 'auto',
                 height: el.height ? `${el.height}mm` : 'auto',
                 display: 'flex',
                 alignItems: 'center',
-                lineHeight: 1,
-                whiteSpace: 'nowrap'
+                lineHeight: 1.1,
+                whiteSpace: 'pre-wrap',
+                overflow: 'hidden'
               };
 
               if (el.type === 'line') {
@@ -8699,9 +12337,11 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
                   <div 
                     key={el.id} 
                     style={{ 
-                      ...style, 
-                      backgroundColor: 'black',
-                      height: `${el.height || 1}mm`
+                      position: 'absolute',
+                      left: `${el.x}mm`,
+                      top: `${el.y}mm`,
+                      width: `${el.width || 50}mm`,
+                      borderTop: `${el.strokeWidth || 0.6}mm ${cssLineStyle(el.lineStyle)} #111`,
                     }} 
                   />
                 );
@@ -8780,6 +12420,9 @@ function PrintCustomizationView({ templates, setTemplates }: { templates: PrintT
       type,
       width: type === 'Etiqueta' ? 40 : 80,
       height: type === 'Etiqueta' ? 25 : 200,
+      showBorder: false,
+      borderStyle: 'solid',
+      borderThickness: 0.5,
       elements: [],
       companyId: '1'
     };

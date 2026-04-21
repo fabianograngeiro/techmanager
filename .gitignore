@@ -33,3 +33,7 @@ Thumbs.db
 
 # Docker local overrides
 docker-compose.override.yml
+
+# Temporary context artifacts
+support-contexts.tmp.json
+*.tmp.json
