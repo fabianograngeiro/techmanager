@@ -4,6 +4,16 @@ Plataforma SaaS para gestao de assistencia tecnica.
 
 Este guia mostra o passo a passo completo para configurar, executar e publicar o projeto.
 
+## Documentacao Viva
+
+A documentacao tecnica continua do projeto fica em:
+
+- `docs/README.md`
+- `docs/INSTALLATION.md`
+- `docs/OPERATIONS.md`
+- `docs/ARCHITECTURE.md`
+- `docs/RUNBOOK.md`
+
 ## 1. O que o projeto entrega
 
 Principais modulos:
@@ -80,7 +90,7 @@ APP_URL="http://localhost:3000"
 
 Observacoes:
 
-- Se DATABASE_URL nao estiver valida, parte da API usa fallback local em db.json para demonstracao.
+- Se DATABASE_URL nao estiver valida, parte da API usa fallback local em db.json.
 - Em producao, use sempre PostgreSQL ativo.
 
 ## 5. Subir banco e aplicar schema Prisma
@@ -117,13 +127,8 @@ Como funciona no dev:
 
 ## 7. Primeiro acesso no sistema
 
-Contas de teste disponiveis na tela de login:
-
-- saas@admin.com
-- admin@empresa.com
-- joao@tecnico.com
-
-Senha no fluxo demo: qualquer valor preenchido (login mock no frontend).
+No primeiro acesso, utilize as credenciais criadas durante o setup inicial.
+Se ainda nao houver superadmin configurado, o sistema abre automaticamente a tela de configuracao inicial.
 
 ## 8. Configurar WhatsApp por empresa
 

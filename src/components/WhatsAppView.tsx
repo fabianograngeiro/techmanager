@@ -108,8 +108,12 @@ export function WhatsAppView({ companyId }: { companyId: string }) {
   };
 
   const sendPixMessage = () => {
-    const pixKey = "suachavepix@aqui.com";
-    const pixValue = "R$ 0,00";
+    const pixKey = String(import.meta.env.VITE_PIX_KEY || '').trim();
+    if (!pixKey) {
+      toast.error('Configure a chave PIX da empresa para enviar esta mensagem.');
+      return;
+    }
+    const pixValue = "A combinar";
     const text = `Olá! Segue nossa chave PIX para pagamento:\n\n🔑 Chave: ${pixKey}\n💰 Valor: ${pixValue}\n\nApós o pagamento, por favor envie o comprovante por aqui. 😊`;
     sendMessage('text', text);
   };
@@ -148,13 +152,18 @@ export function WhatsAppView({ companyId }: { companyId: string }) {
   };
 
   const sendCarouselMessage = () => {
+    const catalogId = String(import.meta.env.VITE_WHATSAPP_CATALOG_ID || '').trim();
+    if (!catalogId) {
+      toast.error('Configure o catálogo da empresa para enviar lista de produtos.');
+      return;
+    }
     const content = {
       type: "product_list",
       header: { type: "text", text: "Nossas Ofertas" },
       body: { text: "Confira os produtos em destaque na nossa assistência técnica:" },
       footer: { text: "TechManager" },
       action: {
-        catalog_id: "CATALOG_ID_MOCK",
+        catalog_id: catalogId,
         sections: [
           {
             title: "Destaques",
