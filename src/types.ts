@@ -5,6 +5,7 @@ export type AIProvider = 'openai' | 'groq' | 'gemini' | 'claude';
 export type CompanyAIAssistantMode = 'saas-managed' | 'company-own';
 export type AIAgentPromptArea =
   | 'suporte-tecnico'
+  | 'contador-fiscal'
   | 'ordem-servico'
   | 'atendimento'
   | 'financeiro'
@@ -35,9 +36,23 @@ export interface Company {
   address: string;
   logo?: string;
   fiscalEnabled?: boolean;
+  fiscalStrictModeEnabled?: boolean;
+  fiscalUf?: string;
+  fiscalActivitySector?: string;
+  fiscalActivityCode?: string;
+  fiscalActivitySearchTerm?: string;
+  accountantAssistantEnabled?: boolean;
+  accountantNotificationEnabled?: boolean;
+  accountantReminderEnabled?: boolean;
+  accountantReminderFrequencyDays?: number;
+  accountantServices?: string[];
   labelPrinterName?: string;
   a4PrinterName?: string;
   osCopiesPerPage?: 1 | 2;
+  notifyWhatsappOnOpen?: boolean;
+  notifyBudgetReady?: boolean;
+  pixKeyType?: 'CPF' | 'CNPJ' | 'EMAIL' | 'TELEFONE' | 'ALEATORIA';
+  pixKey?: string;
   aiAssistantMode?: CompanyAIAssistantMode;
   aiSaasCatalogId?: string;
   aiProvider?: AIProvider;
@@ -146,10 +161,19 @@ export interface Customer {
   id: string;
   name: string;
   document: string;
+  ie?: string;
   email: string;
   phone: string;
+  phone2?: string;
   address: string;
+  addressStreet?: string;
+  addressNumber?: string;
+  addressNeighborhood?: string;
+  addressCity?: string;
+  addressState?: string;
+  addressZip?: string;
   companyId: string;
+  importedFromBackup?: boolean;
 }
 
 export type OSStatus = 
@@ -178,7 +202,6 @@ export interface ServiceOrder {
   number: string;
   customerId: string;
   customerName: string;
-  customerPhone?: string;
   equipment: string;
   brand: string;
   model: string;
@@ -199,16 +222,23 @@ export interface ServiceOrder {
   isApproved?: boolean;
   accessories?: string;
   details?: string;
+  cancellationReason?: string;
+  cancellationDate?: string;
   technicianId?: string;
   technicianName?: string;
   createdAt: string;
   updatedAt: string;
   companyId: string;
+  importedFromBackup?: boolean;
 }
 
 export interface Product {
   id: string;
   name: string;
+  brand?: string;
+  model?: string;
+  image?: string;
+  imageFit?: 'cover' | 'contain' | 'fill';
   sku: string;
   price: number;
   stock: number;
@@ -219,8 +249,14 @@ export interface Product {
   ncm?: string;
   cest?: string;
   origin?: '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8'; // 0: Nacional, etc.
+  taxApiCode?: string;
   taxCategory?: string;
+  fiscalCfop?: string;
+  fiscalCstIcms?: string;
+  fiscalCstPis?: string;
+  fiscalCstCofins?: string;
   cost?: number; // Valor de custo para cálculo de lucro
+  importedFromBackup?: boolean;
 }
 
 export interface Supplier {
@@ -233,6 +269,7 @@ export interface Supplier {
   contactName?: string;
   category?: string;
   companyId: string;
+  importedFromBackup?: boolean;
 }
 
 export interface Transaction {
@@ -263,11 +300,12 @@ export interface TemplateElement {
   fontSize?: number;
   fontWeight?: string;
   textAlign?: 'left' | 'center' | 'right';
+  wrapMode?: 'wrap' | 'single-line';
   width?: number;
   height?: number;
+  rotation?: number;
   strokeWidth?: number;
   lineStyle?: 'solid' | 'dashed' | 'dotted' | 'double';
-  rotation?: number;
 }
 
 export interface PrintTemplate {
@@ -276,9 +314,18 @@ export interface PrintTemplate {
   type: 'Etiqueta' | 'Cupom' | 'A4';
   width: number; // mm
   height: number; // mm
+  elements: TemplateElement[];
+  orientation?: 'vertical' | 'horizontal';
+  labelRows?: number;
+  labelColumns?: number;
+  gapX?: number; // mm
+  gapY?: number; // mm
+  density?: number; // 1 = normal, >1 = mais denso
+  shape?: 'rectangle' | 'rounded' | 'ellipse';
+  cornerRadius?: number; // mm
   showBorder?: boolean;
   borderStyle?: 'solid' | 'dashed' | 'dotted' | 'double';
-  borderThickness?: number;
-  elements: TemplateElement[];
+  borderThickness?: number; // mm
   companyId: string;
+  isDefault?: boolean; // padrão para impressão automática (um por tipo)
 }

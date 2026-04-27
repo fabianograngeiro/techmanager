@@ -2,10 +2,11 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import axios from 'axios';
 import dotenv from 'dotenv';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 
 dotenv.config();
 
@@ -34,12 +35,14 @@ async function startServer() {
     products: [],
     services: [],
     sales: [],
+    returns: [],
     finance: [],
     tasks: [],
     team: [],
     rma: [],
     equipmentTypes: [],
     printTemplates: [],
+    holidayCalendar: {},
     companySettings: null,
     aiProviderConfigs: {},
     whatsappConfigs: {},
@@ -169,6 +172,118 @@ async function startServer() {
       console.error('Erro ao listar impressoras:', error);
       res.status(500).json({ printers: [], error: 'Falha ao listar impressoras do sistema.' });
     }
+  });
+
+  const sanitizeFileName = (value: string) =>
+    String(value || 'documento')
+      .replace(/[^\w.-]+/g, '_')
+      .replace(/_+/g, '_')
+      .slice(0, 80);
+
+  const decodeImageDataUrl = (value: string) => {
+    if (typeof value !== 'string') return null;
+    const match = value.match(/^data:(image\/png|image\/jpeg);base64,(.+)$/i);
+    if (!match) return null;
+    return {
+      ext: match[1].toLowerCase().includes('jpeg') ? 'jpg' : 'png',
+      bytes: Buffer.from(match[2], 'base64'),
+    };
+  };
+
+  const printImageOnWindows = (imagePath: string, printerName: string, documentName: string) => {
+    const escapePs = (value: string) => `'${String(value).replace(/'/g, "''")}'`;
+    const script = `
+      Add-Type -AssemblyName System.Drawing
+      $imagePath = ${escapePs(imagePath)}
+      $printerName = ${escapePs(printerName)}
+      $documentName = ${escapePs(documentName)}
+      $img = [System.Drawing.Image]::FromFile($imagePath)
+      try {
+        $doc = New-Object System.Drawing.Printing.PrintDocument
+        $doc.PrinterSettings.PrinterName = $printerName
+        if (-not $doc.PrinterSettings.IsValid) {
+          throw "Impressora inválida: $printerName"
+        }
+        $doc.DocumentName = $documentName
+        $doc.add_PrintPage({
+          param($sender, $e)
+          $margin = $e.MarginBounds
+          $ratioX = $margin.Width / $img.Width
+          $ratioY = $margin.Height / $img.Height
+          $ratio = [Math]::Min($ratioX, $ratioY)
+          if ($ratio -le 0) { $ratio = 1 }
+          $newWidth = [int]($img.Width * $ratio)
+          $newHeight = [int]($img.Height * $ratio)
+          $x = $margin.X + [int](($margin.Width - $newWidth) / 2)
+          $y = $margin.Y + [int](($margin.Height - $newHeight) / 2)
+          $e.Graphics.DrawImage($img, $x, $y, $newWidth, $newHeight)
+          $e.HasMorePages = $false
+        })
+        $doc.Print()
+        $doc.Dispose()
+      } finally {
+        $img.Dispose()
+      }
+    `;
+    execFileSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+      stdio: 'pipe',
+      timeout: 45000,
+    });
+  };
+
+  app.post('/api/system/print-jobs', (req, res) => {
+    const jobs = Array.isArray(req.body?.jobs) ? req.body.jobs : [];
+    if (jobs.length === 0) {
+      return res.status(400).json({ success: false, error: 'Nenhum trabalho de impressão recebido.' });
+    }
+
+    if (process.platform !== 'win32') {
+      return res.status(400).json({ success: false, error: 'Impressão direta está disponível apenas em Windows neste ambiente.' });
+    }
+
+    const results: Array<{ documentName: string; printerName: string; success: boolean; error?: string }> = [];
+
+    for (const job of jobs) {
+      const printerName = String(job?.printerName || '').trim();
+      const documentName = sanitizeFileName(String(job?.documentName || 'TechManager'));
+      const decoded = decodeImageDataUrl(String(job?.dataUrl || ''));
+
+      if (!printerName || !decoded) {
+        results.push({
+          documentName,
+          printerName,
+          success: false,
+          error: 'Dados inválidos para impressão.',
+        });
+        continue;
+      }
+
+      const tmpFile = path.join(os.tmpdir(), `tm-print-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${decoded.ext}`);
+
+      try {
+        fs.writeFileSync(tmpFile, decoded.bytes);
+        printImageOnWindows(tmpFile, printerName, documentName);
+        results.push({ documentName, printerName, success: true });
+      } catch (error: any) {
+        results.push({
+          documentName,
+          printerName,
+          success: false,
+          error: error?.message || 'Falha ao enviar impressão.',
+        });
+      } finally {
+        try {
+          if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+        } catch {}
+      }
+    }
+
+    const hasFailure = results.some((item) => !item.success);
+    return res.status(hasFailure ? 207 : 200).json({
+      success: !hasFailure,
+      results,
+      printedAt: new Date().toISOString(),
+    });
   });
 
   app.get('/api/system/backup', (_req, res) => {

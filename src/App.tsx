@@ -99,9 +99,21 @@ import {
   Sun,
   Moon,
   ListChecks,
-  PlusCircle
+  PlusCircle,
+  ArrowRight,
+  ChevronLeft,
+  Star
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import {
+  Stage,
+  Layer,
+  Text as KonvaText,
+  Rect as KonvaRect,
+  Line as KonvaLine,
+  Group as KonvaGroup,
+  Ellipse as KonvaEllipse,
+} from 'react-konva';
 import { 
   Card, 
   CardContent, 
@@ -191,6 +203,7 @@ import {
   SupportAttachment,
   SupportMessage,
   SupportSession,
+  Customer,
   TechnicalLevel,
   TechnicalSector,
 } from './types';
@@ -233,11 +246,461 @@ const safeRandomUUID = (): string => {
   return `tm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
+const PIX_KEY_TYPE_OPTIONS = [
+  { value: 'CPF', label: 'CPF' },
+  { value: 'CNPJ', label: 'CNPJ' },
+  { value: 'EMAIL', label: 'E-mail' },
+  { value: 'TELEFONE', label: 'Telefone' },
+  { value: 'ALEATORIA', label: 'Chave Aleatória' },
+] as const;
+
+const normalizePixKey = (key: string, keyType?: Company['pixKeyType']) => {
+  const trimmed = String(key || '').trim();
+  if (!trimmed) return '';
+  if (keyType === 'CPF' || keyType === 'CNPJ') return onlyDigits(trimmed);
+  if (keyType === 'EMAIL') return trimmed.toLowerCase();
+  if (keyType === 'TELEFONE') {
+    const digits = onlyDigits(trimmed);
+    if (!digits) return '';
+    return digits.startsWith('55') ? `+${digits}` : `+55${digits}`;
+  }
+  return trimmed;
+};
+
+const normalizePixMerchantName = (name: string) =>
+  String(name || 'TECHMANAGER')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Za-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase()
+    .slice(0, 25) || 'TECHMANAGER';
+
+const normalizePixCity = (address: string) =>
+  String(address || 'SAO PAULO')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(-1)[0]
+    ?.normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Za-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase()
+    .slice(0, 15) || 'SAO PAULO';
+
+const emvField = (id: string, value: string) => `${id}${String(value.length).padStart(2, '0')}${value}`;
+
+const computeCrc16 = (payload: string) => {
+  let crc = 0xffff;
+  for (let i = 0; i < payload.length; i += 1) {
+    crc ^= payload.charCodeAt(i) << 8;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 0x8000) !== 0 ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xffff;
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, '0');
+};
+
+const buildPixPayload = ({
+  key,
+  keyType,
+  amount,
+  merchantName,
+  merchantCity,
+  txid,
+}: {
+  key: string;
+  keyType?: Company['pixKeyType'];
+  amount: number;
+  merchantName: string;
+  merchantCity: string;
+  txid?: string;
+}) => {
+  const normalizedKey = normalizePixKey(key, keyType);
+  if (!normalizedKey) return '';
+
+  const amountValue = Math.max(0, Number(amount || 0)).toFixed(2);
+  const accountInfo = emvField('00', 'br.gov.bcb.pix') + emvField('01', normalizedKey);
+  const additionalData = emvField('05', String(txid || '***').slice(0, 25));
+  const payloadWithoutCrc = [
+    emvField('00', '01'),
+    emvField('26', accountInfo),
+    emvField('52', '0000'),
+    emvField('53', '986'),
+    emvField('54', amountValue),
+    emvField('58', 'BR'),
+    emvField('59', normalizePixMerchantName(merchantName)),
+    emvField('60', normalizePixCity(merchantCity)),
+    emvField('62', additionalData),
+    '6304',
+  ].join('');
+
+  return `${payloadWithoutCrc}${computeCrc16(payloadWithoutCrc)}`;
+};
+
+const getOrderTotalValue = (os: ServiceOrder) => {
+  const itemsTotal = Array.isArray(os.items) && os.items.length > 0
+    ? os.items.reduce((acc, item) => acc + (Number(item.totalPrice) || 0), 0)
+    : 0;
+  return itemsTotal > 0 ? itemsTotal : Number(os.value || 0);
+};
+
+const buildQrCodeImageUrl = (payload: string, size = 180) =>
+  `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&data=${encodeURIComponent(payload)}`;
+
+const printHtmlUsingHiddenFrame = (html: string): boolean => {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return false;
+  }
+
+  const iframe = document.createElement('iframe');
+  iframe.style.position = 'fixed';
+  iframe.style.right = '0';
+  iframe.style.bottom = '0';
+  iframe.style.width = '0';
+  iframe.style.height = '0';
+  iframe.style.border = '0';
+  iframe.style.opacity = '0';
+  iframe.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(iframe);
+
+  const cleanup = () => {
+    if (iframe.parentNode) {
+      iframe.parentNode.removeChild(iframe);
+    }
+  };
+
+  const doc = iframe.contentDocument;
+  if (!doc) {
+    cleanup();
+    return false;
+  }
+
+  doc.open();
+  doc.write(html);
+  doc.close();
+
+  let printed = false;
+  const triggerNativePrint = () => {
+    if (printed) return;
+    const frameWindow = iframe.contentWindow;
+    if (!frameWindow) {
+      cleanup();
+      return;
+    }
+
+    printed = true;
+    frameWindow.onafterprint = () => cleanup();
+    frameWindow.focus();
+    frameWindow.print();
+
+    // Safety fallback for browsers that do not fire onafterprint.
+    window.setTimeout(cleanup, 12000);
+  };
+
+  iframe.onload = () => {
+    window.setTimeout(triggerNativePrint, 120);
+  };
+
+  // Fallback for browsers that do not emit iframe onload reliably after doc.write.
+  window.setTimeout(triggerNativePrint, 700);
+  return true;
+};
+
+// Componente para renderizar conteúdo A4 da OS para impressão/PDF
+const OSPrintContentForRef = React.forwardRef<
+  HTMLDivElement,
+  { os: ServiceOrder; company: Company; customer?: Customer }
+>(({ os, company, customer }, ref) => {
+  const customerCityState = customer?.addressCity || customer?.addressState
+    ? `${customer?.addressCity || ''}${customer?.addressState ? ` - ${customer?.addressState}` : ''}`.trim()
+    : '--';
+  const customerAddress = customer?.addressStreet
+    ? `${customer?.addressStreet}${customer?.addressNumber ? `, ${customer?.addressNumber}` : ''}${customer?.addressNeighborhood ? ` - ${customer?.addressNeighborhood}` : ''}`
+    : customer?.address || '--';
+  const customerZip = customer?.addressZip || '--';
+  const customerDocument = customer?.document || '--';
+  const customerEmail = customer?.email || '--';
+  const customerPhone = customer?.phone || '--';
+  const customerContact = customer?.phone2 || '--';
+  const orderTotalValue = getOrderTotalValue(os);
+  const pixPayload = buildPixPayload({
+    key: company.pixKey || '',
+    keyType: company.pixKeyType,
+    amount: orderTotalValue,
+    merchantName: company.name || company.razaoSocial || 'TechManager',
+    merchantCity: company.address || 'Sao Paulo',
+    txid: os.number.replace(/[^A-Za-z0-9]/g, '').slice(0, 25) || '***',
+  });
+  const pixQrCodeUrl = pixPayload ? buildQrCodeImageUrl(pixPayload, 180) : '';
+
+  return (
+    <div ref={ref} id="os-print-area" className="mx-auto bg-white text-black shadow-sm" style={{ width: '210mm', minHeight: '297mm', padding: '12mm', boxSizing: 'border-box' }}>
+      <div className="bg-white text-black font-sans">
+      {/* Header */}
+      <div className="flex flex-row justify-between items-start gap-4 border-b-2 border-black pb-6 mb-6">
+        <div className="flex gap-4 items-center">
+          <div className="w-16 h-16 bg-black text-white rounded-lg flex items-center justify-center text-xl font-bold shrink-0 overflow-hidden">
+            {company.logo ? (
+              <img src={company.logo} alt={company.name || 'Logo'} className="w-full h-full object-contain bg-white" />
+            ) : (
+              'TM'
+            )}
+          </div>
+          <div>
+            <h1 className="text-2xl font-black uppercase tracking-tight">{company.name}</h1>
+            <p className="text-xs uppercase font-bold text-black">{company.address}</p>
+            <p className="text-xs font-bold text-black">{company.cnpj} • {company.phone}</p>
+          </div>
+        </div>
+        <div className="text-right shrink-0 w-auto">
+          <div className="bg-black text-white px-4 py-2 rounded-md mb-2 block w-auto">
+            <p className="text-[10px] font-bold uppercase tracking-widest whitespace-nowrap">Ordem de Serviço</p>
+            <p className="text-xl font-black">{os.number}</p>
+          </div>
+          <p className="text-[10px] font-bold text-black italic">Data de Entrada: {format(new Date(os.createdAt), 'dd/MM/yyyy HH:mm')}</p>
+        </div>
+      </div>
+
+      {/* Customer & Equipment */}
+      <div className="mb-8">
+        <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-black pb-1">Dados do Cliente</h3>
+        <div className="mt-3 grid grid-cols-3 gap-4 text-xs">
+          <div>
+            <p className="text-[10px] font-bold uppercase">Nome Completo</p>
+            <p className="text-sm font-black">{os.customerName}</p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold uppercase">CPF/CNPJ</p>
+            <p className="text-sm font-medium text-black">{customerDocument}</p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold uppercase">Contato</p>
+            <p className="text-sm font-medium text-black">{customerContact}</p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold uppercase">Cidade - Estado</p>
+            <p className="text-sm font-medium text-black">{customerCityState}</p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold uppercase">Email</p>
+            <p className="text-sm font-medium text-black">{customerEmail}</p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold uppercase">Telefone</p>
+            <p className="text-sm font-medium text-black">{customerPhone}</p>
+          </div>
+          <div className="col-span-2">
+            <p className="text-[10px] font-bold uppercase">Endereço</p>
+            <p className="text-sm font-medium text-black">{customerAddress}</p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold uppercase">CEP</p>
+            <p className="text-sm font-medium text-black">{customerZip}</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="mb-8">
+        <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-black pb-1">Equipamento</h3>
+        <div className="mt-3">
+          <p className="text-sm font-black">{os.equipment}</p>
+          <p className="text-xs text-black">{os.brand} {os.model}</p>
+          <p className="text-xs text-black font-mono">S/N: {os.serialNumber}</p>
+        </div>
+      </div>
+
+      {/* Defect & Diagnosis */}
+      <div className="space-y-6 mb-8">
+        <div className="bg-gray-50 p-4 rounded-lg border">
+          <h3 className="text-xs font-black uppercase tracking-widest mb-2">Defeito Informado</h3>
+          <p className="text-sm italic text-black">"{os.defect}"</p>
+        </div>
+        {os.diagnosis && (
+          <div className="p-4 rounded-lg border border-black/10">
+            <h3 className="text-xs font-black uppercase tracking-widest mb-2">Diagnóstico Técnico</h3>
+            <p className="text-sm">{os.diagnosis}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Status & Priority */}
+      <div className="grid grid-cols-4 gap-4 mb-8">
+        <div className="border p-3 rounded-lg text-center">
+          <p className="text-[9px] uppercase font-bold text-black mb-1 leading-none">Status</p>
+          <p className="text-sm font-black">{os.status}</p>
+        </div>
+        <div className="border p-3 rounded-lg text-center">
+          <p className="text-[9px] uppercase font-bold text-black mb-1 leading-none">Prioridade</p>
+          <p className="text-sm font-black">{os.priority}</p>
+        </div>
+        <div className="border p-3 rounded-lg text-center">
+          <p className="text-[9px] uppercase font-bold text-black mb-1 leading-none">Prazo Diag.</p>
+          <p className="text-sm font-black">
+            {os.diagnosisDeadline ? format(new Date(os.diagnosisDeadline), 'dd/MM/yyyy') : '--/--/----'}
+          </p>
+        </div>
+        <div className="border p-3 rounded-lg text-center">
+          <p className="text-[9px] uppercase font-bold text-black mb-1 leading-none">Prazo Entrega</p>
+          <p className="text-sm font-black">
+            {os.completionDeadline ? format(new Date(os.completionDeadline), 'dd/MM/yyyy') : '--/--/----'}
+          </p>
+        </div>
+      </div>
+
+      {/* Items / Parts / Services */}
+      <div className="mb-8 border rounded-xl overflow-x-auto">
+        <table className="w-full text-sm min-w-full">
+          <thead className="bg-gray-100 border-b">
+            <tr>
+              <th className="px-4 py-2 text-left text-[10px] uppercase font-black">Descrição</th>
+              <th className="px-4 py-2 text-center text-[10px] uppercase font-black">Tipo</th>
+              <th className="px-4 py-2 text-center text-[10px] uppercase font-black">Qtd</th>
+              <th className="px-4 py-2 text-right text-[10px] uppercase font-black">Unitário</th>
+              <th className="px-4 py-2 text-right text-[10px] uppercase font-black">Total</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {os.items && os.items.length > 0 ? os.items.map((item, idx) => (
+              <tr key={idx}>
+                <td className="px-4 py-3 font-medium">{item.description}</td>
+                <td className="px-4 py-3 text-center text-xs">{item.type}</td>
+                <td className="px-4 py-3 text-center">{item.quantity}</td>
+                <td className="px-4 py-3 text-right">R$ {item.unitPrice.toFixed(2)}</td>
+                <td className="px-4 py-3 text-right font-bold">R$ {item.totalPrice.toFixed(2)}</td>
+              </tr>
+            )) : (
+              <tr>
+                <td colSpan={5} className="px-4 py-8 text-center text-black italic">
+                  Nenhum item ou serviço registrado até o momento.
+                </td>
+              </tr>
+            )}
+          </tbody>
+          <tfoot className="bg-gray-50 font-black">
+            <tr>
+              <td colSpan={4} className="px-4 py-3 text-right uppercase tracking-widest text-xs">Valor Total da OS:</td>
+              <td className="px-4 py-3 text-right text-lg">R$ {orderTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      {pixPayload && (
+        <div className="mb-8 border rounded-xl p-4">
+          <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-black pb-1">Pagamento PIX</h3>
+          <div className="mt-3 flex items-center gap-4">
+            <img src={pixQrCodeUrl} alt="QRCode PIX" className="w-[150px] h-[150px] border" />
+            <div className="text-xs flex-1">
+              <p className="font-bold">Valor para pagamento: R$ {orderTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
+              <p className="mt-1 text-[10px] uppercase font-bold">Chave ({company.pixKeyType || 'PIX'}): {company.pixKey}</p>
+              <p className="mt-2 text-[10px] uppercase font-bold">Copia e Cola PIX:</p>
+              <p className="mt-1 break-all font-mono text-[9px]">{pixPayload}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Terms & Signatures */}
+      <div className="grid grid-cols-2 gap-12 mt-12">
+        <div className="space-y-4">
+          <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-black pb-1">Termos e Condições</h3>
+          <p className="text-[9px] text-black leading-relaxed">
+            1. O prazo para diagnóstico é de até 48h úteis.<br />
+            2. Equipamentos não retirados em até 90 dias após a notificação serão considerados abandonados.<br />
+            3. A garantia de peças é de 90 dias conforme CDC, exceto para danos causados por mau uso, umidade ou intervenção de terceiros.
+          </p>
+        </div>
+        <div className="flex flex-col justify-end gap-12">
+          <div className="border-t border-black pt-2 text-center">
+            <p className="text-[9px] uppercase font-bold">Assinatura do Cliente</p>
+          </div>
+          <div className="border-t border-black pt-2 text-center">
+            <p className="text-[9px] uppercase font-bold">{company.name}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Footer Notes */}
+      <div className="mt-12 text-center border-t pt-4">
+        <p className="text-[10px] text-black">Este documento é uma representação digital da Ordem de Serviço {os.number}. Gerado em {format(new Date(), 'dd/MM/yyyy HH:mm')}.</p>
+      </div>
+      </div>
+    </div>
+  );
+});
+
 const SUPPORT_SESSIONS_STORAGE_KEY = 'techmanager_support_sessions';
 const SUPPORT_RETENTION_DAYS = 15;
 const AUTH_USERS_STORAGE_KEY = 'techmanager_auth_users';
 const AUTH_SESSION_USER_ID_STORAGE_KEY = 'techmanager_auth_session_user_id';
 const APP_COMPANIES_STORAGE_KEY = 'techmanager_app_companies';
+const ACCOUNTANT_ASSISTANT_REMINDER_KEY = 'techmanager_accountant_assistant_last_reminder';
+const WINDOWS_1252_SPECIAL_BYTES: Record<number, number> = {
+  0x20ac: 0x80,
+  0x201a: 0x82,
+  0x0192: 0x83,
+  0x201e: 0x84,
+  0x2026: 0x85,
+  0x2020: 0x86,
+  0x2021: 0x87,
+  0x02c6: 0x88,
+  0x2030: 0x89,
+  0x0160: 0x8a,
+  0x2039: 0x8b,
+  0x0152: 0x8c,
+  0x017d: 0x8e,
+  0x2018: 0x91,
+  0x2019: 0x92,
+  0x201c: 0x93,
+  0x201d: 0x94,
+  0x2022: 0x95,
+  0x2013: 0x96,
+  0x2014: 0x97,
+  0x02dc: 0x98,
+  0x2122: 0x99,
+  0x0161: 0x9a,
+  0x203a: 0x9b,
+  0x0153: 0x9c,
+  0x017e: 0x9e,
+  0x0178: 0x9f,
+};
+
+const decodeMojibakeSequence = (value: string) => {
+  const bytes = Array.from(value, (char) => {
+    const code = char.charCodeAt(0);
+    return WINDOWS_1252_SPECIAL_BYTES[code] ?? (code <= 0xff ? code : 0x3f);
+  });
+
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    return value;
+  }
+};
+
+const fixMojibakeText = (value: string) =>
+  value.replace(/(?:Ã[\s\S]|Â[\s\S]|â[\s\S]{2})+/g, decodeMojibakeSequence);
+
+const normalizeTextEncoding = <T,>(value: T): T => {
+  if (typeof value === 'string') {
+    return fixMojibakeText(value) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeTextEncoding(item)) as T;
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, normalizeTextEncoding(entry)])
+    ) as T;
+  }
+  return value;
+};
+
 const AI_PROVIDER_MODEL_OPTIONS: Record<AIProvider, AIModelOption[]> = {
   openai: [
     { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
@@ -278,9 +741,23 @@ const EMPTY_COMPANY: Company = {
   address: '',
   logo: undefined,
   fiscalEnabled: false,
+  fiscalStrictModeEnabled: true,
+  fiscalUf: '',
+  fiscalActivitySector: '',
+  fiscalActivityCode: '',
+  fiscalActivitySearchTerm: '',
+  accountantAssistantEnabled: false,
+  accountantNotificationEnabled: true,
+  accountantReminderEnabled: true,
+  accountantReminderFrequencyDays: 7,
+  accountantServices: [],
   labelPrinterName: '',
   a4PrinterName: '',
   osCopiesPerPage: 1,
+  notifyWhatsappOnOpen: true,
+  notifyBudgetReady: true,
+  pixKeyType: 'CPF',
+  pixKey: '',
   aiAssistantMode: 'saas-managed',
   aiSaasCatalogId: '',
   aiProvider: 'openai',
@@ -326,8 +803,827 @@ const sanitizeCustomers = (value: any[]): any[] => {
   });
 };
 
+const onlyDigits = (value: string) => (value || '').replace(/\D/g, '');
+
+type BrasilApiNcmItem = {
+  codigo: string;
+  descricao: string;
+  data_inicio?: string;
+  data_fim?: string;
+  tipo_ato?: string;
+  numero_ato?: string;
+  ano_ato?: string;
+};
+
+type FiscalOption = {
+  value: string;
+  label: string;
+  description: string;
+};
+
+type NcmFiscalProfile = {
+  id: string;
+  title: string;
+  chapterPrefixes: string[];
+  cestOptions: FiscalOption[];
+  taxCategoryOptions: FiscalOption[];
+  cfopOptions: FiscalOption[];
+  cstIcmsOptions: FiscalOption[];
+  cstPisOptions: FiscalOption[];
+  cstCofinsOptions: FiscalOption[];
+};
+
+const NCM_FISCAL_PROFILES: NcmFiscalProfile[] = [
+  {
+    id: 'electronics',
+    title: 'Eletronicos e telecom',
+    chapterPrefixes: ['85'],
+    cestOptions: [
+      { value: '21.064.00', label: '21.064.00', description: 'Aparelhos para telefonia e comunicacao (uso comum em celular/acessorios).' },
+      { value: '21.053.00', label: '21.053.00', description: 'Partes e acessorios de equipamentos eletronicos.' },
+      { value: '21.057.00', label: '21.057.00', description: 'Cabos e condutores para uso eletrico/eletronico.' },
+    ],
+    taxCategoryOptions: [
+      { value: 'Tributado integral', label: 'Tributado integral', description: 'Produto com incidencia normal de ICMS/PIS/COFINS.' },
+      { value: 'Monofasico', label: 'Monofasico', description: 'Tributacao concentrada na cadeia (validar NCM e legislacao).' },
+      { value: 'Substituicao tributaria', label: 'Substituicao tributaria', description: 'ICMS recolhido antecipadamente por ST quando aplicavel.' },
+    ],
+    cfopOptions: [
+      { value: '5102', label: '5102', description: 'Venda de mercadoria adquirida ou recebida de terceiros (dentro do estado).' },
+      { value: '6102', label: '6102', description: 'Venda de mercadoria adquirida ou recebida de terceiros (fora do estado).' },
+      { value: '5405', label: '5405', description: 'Venda com ST de mercadoria adquirida de terceiros (interna).' },
+      { value: '6404', label: '6404', description: 'Venda sujeita a ST para outra UF, de mercadoria de terceiros.' },
+    ],
+    cstIcmsOptions: [
+      { value: '00', label: '00', description: 'Tributada integralmente.' },
+      { value: '20', label: '20', description: 'Com reducao de base de calculo.' },
+      { value: '40', label: '40', description: 'Isenta.' },
+      { value: '60', label: '60', description: 'ICMS cobrado anteriormente por ST.' },
+    ],
+    cstPisOptions: [
+      { value: '01', label: '01', description: 'Operacao tributavel com aliquota basica.' },
+      { value: '04', label: '04', description: 'Operacao tributavel monofasica (revenda com aliquota zero).' },
+      { value: '06', label: '06', description: 'Operacao com aliquota zero.' },
+      { value: '49', label: '49', description: 'Outras operacoes de saida (casos especificos).' },
+    ],
+    cstCofinsOptions: [
+      { value: '01', label: '01', description: 'Operacao tributavel com aliquota basica.' },
+      { value: '04', label: '04', description: 'Operacao tributavel monofasica (revenda com aliquota zero).' },
+      { value: '06', label: '06', description: 'Operacao com aliquota zero.' },
+      { value: '49', label: '49', description: 'Outras operacoes de saida (casos especificos).' },
+    ],
+  },
+  {
+    id: 'informatica',
+    title: 'Informatica e perifericos',
+    chapterPrefixes: ['84', '90'],
+    cestOptions: [
+      { value: '21.079.00', label: '21.079.00', description: 'Partes e pecas para maquinas e equipamentos de informatica.' },
+      { value: '21.053.00', label: '21.053.00', description: 'Acessorios e componentes eletronicos diversos.' },
+    ],
+    taxCategoryOptions: [
+      { value: 'Tributado integral', label: 'Tributado integral', description: 'Regra geral para comercializacao de informatica.' },
+      { value: 'Substituicao tributaria', label: 'Substituicao tributaria', description: 'Aplicavel quando NCM/estado exigir ST.' },
+    ],
+    cfopOptions: [
+      { value: '5102', label: '5102', description: 'Venda interna de mercadoria de terceiros.' },
+      { value: '6102', label: '6102', description: 'Venda interestadual de mercadoria de terceiros.' },
+      { value: '5929', label: '5929', description: 'Lancamento para simples faturamento/operacoes especificas.' },
+    ],
+    cstIcmsOptions: [
+      { value: '00', label: '00', description: 'Tributada integralmente.' },
+      { value: '20', label: '20', description: 'Com reducao de base de calculo.' },
+      { value: '60', label: '60', description: 'ICMS retido anteriormente por ST.' },
+    ],
+    cstPisOptions: [
+      { value: '01', label: '01', description: 'Tributacao normal.' },
+      { value: '06', label: '06', description: 'Aliquota zero.' },
+      { value: '49', label: '49', description: 'Outras operacoes de saida.' },
+    ],
+    cstCofinsOptions: [
+      { value: '01', label: '01', description: 'Tributacao normal.' },
+      { value: '06', label: '06', description: 'Aliquota zero.' },
+      { value: '49', label: '49', description: 'Outras operacoes de saida.' },
+    ],
+  },
+  {
+    id: 'generic',
+    title: 'Perfil fiscal generico',
+    chapterPrefixes: [],
+    cestOptions: [
+      { value: '__none__', label: 'Sem CEST sugerido', description: 'Nem todo NCM possui CEST. Consulte contador/UF para confirmar obrigatoriedade.' },
+    ],
+    taxCategoryOptions: [
+      { value: 'Tributado integral', label: 'Tributado integral', description: 'Cenario mais comum de venda de mercadoria.' },
+      { value: 'Substituicao tributaria', label: 'Substituicao tributaria', description: 'Aplicar somente quando exigido para o NCM/UF.' },
+    ],
+    cfopOptions: [
+      { value: '5102', label: '5102', description: 'Venda interna de mercadoria de terceiros.' },
+      { value: '6102', label: '6102', description: 'Venda interestadual de mercadoria de terceiros.' },
+    ],
+    cstIcmsOptions: [
+      { value: '00', label: '00', description: 'Tributada integralmente.' },
+      { value: '40', label: '40', description: 'Isenta.' },
+      { value: '60', label: '60', description: 'ICMS por substituicao tributaria.' },
+    ],
+    cstPisOptions: [
+      { value: '01', label: '01', description: 'Operacao tributavel com aliquota basica.' },
+      { value: '06', label: '06', description: 'Operacao com aliquota zero.' },
+      { value: '49', label: '49', description: 'Outras operacoes de saida.' },
+    ],
+    cstCofinsOptions: [
+      { value: '01', label: '01', description: 'Operacao tributavel com aliquota basica.' },
+      { value: '06', label: '06', description: 'Operacao com aliquota zero.' },
+      { value: '49', label: '49', description: 'Outras operacoes de saida.' },
+    ],
+  },
+];
+
+const getFiscalProfileByNcm = (ncmCode: string): NcmFiscalProfile => {
+  const digits = onlyDigits(ncmCode || '');
+  const chapter = digits.slice(0, 2);
+  const found = NCM_FISCAL_PROFILES.find((profile) => profile.chapterPrefixes.includes(chapter));
+  return found || NCM_FISCAL_PROFILES.find((profile) => profile.id === 'generic')!;
+};
+
+type BrasilApiCepResponse = {
+  cep?: string;
+  state?: string;
+  city?: string;
+  neighborhood?: string;
+  street?: string;
+};
+
+type BrasilApiCnpjResponse = {
+  cnpj?: string;
+  razao_social?: string;
+  nome_fantasia?: string;
+  email?: string | null;
+  ddd_telefone_1?: string;
+  cep?: string;
+  uf?: string;
+  municipio?: string;
+  bairro?: string;
+  logradouro?: string;
+  numero?: string;
+  complemento?: string;
+};
+
+const formatCep = (value: string) => {
+  const digits = onlyDigits(value).slice(0, 8);
+  if (digits.length <= 5) return digits;
+  return `${digits.slice(0, 5)}-${digits.slice(5)}`;
+};
+
+const fetchCepByBrasilApi = async (cep: string): Promise<BrasilApiCepResponse> => {
+  const cleanCep = onlyDigits(cep);
+  const response = await axios.get(`https://brasilapi.com.br/api/cep/v1/${cleanCep}`);
+  return response.data || {};
+};
+
+const fetchCnpjByBrasilApi = async (cnpj: string): Promise<BrasilApiCnpjResponse> => {
+  const cleanCnpj = onlyDigits(cnpj);
+  const response = await axios.get(`https://brasilapi.com.br/api/cnpj/v1/${cleanCnpj}`);
+  return response.data || {};
+};
+
+const normalizeLookupText = (value: string) =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+
+const BRAZIL_UF_OPTIONS = [
+  'AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA', 'MT', 'MS',
+  'MG', 'PA', 'PB', 'PR', 'PE', 'PI', 'RJ', 'RN', 'RS', 'RO', 'RR', 'SC',
+  'SP', 'SE', 'TO',
+];
+
+type FiscalActivityTemplate = {
+  code: string;
+  name: string;
+  keywords: string[];
+  suggestedTaxCategory?: string;
+  suggestedCfop?: string;
+  suggestedCstIcms?: string;
+  suggestedCstPis?: string;
+  suggestedCstCofins?: string;
+};
+
+const FISCAL_ACTIVITY_TEMPLATES: FiscalActivityTemplate[] = [
+  {
+    code: '4751201',
+    name: 'Comercio varejista especializado de equipamentos e suprimentos de informatica',
+    keywords: ['informatica', 'pc', 'notebook', 'periferico', 'hardware'],
+    suggestedTaxCategory: 'Tributado integral',
+    suggestedCfop: '5102',
+    suggestedCstIcms: '00',
+    suggestedCstPis: '01',
+    suggestedCstCofins: '01',
+  },
+  {
+    code: '4752100',
+    name: 'Comercio varejista especializado de equipamentos de telefonia e comunicacao',
+    keywords: ['telefonia', 'celular', 'smartphone', 'acessorio', 'cabo'],
+    suggestedTaxCategory: 'Tributado integral',
+    suggestedCfop: '5102',
+    suggestedCstIcms: '00',
+    suggestedCstPis: '01',
+    suggestedCstCofins: '01',
+  },
+  {
+    code: '9511800',
+    name: 'Reparacao e manutencao de computadores e de equipamentos perifericos',
+    keywords: ['assistencia tecnica', 'reparo', 'manutencao', 'conserto', 'oficina'],
+    suggestedTaxCategory: 'Tributado integral',
+    suggestedCfop: '5102',
+    suggestedCstIcms: '00',
+    suggestedCstPis: '49',
+    suggestedCstCofins: '49',
+  },
+  {
+    code: '9521500',
+    name: 'Reparacao e manutencao de equipamentos eletroeletronicos de uso pessoal e domestico',
+    keywords: ['eletronico', 'eletroeletronico', 'audio', 'video', 'manutencao'],
+    suggestedTaxCategory: 'Tributado integral',
+    suggestedCfop: '5102',
+    suggestedCstIcms: '00',
+    suggestedCstPis: '49',
+    suggestedCstCofins: '49',
+  },
+];
+
+const ACCOUNTANT_ASSISTANT_SERVICE_OPTIONS = [
+  { id: 'ncm-cest', label: 'Revisar NCM e CEST no cadastro de produtos' },
+  { id: 'cfop-cst', label: 'Sugerir CFOP e CST para operacoes de venda' },
+  { id: 'icms-uf', label: 'Alertar diferencas de tributacao por UF' },
+  { id: 'fiscal-audit', label: 'Auditoria de consistencia fiscal de produtos' },
+  { id: 'deadline-reminders', label: 'Lembretes de rotinas e entregas contabeis' },
+  { id: 'setor-support', label: 'Suporte fiscal para Estoque, Vendas e Financeiro' },
+];
+
+const searchFiscalActivities = (query: string): FiscalActivityTemplate[] => {
+  const normalized = normalizeLookupText(query);
+  if (!normalized) return FISCAL_ACTIVITY_TEMPLATES;
+  const queryDigits = onlyDigits(normalized);
+
+  return FISCAL_ACTIVITY_TEMPLATES.filter((item) => {
+    if (queryDigits && item.code.includes(queryDigits)) return true;
+    if (normalizeLookupText(item.name).includes(normalized)) return true;
+    return item.keywords.some((keyword) => normalizeLookupText(keyword).includes(normalized));
+  });
+};
+
+const resolveFiscalActivityTemplate = (code?: string, sector?: string): FiscalActivityTemplate | null => {
+  const codeDigits = onlyDigits(String(code || ''));
+  if (codeDigits) {
+    const byCode = FISCAL_ACTIVITY_TEMPLATES.find((item) => item.code === codeDigits);
+    if (byCode) return byCode;
+  }
+
+  const normalizedSector = normalizeLookupText(String(sector || ''));
+  if (!normalizedSector) return null;
+
+  return (
+    FISCAL_ACTIVITY_TEMPLATES.find((item) =>
+      item.keywords.some((keyword) => normalizedSector.includes(normalizeLookupText(keyword)))
+    ) || null
+  );
+};
+
+const NCM_LOCAL_CACHE_KEY = 'techmanager_ncm_local_cache_v1';
+const NCM_LOCAL_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+type NcmLocalCachePayload = {
+  updatedAt: string;
+  items: BrasilApiNcmItem[];
+};
+
+const readNcmLocalCache = (): NcmLocalCachePayload | null => {
+  try {
+    const raw = localStorage.getItem(NCM_LOCAL_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.items) || !parsed.updatedAt) return null;
+    return parsed as NcmLocalCachePayload;
+  } catch {
+    return null;
+  }
+};
+
+const writeNcmLocalCache = (items: BrasilApiNcmItem[]) => {
+  try {
+    const payload: NcmLocalCachePayload = {
+      updatedAt: new Date().toISOString(),
+      items,
+    };
+    localStorage.setItem(NCM_LOCAL_CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    // Silently ignore cache write failures.
+  }
+};
+
+const isNcmCacheFresh = (updatedAt: string) => {
+  const timestamp = new Date(updatedAt).getTime();
+  if (Number.isNaN(timestamp)) return false;
+  return Date.now() - timestamp <= NCM_LOCAL_CACHE_MAX_AGE_MS;
+};
+
+const loadNcmLocalBase = async (): Promise<BrasilApiNcmItem[]> => {
+  const cached = readNcmLocalCache();
+  if (cached?.items?.length && isNcmCacheFresh(cached.updatedAt)) {
+    return cached.items;
+  }
+
+  try {
+    const response = await axios.get('https://brasilapi.com.br/api/ncm/v1');
+    const allItems: BrasilApiNcmItem[] = Array.isArray(response.data) ? response.data : [];
+    if (allItems.length) {
+      writeNcmLocalCache(allItems);
+      return allItems;
+    }
+  } catch {
+    // Fallback to stale cache when offline/API unavailable.
+  }
+
+  return cached?.items || [];
+};
+
+const dedupeNcmItems = (items: BrasilApiNcmItem[]) => {
+  const map = new Map<string, BrasilApiNcmItem>();
+  items.forEach((item) => {
+    const key = `${item.codigo || ''}|${item.descricao || ''}`;
+    if (!map.has(key)) map.set(key, item);
+  });
+  return Array.from(map.values());
+};
+
+const normalizeNcmCode = (value: string) => String(value || '').replace(/\D/g, '');
+
+// Palavras irrelevantes para busca de NCM (artigos, preposições, etc.)
+const NCM_STOP_WORDS = new Set([
+  'de', 'da', 'do', 'das', 'dos', 'e', 'ou', 'a', 'o', 'as', 'os',
+  'um', 'uma', 'com', 'sem', 'para', 'por', 'em', 'no', 'na', 'nos', 'nas',
+  'que', 'se', 'ao', 'aos', 'ate', 'sua', 'seu', 'seus', 'suas', 'tipo', 'modelo',
+]);
+
+// Termos muito genéricos de catálogo, úteis apenas como apoio.
+const NCM_GENERIC_TERMS = new Set([
+  'produto', 'peca', 'item', 'acessorio', 'kit', 'carga', 'carrega', 'carregamento',
+  'novo', 'nova', 'original', 'universal', 'premium', 'qualidade'
+]);
+
+const NCM_TERM_SYNONYMS: Record<string, string[]> = {
+  usb: ['universal serial bus'],
+  cabo: ['cabos', 'condutor', 'condutores', 'fio', 'fios'],
+  hdmi: ['video', 'dado', 'condutor', 'monitor', 'imagem', 'cabo video'],
+  vga: ['video', 'monitor', 'imagem', 'condutor'],
+  displayport: ['video', 'monitor', 'condutor', 'imagem'],
+  carregador: ['carga', 'carregamento', 'fonte'],
+  fonte: ['alimentacao', 'alimentador', 'carregador'],
+  celular: ['smartphone', 'telefone', 'telefonia', 'movel'],
+  notebook: ['portatil', 'laptop'],
+  tela: ['display', 'lcd', 'oled', 'touchscreen', 'monitor'],
+  bateria: ['acumulador', 'pilha'],
+  conector: ['plug', 'terminal'],
+};
+
+const NCM_QUERY_ALIASES: Record<string, string[]> = {
+  'monitor gamer': ['monitor video', 'monitor policromatico'],
+  'fone bluetooth': ['auscultador sem fio', 'fone sem fio'],
+  'fonte notebook': ['adaptador alimentacao notebook', 'carregador notebook'],
+  'cabo usb c': ['cabo usb tipo c', 'condutor eletrico usb'],
+  'cabo hdmi': ['cabo condutor video dados', 'condutor eletrico isolado hdmi'],
+  'cabo vga': ['cabo condutor video', 'condutor eletrico monitor'],
+  'cabo displayport': ['cabo condutor video', 'condutor eletrico monitor'],
+  'adaptador hdmi': ['adaptador conversor video', 'conversor sinal video'],
+  'adaptador vga': ['adaptador conversor video', 'conversor sinal video'],
+  'pelicula celular': ['pelicula plastica protetora'],
+  'carregador turbo': ['carregador eletrico', 'fonte alimentacao'],
+};
+
+// Camada de tags manuais (de/para) para aproximar linguagem comercial da nomenclatura oficial.
+// Chave: NCM numerico sem pontuacao (preferencialmente 8 digitos; prefixos tambem sao aceitos).
+const NCM_MANUAL_TAGS: Record<string, string[]> = {
+  '85437039': ['hdmi', 'vga', 'displayport', 'adaptador video', 'conversor video', 'dongle', 'video', 'monitor', 'imagem'],
+  '85444200': ['cabo', 'usb', 'tipo c', 'dados', 'carregamento', 'conector'],
+  '85176259': ['roteador', 'wifi', 'rede', 'modem', 'comunicacao'],
+  '85183000': ['fone', 'headset', 'audio', 'ouvido', 'bluetooth'],
+  '85076000': ['bateria', 'lition', 'litio', 'celular', 'power bank'],
+  // Prefixos de capitulo/posicao (fallback de tags por familia)
+  '8544': ['cabo', 'hdmi', 'vga', 'displayport', 'condutor', 'fio', 'usb', 'dados', 'energia', 'carregamento'],
+  '8543': ['aparelho eletronico', 'modulo', 'conversor', 'adaptador'],
+  '8528': ['monitor', 'tela', 'display', 'video'],
+  '8471': ['informatica', 'computador', 'notebook', 'processamento'],
+};
+
+const NCM_ELECTRONICS_HINTS = new Set([
+  'usb', 'cabo', 'carregador', 'fonte', 'celular', 'notebook', 'tela', 'bateria', 'conector', 'hdmi', 'placa'
+]);
+
+const NCM_ELECTRONICS_NCM_KEYWORDS = [
+  'eletric', 'eletron', 'telefon', 'cabo', 'condutor', 'isolad', 'acumulador',
+  'aparelho', 'conector', 'usb', 'dados', 'carregador', 'alimentacao'
+];
+
+const singularizeTerm = (term: string) => {
+  if (term.endsWith('oes') && term.length > 4) return `${term.slice(0, -3)}ao`;
+  if (term.endsWith('ais') && term.length > 4) return `${term.slice(0, -3)}al`;
+  if (term.endsWith('eis') && term.length > 4) return `${term.slice(0, -3)}el`;
+  if (term.endsWith('is') && term.length > 4) return `${term.slice(0, -2)}il`;
+  if (term.endsWith('es') && term.length > 4) return term.slice(0, -2);
+  if (term.endsWith('s') && term.length > 3) return term.slice(0, -1);
+  return term;
+};
+
+const tokenizeLookupText = (value: string) =>
+  normalizeLookupText(value)
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(singularizeTerm);
+
+const buildVectorFromTokens = (tokens: string[]) => {
+  const vector = new Map<string, number>();
+  tokens.forEach((token) => {
+    if (!token) return;
+    vector.set(token, (vector.get(token) || 0) + 1);
+  });
+  return vector;
+};
+
+const cosineSimilarity = (a: Map<string, number>, b: Map<string, number>) => {
+  if (a.size === 0 || b.size === 0) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+
+  a.forEach((aValue, key) => {
+    normA += aValue * aValue;
+    const bValue = b.get(key) || 0;
+    dot += aValue * bValue;
+  });
+  b.forEach((bValue) => {
+    normB += bValue * bValue;
+  });
+
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  if (!denominator) return 0;
+  return dot / denominator;
+};
+
+const getManualTagsForNcm = (ncmCode: string) => {
+  const digits = normalizeNcmCode(ncmCode);
+  if (!digits) return [] as string[];
+
+  const tags = new Set<string>();
+
+  // Match exato (8 digitos) ou parcial (prefixos definidos no dicionario)
+  Object.entries(NCM_MANUAL_TAGS).forEach(([key, mappedTags]) => {
+    if (!key) return;
+    if (digits === key || digits.startsWith(key) || key.startsWith(digits)) {
+      mappedTags.forEach((tag) => tags.add(normalizeLookupText(tag)));
+    }
+  });
+
+  return Array.from(tags);
+};
+
+const itemSemanticVectorCache = new Map<string, Map<string, number>>();
+
+const getItemSemanticVector = (item: BrasilApiNcmItem) => {
+  const cacheKey = `${normalizeNcmCode(item.codigo)}|${normalizeLookupText(item.descricao)}`;
+  const cached = itemSemanticVectorCache.get(cacheKey);
+  if (cached) return cached;
+
+  const descriptionTokens = tokenizeLookupText(item.descricao);
+  const manualTagTokens = getManualTagsForNcm(item.codigo).flatMap((tag) => tokenizeLookupText(tag));
+  const codeTokens = [normalizeNcmCode(item.codigo)].filter(Boolean);
+
+  const vector = buildVectorFromTokens([...descriptionTokens, ...manualTagTokens, ...codeTokens]);
+  itemSemanticVectorCache.set(cacheKey, vector);
+  return vector;
+};
+
+type NcmSearchTerms = {
+  originalTerms: string[];
+  expandedTerms: string[];
+};
+
+type NcmSegmentProfile = {
+  id: string;
+  triggerTerms: string[];
+  preferredCodePrefixes: string[];
+  contextKeywords: string[];
+};
+
+const NCM_SEGMENT_PROFILES: NcmSegmentProfile[] = [
+  {
+    id: 'mobile-accessories',
+    triggerTerms: ['celular', 'smartphone', 'iphone', 'android', 'usb', 'carregador', 'cabo', 'conector'],
+    preferredCodePrefixes: ['85'],
+    contextKeywords: ['telefon', 'eletric', 'eletron', 'cabo', 'condutor', 'carregador', 'usb', 'adaptador', 'conector'],
+  },
+  {
+    id: 'notebook-informatica',
+    triggerTerms: ['notebook', 'laptop', 'computador', 'pc', 'ssd', 'hd', 'memoria', 'teclado', 'mouse'],
+    preferredCodePrefixes: ['84', '85', '90'],
+    contextKeywords: ['maquina', 'processamento', 'informatic', 'armazenamento', 'memoria', 'teclado', 'mouse', 'placa', 'eletron'],
+  },
+  {
+    id: 'games-perifericos',
+    triggerTerms: ['game', 'gamer', 'console', 'controle', 'joystick', 'headset'],
+    preferredCodePrefixes: ['95', '85'],
+    contextKeywords: ['jogo', 'videogame', 'console', 'controle', 'audio', 'eletron'],
+  },
+  {
+    id: 'energia-bateria',
+    triggerTerms: ['bateria', 'pilha', 'fonte', 'nobreak', 'energia', 'alimentacao'],
+    preferredCodePrefixes: ['85'],
+    contextKeywords: ['acumulador', 'pilha', 'bateria', 'energia', 'alimentacao', 'conversor', 'transformador'],
+  },
+];
+
+const extractMeaningfulTerms = (query: string): NcmSearchTerms => {
+  const allTerms = tokenizeLookupText(query).filter((term) => term.length >= 2 && !NCM_STOP_WORDS.has(term));
+  const specificTerms = allTerms.filter((term) => !NCM_GENERIC_TERMS.has(term));
+  const originalTerms = Array.from(new Set(specificTerms.length > 0 ? specificTerms : allTerms));
+
+  const expanded = new Set<string>(originalTerms);
+  originalTerms.forEach((term) => {
+    (NCM_TERM_SYNONYMS[term] || []).forEach((synonym) => {
+      tokenizeLookupText(synonym).forEach((token) => {
+        if (token.length >= 2 && !NCM_STOP_WORDS.has(token)) expanded.add(token);
+      });
+    });
+  });
+
+  return {
+    originalTerms,
+    expandedTerms: Array.from(expanded),
+  };
+};
+
+const buildQuerySemanticVector = (query: string, terms: NcmSearchTerms) => {
+  const aliasExpansions = getQueryAliasExpansions(query);
+  const fullQueryTokens = tokenizeLookupText([query, ...aliasExpansions].join(' '));
+  return buildVectorFromTokens([...fullQueryTokens, ...terms.expandedTerms]);
+};
+
+const getQueryAliasExpansions = (query: string): string[] => {
+  const normalized = normalizeLookupText(query);
+  const expansions: string[] = [];
+  Object.entries(NCM_QUERY_ALIASES).forEach(([alias, terms]) => {
+    if (normalized.includes(alias)) {
+      expansions.push(...terms);
+    }
+  });
+  return expansions;
+};
+
+const detectNcmSegments = (terms: NcmSearchTerms): NcmSegmentProfile[] => {
+  const searchSet = new Set(terms.expandedTerms);
+  return NCM_SEGMENT_PROFILES.filter((profile) =>
+    profile.triggerTerms.some((term) => searchSet.has(term))
+  );
+};
+
+const countMatchedOriginalTerms = (item: BrasilApiNcmItem, terms: NcmSearchTerms): number => {
+  const descriptionTokens = new Set(tokenizeLookupText(item.descricao));
+  const code = String(item.codigo || '').replace(/\D/g, '');
+  // Inclui tags manuais do item para que termos comerciais (ex: 'hdmi') contem como match.
+  const manualTagTokens = new Set(
+    getManualTagsForNcm(item.codigo).flatMap((tag) => tokenizeLookupText(tag))
+  );
+  return terms.originalTerms.reduce((acc, term) => {
+    const exactTokenMatch = descriptionTokens.has(term) || manualTagTokens.has(term);
+    const prefixTokenMatch =
+      Array.from(descriptionTokens).some((token) => token.startsWith(term)) ||
+      Array.from(manualTagTokens).some((token) => token.startsWith(term));
+    const inCode = code.includes(term);
+    return exactTokenMatch || prefixTokenMatch || inCode ? acc + 1 : acc;
+  }, 0);
+};
+
+const scoreNcmItem = (
+  item: BrasilApiNcmItem,
+  terms: NcmSearchTerms,
+  query: string,
+  activeSegments: NcmSegmentProfile[],
+  queryVector: Map<string, number>,
+  normalizedQuery: string
+): number => {
+  const description = normalizeLookupText(item.descricao);
+  const descriptionTokens = new Set(tokenizeLookupText(item.descricao));
+  const code = String(item.codigo || '').replace(/\D/g, '');
+
+  let score = 0;
+
+  // Match forte com termos originais da query
+  for (const term of terms.originalTerms) {
+    const exactTokenMatch = descriptionTokens.has(term);
+    const prefixTokenMatch = Array.from(descriptionTokens).some((token) => token.startsWith(term));
+    const inCode = code.includes(term);
+    if (exactTokenMatch) score += 4;
+    else if (prefixTokenMatch) score += 2;
+    else if (inCode) score += 1;
+  }
+
+  // Match auxiliar com sinônimos/expansões
+  const originalSet = new Set(terms.originalTerms);
+  for (const term of terms.expandedTerms) {
+    if (originalSet.has(term)) continue;
+    if (descriptionTokens.has(term)) score += 1;
+  }
+
+  // Bonus por frase semelhante completa no texto
+  if (normalizedQuery && description.includes(normalizedQuery)) {
+    score += 3;
+  }
+
+  // Penaliza resultados sem contexto quando a busca parece eletrônica
+  const looksElectronic = terms.originalTerms.some((term) => NCM_ELECTRONICS_HINTS.has(term));
+  if (looksElectronic) {
+    const hasElectronicContext = NCM_ELECTRONICS_NCM_KEYWORDS.some((keyword) => description.includes(keyword));
+    if (!hasElectronicContext) {
+      score -= 6;
+    }
+  }
+
+  // Ajuste por segmento de negócio: favorece capítulos NCM e contexto típicos.
+  if (activeSegments.length > 0) {
+    activeSegments.forEach((segment) => {
+      const prefersCode = segment.preferredCodePrefixes.some((prefix) => code.startsWith(prefix));
+      const hasSegmentContext = segment.contextKeywords.some((keyword) => description.includes(keyword));
+      if (prefersCode) score += 3;
+      if (hasSegmentContext) score += 2;
+      if (!prefersCode && !hasSegmentContext) score -= 4;
+    });
+  }
+
+  // Camada semântica vetorial: aproxima termos comercialmente parecidos das descricoes oficiais.
+  const itemVector = getItemSemanticVector(item);
+  const semanticSimilarity = cosineSimilarity(queryVector, itemVector);
+  score += semanticSimilarity * 12;
+
+  // Bonus por tags manuais (de/para) mapeadas para o NCM.
+  const itemTags = getManualTagsForNcm(item.codigo);
+  const matchedTagCount = itemTags.reduce((acc, tag) => {
+    const normalizedTag = normalizeLookupText(tag);
+    return terms.expandedTerms.includes(normalizedTag) || normalizedQuery.includes(normalizedTag)
+      ? acc + 1
+      : acc;
+  }, 0);
+  score += matchedTagCount * 2.5;
+
+  return score;
+};
+
+const fetchNcmByBrasilApi = async (query: string): Promise<BrasilApiNcmItem[]> => {
+  const aliasExpansions = getQueryAliasExpansions(query);
+  const expandedQueryText = [query, ...aliasExpansions].join(' ');
+  const searchTerms = extractMeaningfulTerms(expandedQueryText);
+  if (!searchTerms.originalTerms.length) return [];
+  const activeSegments = detectNcmSegments(searchTerms);
+  const queryVector = buildQuerySemanticVector(expandedQueryText, searchTerms);
+  const normalizedExpandedQuery = normalizeLookupText(expandedQueryText);
+
+  const minScore = searchTerms.originalTerms.length >= 2 ? 4 : 3;
+
+  // 1) Base local (cache) primeiro: rapido e resiliente.
+  const localItems = await loadNcmLocalBase();
+  const numericQuery = normalizeNcmCode(query);
+
+  if (localItems.length > 0 && numericQuery.length >= 2) {
+    const codeMatches = localItems
+      .filter((item) => normalizeNcmCode(item.codigo).startsWith(numericQuery))
+      .sort((a, b) => normalizeNcmCode(a.codigo).localeCompare(normalizeNcmCode(b.codigo)));
+    if (codeMatches.length > 0) {
+      return codeMatches.slice(0, 120);
+    }
+  }
+
+  if (localItems.length > 0) {
+    const localScored = localItems
+      .map((item) => ({
+        item,
+        score: scoreNcmItem(item, searchTerms, expandedQueryText, activeSegments, queryVector, normalizedExpandedQuery),
+        matchedOriginalTerms: countMatchedOriginalTerms(item, searchTerms),
+      }))
+      .filter(({ score }) => score >= minScore)
+      .sort((a, b) => b.score - a.score || b.matchedOriginalTerms - a.matchedOriginalTerms);
+
+    if (localScored.length > 0) {
+      const strictMatches = localScored.filter(({ matchedOriginalTerms }) => matchedOriginalTerms === searchTerms.originalTerms.length);
+      if (strictMatches.length > 0) {
+        return dedupeNcmItems(strictMatches.slice(0, 100).map(({ item }) => item));
+      }
+
+      const minMatchCount = Math.max(1, Math.ceil(searchTerms.originalTerms.length / 2));
+      const relaxedMatches = localScored.filter(({ matchedOriginalTerms }) => matchedOriginalTerms >= minMatchCount);
+      if (relaxedMatches.length > 0) {
+        return dedupeNcmItems(relaxedMatches.slice(0, 100).map(({ item }) => item));
+      }
+    }
+  }
+
+  // 2) API de busca textual como backup.
+  try {
+    const response = await axios.get(
+      `https://brasilapi.com.br/api/ncm/v1?search=${encodeURIComponent(expandedQueryText.trim())}`
+    );
+    const apiResults: BrasilApiNcmItem[] = Array.isArray(response.data) ? response.data : [];
+    // Valida se os resultados da API realmente têm relação com a busca
+    const validApiResults = apiResults
+      .map((item) => ({
+        item,
+        score: scoreNcmItem(item, searchTerms, expandedQueryText, activeSegments, queryVector, normalizedExpandedQuery),
+        matchedOriginalTerms: countMatchedOriginalTerms(item, searchTerms),
+      }))
+      .filter(({ score }) => score >= minScore)
+      .sort((a, b) => b.score - a.score || b.matchedOriginalTerms - a.matchedOriginalTerms);
+    if (validApiResults.length > 0) {
+      return dedupeNcmItems(validApiResults.slice(0, 100).map(({ item }) => item));
+    }
+  } catch {
+    // Continue no backup final abaixo.
+  }
+
+  // 3) API da tabela completa como ultimo recurso e refresh do cache local.
+  try {
+    const allItemsResponse = await axios.get('https://brasilapi.com.br/api/ncm/v1');
+    const allItems: BrasilApiNcmItem[] = Array.isArray(allItemsResponse.data) ? allItemsResponse.data : [];
+    if (!allItems.length) return [];
+    writeNcmLocalCache(allItems);
+
+    const scored = allItems
+      .map((item) => ({
+        item,
+        score: scoreNcmItem(item, searchTerms, expandedQueryText, activeSegments, queryVector, normalizedExpandedQuery),
+        matchedOriginalTerms: countMatchedOriginalTerms(item, searchTerms),
+      }))
+      .filter(({ score }) => score >= minScore)
+      .sort((a, b) => b.score - a.score || b.matchedOriginalTerms - a.matchedOriginalTerms);
+
+    if (!scored.length) return [];
+
+    // Tenta match estrito primeiro: todos os termos originais devem ter batido.
+    const strictMatches = scored.filter(({ matchedOriginalTerms }) => matchedOriginalTerms === searchTerms.originalTerms.length);
+    if (strictMatches.length > 0) {
+      return dedupeNcmItems(strictMatches.slice(0, 100).map(({ item }) => item));
+    }
+
+    // Relaxado: pelo menos metade dos termos originais deve bater.
+    const minMatchCount = Math.max(1, Math.ceil(searchTerms.originalTerms.length / 2));
+    const relaxedMatches = scored.filter(({ matchedOriginalTerms }) => matchedOriginalTerms >= minMatchCount);
+    return dedupeNcmItems(relaxedMatches.slice(0, 100).map(({ item }) => item));
+  } catch {
+    return [];
+  }
+};
+
+const formatCpfCnpj = (value: string) => {
+  const digits = onlyDigits(value).slice(0, 14);
+  if (digits.length <= 11) {
+    return digits
+      .replace(/^(\d{3})(\d)/, '$1.$2')
+      .replace(/^(\d{3})\.(\d{3})(\d)/, '$1.$2.$3')
+      .replace(/^(\d{3})\.(\d{3})\.(\d{3})(\d)/, '$1.$2.$3-$4');
+  }
+  return digits
+    .replace(/^(\d{2})(\d)/, '$1.$2')
+    .replace(/^(\d{2})\.(\d{3})(\d)/, '$1.$2.$3')
+    .replace(/^(\d{2})\.(\d{3})\.(\d{3})(\d)/, '$1.$2.$3/$4')
+    .replace(/^(\d{2})\.(\d{3})\.(\d{3})\/(\d{4})(\d)/, '$1.$2.$3/$4-$5');
+};
+
+const formatPhone = (value: string) => {
+  const digits = onlyDigits(value).slice(0, 11);
+  if (digits.length <= 10) {
+    return digits
+      .replace(/^(\d{2})(\d)/, '($1) $2')
+      .replace(/^(\(\d{2}\) \d{4})(\d)/, '$1-$2');
+  }
+  return digits
+    .replace(/^(\d{2})(\d)/, '($1) $2')
+    .replace(/^(\(\d{2}\) \d{5})(\d)/, '$1-$2');
+};
+
+const formatStateRegistration = (value: string) => {
+  const normalized = (value || '').trim().toUpperCase();
+  return normalized === 'ISENTO' ? 'ISENTO' : onlyDigits(normalized).slice(0, 14);
+};
+
+const normalizeEmail = (value: string) => (value || '').trim().toLowerCase();
+const isValidOptionalEmail = (value: string) => {
+  const email = normalizeEmail(value);
+  return !email || /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
+};
+
 const AGENT_PROMPT_AREA_LABELS: Record<AIAgentPromptArea, string> = {
   'suporte-tecnico': 'Assistente Técnico',
+  'contador-fiscal': 'Assistente Contador',
   'ordem-servico': 'Ordem de Serviço',
   atendimento: 'Atendimento',
   financeiro: 'Financeiro',
@@ -352,25 +1648,42 @@ const ROLE_FRIENDLY_NAMES: Record<string, string> = {
   'USUARIO': 'Técnico'
 };
 
-const SidebarItem = ({ icon: Icon, label, active, onClick }: any) => (
+const SidebarItem = ({ icon: Icon, label, active, collapsed, onClick }: any) => (
   <button
     onClick={onClick}
     className={cn(
-      "flex items-center w-full gap-3 px-4 py-2.5 text-sm font-medium transition-all rounded-lg group relative overflow-hidden",
+      "flex items-center w-full gap-3 px-4 py-2.5 text-sm font-medium transition-all rounded-lg group relative",
+      collapsed && "justify-center px-0 py-1.5 min-h-[44px] gap-0",
       active 
         ? "bg-primary text-primary-foreground shadow-lg shadow-primary/20" 
         : "text-muted-foreground hover:bg-secondary hover:text-foreground"
     )}
+    title={collapsed ? label : undefined}
   >
-    <Icon className={cn("w-5 h-5 transition-transform duration-300", active ? "text-primary-foreground" : "group-hover:scale-110 group-hover:text-primary")} />
-    <span>{label}</span>
+    <Icon className={cn(
+      "transition-transform duration-300",
+      collapsed ? "w-6 h-6" : "w-5 h-5",
+      active
+        ? "text-primary-foreground"
+        : "text-foreground/80 group-hover:scale-110 group-hover:text-primary"
+    )} />
+    {!collapsed && <span className="text-left leading-tight">{label}</span>}
+    {collapsed && (
+      <span
+        className="pointer-events-none absolute left-full ml-2 rounded-md border bg-background px-2 py-1 text-xs font-semibold text-foreground shadow-lg opacity-0 translate-x-1 transition-all duration-200 group-hover:opacity-100 group-hover:translate-x-0"
+      >
+        {label}
+      </span>
+    )}
     {active && (
       <motion.div 
         layoutId="active-nav"
         className="absolute right-0 w-1 h-6 bg-primary-foreground rounded-l-full"
       />
     )}
-    {!active && <ChevronRight className="w-4 h-4 ml-auto opacity-0 group-hover:opacity-100 transition-opacity" />}
+    {!collapsed && !active && (
+      <ChevronRight className="w-4 h-4 ml-auto opacity-0 group-hover:opacity-100 transition-opacity" />
+    )}
   </button>
 );
 
@@ -631,7 +1944,7 @@ export default function App() {
   const [allOrders, setAllOrders] = useState<ServiceOrder[]>([]);
   const [customSubStatuses, setCustomSubStatuses] = useState<Record<string, string[]>>(() => {
     const saved = localStorage.getItem('techmanager_substatuses');
-    return saved ? JSON.parse(saved) : {
+    return saved ? normalizeTextEncoding(JSON.parse(saved)) : {
       'Aguardando peça': ['Peça encomendada', 'Aguardando peça pelo cliente', 'Peça em trânsito', 'Peça indisponível'],
       'Em reparo': ['Iniciado', 'Aguardando senha do sistema', 'Aguardando autorização extra', 'Reparo suspenso'],
       'Testes finais': ['Stress test', 'Verificando conexões', 'Limpeza interna', 'Aguardando validação do técnico']
@@ -675,8 +1988,41 @@ export default function App() {
     const interval = setInterval(checkReminders, 60000); // Check every minute
     return () => clearInterval(interval);
   }, [tasks]);
+
   const [companyLogo, setCompanyLogo] = useState<string | null>(null);
   const [company, setCompany] = useState<Company>(EMPTY_COMPANY);
+
+  useEffect(() => {
+    if (!company.accountantAssistantEnabled) return;
+    if (company.accountantNotificationEnabled === false) return;
+
+    const selectedServices = (company.accountantServices || []).filter(Boolean);
+    const serviceNames = ACCOUNTANT_ASSISTANT_SERVICE_OPTIONS
+      .filter((item) => selectedServices.includes(item.id))
+      .map((item) => item.label);
+    if (serviceNames.length === 0) return;
+    if (company.accountantReminderEnabled === false) return;
+
+    const now = new Date();
+    const reminderDays = Math.max(1, Number(company.accountantReminderFrequencyDays) || 7);
+    const lastReminderIso = localStorage.getItem(ACCOUNTANT_ASSISTANT_REMINDER_KEY);
+    const lastReminderDate = lastReminderIso ? new Date(lastReminderIso) : null;
+    const daysSinceLast = lastReminderDate ? differenceInDays(now, lastReminderDate) : Number.POSITIVE_INFINITY;
+    if (daysSinceLast < reminderDays) return;
+
+    toast.info('Assistente Contador IA: revisar rotina fiscal', {
+      description: `Servicos ativos: ${serviceNames.slice(0, 3).join(' | ')}`,
+      duration: 10000,
+    });
+    localStorage.setItem(ACCOUNTANT_ASSISTANT_REMINDER_KEY, now.toISOString());
+  }, [
+    company.accountantAssistantEnabled,
+    company.accountantNotificationEnabled,
+    company.accountantReminderEnabled,
+    company.accountantReminderFrequencyDays,
+    company.accountantServices,
+  ]);
+
   const [osSortOrder, setOsSortOrder] = useState<'number' | 'date' | 'priority'>(() => {
     const saved = localStorage.getItem('techmanager_os_sort');
     return (saved as any) || 'number';
@@ -741,26 +2087,30 @@ export default function App() {
 
     const loadAppState = async () => {
       const applyResolvedState = async (serverState: any = {}) => {
+        const normalizedState = normalizeTextEncoding(serverState);
         const resolveArray = <T,>(serverValue: unknown): T[] => {
           if (Array.isArray(serverValue)) return serverValue as T[];
           return [];
         };
 
-        const resolvedUsers = resolveArray<AuthUser>(serverState?.users);
-        const resolvedCompanies = resolveArray<ManagedCompany>(serverState?.companies);
-        const resolvedOrders = resolveArray<ServiceOrder>(serverState?.orders);
-        const resolvedTasks = resolveArray<any>(serverState?.tasks);
-        const resolvedProducts = resolveArray<any>(serverState?.products);
-        const resolvedSales = resolveArray<any>(serverState?.sales);
-        const resolvedFinance = resolveArray<any>(serverState?.finance);
-        const resolvedTeam = resolveArray<User>(serverState?.team);
-        const resolvedRma = resolveArray<any>(serverState?.rma);
-        const resolvedEquipmentTypes = resolveArray<EquipmentType>(serverState?.equipmentTypes);
-        const resolvedCustomers = sanitizeCustomers(resolveArray<any>(serverState?.customers));
-        const resolvedSuppliers = resolveArray<Supplier>(serverState?.suppliers);
-        const resolvedPrintTemplates = resolveArray<PrintTemplate>(serverState?.printTemplates);
-        const resolvedCompany = hasCompanyContent(serverState?.companySettings)
-          ? { ...EMPTY_COMPANY, ...serverState.companySettings }
+        const resolvedUsers = resolveArray<AuthUser>(normalizedState?.users);
+        const resolvedCompanies = resolveArray<ManagedCompany>(normalizedState?.companies);
+        const resolvedOrders = resolveArray<ServiceOrder>(normalizedState?.orders);
+        const resolvedTasks = resolveArray<any>(normalizedState?.tasks);
+        const resolvedProducts = resolveArray<any>(normalizedState?.products);
+        const resolvedSales = resolveArray<any>(normalizedState?.sales);
+        const resolvedFinance = resolveArray<any>(normalizedState?.finance);
+        const resolvedTeam = resolveArray<User>(normalizedState?.team);
+        const resolvedRma = resolveArray<any>(normalizedState?.rma);
+        const resolvedEquipmentTypes = resolveArray<EquipmentType>(normalizedState?.equipmentTypes);
+        const resolvedCustomers = sanitizeCustomers(resolveArray<any>(normalizedState?.customers));
+        const resolvedSuppliers = resolveArray<Supplier>(normalizedState?.suppliers);
+        const resolvedPrintTemplates = resolveArray<PrintTemplate>(normalizedState?.printTemplates);
+        const adjustedPrintTemplates = resolvedPrintTemplates.map((template) =>
+          template.id === '1tl03tdak' ? { ...template, gapX: 4 } : template
+        );
+        const resolvedCompany = hasCompanyContent(normalizedState?.companySettings)
+          ? { ...EMPTY_COMPANY, ...normalizedState.companySettings }
           : companyFromManagedCompany(resolvedCompanies[0]);
 
         if (cancelled) return;
@@ -777,7 +2127,7 @@ export default function App() {
         setEquipmentTypes(resolvedEquipmentTypes);
         setGlobalCustomers(resolvedCustomers);
         setSuppliers(resolvedSuppliers);
-        setPrintTemplates(resolvedPrintTemplates);
+        setPrintTemplates(adjustedPrintTemplates);
         setCompany(resolvedCompany);
         setActiveCompany(resolvedCompany);
         setCompanyLogo(resolvedCompany.logo || null);
@@ -851,7 +2201,7 @@ export default function App() {
 
   const [supportSessions, setSupportSessions] = useState<SupportSession[]>(() => {
     const saved = localStorage.getItem(SUPPORT_SESSIONS_STORAGE_KEY);
-    return saved ? JSON.parse(saved) : [];
+    return saved ? normalizeTextEncoding(JSON.parse(saved)) : [];
   });
 
   useEffect(() => {
@@ -953,6 +2303,8 @@ export default function App() {
     { id: 'equipe', label: 'Equipe / Usuários', icon: Users },
     { id: 'impressao', label: 'Personalizar Impressão', icon: PrinterIcon },
     ...(isTechnicalSupportEnabled ? [{ id: 'suporte-tecnico', label: 'Assistente Técnico', icon: Lightbulb }] : []),
+    { id: 'assistente-contador', label: 'Assistente Contador', icon: Briefcase },
+    { id: 'migracao', label: 'Assistente de Migração', icon: Database },
     { id: 'calendario', label: 'Calendário', icon: Calendar },
     { id: 'config', label: 'Configurações', icon: Settings },
   ] : [
@@ -964,9 +2316,16 @@ export default function App() {
     { id: 'estoque', label: 'Estoque', icon: Package },
     { id: 'whatsapp', label: 'WhatsApp', icon: MessageSquare },
     ...(isTechnicalSupportEnabled ? [{ id: 'suporte-tecnico', label: 'Assistente Técnico', icon: Lightbulb }] : []),
+    { id: 'assistente-contador', label: 'Assistente Contador', icon: Briefcase },
+    { id: 'migracao', label: 'Assistente de Migração', icon: Database },
     { id: 'calendario', label: 'Calendário', icon: Calendar },
     { id: 'config', label: 'Configurações', icon: Settings },
-  ].filter(item => (user?.allowedTabs || []).includes(item.id) || (item.id === 'suporte-tecnico' && isTechnicalSupportEnabled)));
+  ].filter(item =>
+    (user?.allowedTabs || []).includes(item.id) ||
+    (item.id === 'suporte-tecnico' && isTechnicalSupportEnabled) ||
+    (item.id === 'assistente-contador' && company.accountantAssistantEnabled) ||
+    item.id === 'migracao'
+  ));
 
   const renderContent = () => {
     if (viewingOSId) {
@@ -982,6 +2341,7 @@ export default function App() {
           globalCustomers={globalCustomers}
           user={user}
           company={company}
+          printTemplates={printTemplates}
         />
       );
     }
@@ -1044,6 +2404,7 @@ export default function App() {
             user={user as User} 
             equipmentTypes={equipmentTypes} 
             globalCustomers={globalCustomers}
+            setGlobalCustomers={setGlobalCustomers}
             setAllOrders={setAllOrders} 
             printTemplates={printTemplates} 
             company={company}
@@ -1066,6 +2427,13 @@ export default function App() {
         return (
           <StockView 
             fiscalEnabled={!!activeCompany.fiscalEnabled} 
+            fiscalStrictModeEnabled={activeCompany.fiscalStrictModeEnabled !== false}
+            companyFiscalSettings={{
+              fiscalUf: activeCompany.fiscalUf,
+              fiscalActivitySector: activeCompany.fiscalActivitySector,
+              fiscalActivityCode: activeCompany.fiscalActivityCode,
+              accountantAssistantEnabled: activeCompany.accountantAssistantEnabled,
+            }}
             allProducts={allProducts}
             setAllProducts={setAllProducts}
             rmaHistory={rmaHistory}
@@ -1113,6 +2481,23 @@ export default function App() {
             supportSessions={supportSessions}
             setSupportSessions={setSupportSessions}
             isPremiumEnabled={!!isTechnicalSupportEnabled}
+          />
+        );
+      case 'assistente-contador':
+        return (
+          <AccountantAssistantView
+            company={company}
+            allProducts={allProducts}
+          />
+        );
+      case 'migracao':
+        return (
+          <MigrationAssistantView
+            activeCompanyId={company.id}
+            setAllProducts={setAllProducts}
+            setGlobalCustomers={setGlobalCustomers}
+            setAllOrders={setAllOrders}
+            setSuppliers={setSuppliers}
           />
         );
       case 'config':
@@ -1177,7 +2562,7 @@ export default function App() {
   }
 
   return (
-    <div className={cn("flex min-h-screen bg-background text-foreground font-sans selection:bg-primary/10 transition-colors duration-300", darkMode && "dark")}>
+    <div className={cn("theme-auto flex min-h-screen bg-background text-foreground font-sans selection:bg-primary/10 transition-colors duration-300", darkMode && "dark")}>
       <Toaster position="top-right" richColors />
       
       {/* Backdrop for Mobile */}
@@ -1196,8 +2581,8 @@ export default function App() {
       {/* Sidebar */}
       <aside 
         className={cn(
-          "fixed inset-y-0 left-0 z-50 flex flex-col transition-all duration-300 bg-white border-r shadow-sm lg:relative",
-          isSidebarOpen ? "w-64 translate-x-0" : "w-20 -translate-x-full lg:translate-x-0 lg:w-20",
+          "fixed inset-y-0 left-0 z-50 flex flex-col transition-all duration-300 bg-background border-r shadow-sm lg:relative",
+          isSidebarOpen ? "w-72 translate-x-0" : "w-20 -translate-x-full lg:translate-x-0 lg:w-20",
           !isSidebarOpen && !isMobile && "lg:w-20"
         )}
       >
@@ -1215,13 +2600,17 @@ export default function App() {
           )}
         </div>
 
-        <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+        <nav className={cn(
+          "flex-1 px-3 py-4 overflow-y-auto",
+          isSidebarOpen ? "space-y-1" : "space-y-0.5"
+        )}>
           {menuItems.map((item) => (
             <SidebarItem
               key={item.id}
               icon={item.icon}
-              label={isSidebarOpen ? item.label : ""}
+              label={item.label}
               active={activeTab === item.id}
+              collapsed={!isSidebarOpen}
               onClick={() => {
                 setActiveTab(item.id);
                 if (isMobile) setIsSidebarOpen(false);
@@ -1233,7 +2622,8 @@ export default function App() {
         <div className="p-4 border-t">
           <SidebarItem
             icon={LogOut}
-            label={isSidebarOpen ? "Sair" : ""}
+            label="Sair"
+            collapsed={!isSidebarOpen}
             onClick={() => {
               handleLogout();
             }}
@@ -1354,6 +2744,7 @@ function SuperAdminCompaniesView({
   const [document, setDocument] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
+  const [isCnpjLookupLoading, setIsCnpjLookupLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
 
@@ -1373,7 +2764,30 @@ function SuperAdminCompaniesView({
     setDocument('');
     setEmail('');
     setPhone('');
+    setIsCnpjLookupLoading(false);
     setEditingId(null);
+  };
+
+  const handleLookupCompanyByCnpj = async () => {
+    const cleanCnpj = onlyDigits(document);
+    if (cleanCnpj.length !== 14) {
+      toast.error('Informe um CNPJ válido com 14 dígitos para consultar.');
+      return;
+    }
+
+    try {
+      setIsCnpjLookupLoading(true);
+      const data = await fetchCnpjByBrasilApi(cleanCnpj);
+      setDocument(formatCpfCnpj(cleanCnpj));
+      setName(data.razao_social || data.nome_fantasia || name);
+      setEmail((data.email || '').toLowerCase());
+      setPhone(formatPhone(data.ddd_telefone_1 || phone));
+      toast.success('Dados da empresa carregados via CNPJ.');
+    } catch {
+      toast.error('Não foi possível consultar este CNPJ na BrasilAPI.');
+    } finally {
+      setIsCnpjLookupLoading(false);
+    }
   };
 
   const saveCompany = () => {
@@ -1461,7 +2875,17 @@ function SuperAdminCompaniesView({
         <CardContent className="space-y-3">
           <div className="grid md:grid-cols-2 gap-3">
             <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome da empresa" />
-            <Input value={document} onChange={(e) => setDocument(e.target.value)} placeholder="CNPJ/Documento (opcional)" />
+            <div className="flex gap-2">
+              <Input value={document} onChange={(e) => setDocument(formatCpfCnpj(e.target.value))} placeholder="CNPJ/Documento (opcional)" />
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleLookupCompanyByCnpj}
+                disabled={isCnpjLookupLoading}
+              >
+                {isCnpjLookupLoading ? 'Consultando...' : 'Buscar CNPJ'}
+              </Button>
+            </div>
             <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="E-mail (opcional)" />
             <Input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (opcional)" />
           </div>
@@ -1574,8 +2998,8 @@ function SuperAdminUsersView({
           privilege: u.role === 'ADMIN-USER' ? 'Completo' : 'Profissional',
           allowedTabs:
             u.role === 'ADMIN-USER'
-              ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico']
-              : ['dashboard', 'os', 'tarefas', 'suporte-tecnico'],
+              ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico', 'assistente-contador', 'migracao']
+              : ['dashboard', 'os', 'tarefas', 'suporte-tecnico', 'assistente-contador', 'migracao'],
         }))
     );
   };
@@ -1640,8 +3064,8 @@ function SuperAdminUsersView({
                 role === 'ADMIN-SAAS'
                   ? ['superadmin-dashboard', 'superadmin-companies', 'superadmin-users', 'superadmin-settings']
                   : role === 'ADMIN-USER'
-                  ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico']
-                  : ['dashboard', 'os', 'tarefas', 'suporte-tecnico'],
+                  ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico', 'assistente-contador', 'migracao']
+                  : ['dashboard', 'os', 'tarefas', 'suporte-tecnico', 'assistente-contador', 'migracao'],
             } as AuthUser,
           ];
 
@@ -1897,7 +3321,8 @@ function ServiceOrderDetailsView({
   teamUsers,
   globalCustomers,
   user,
-  company
+  company,
+  printTemplates
 }: { 
   osId: string, 
   onBack: () => void, 
@@ -1908,14 +3333,18 @@ function ServiceOrderDetailsView({
   teamUsers: User[],
   globalCustomers: any[],
   user: User | null,
-  company: Company
+  company: Company,
+  printTemplates: PrintTemplate[]
 }) {
   const os = allOrders.find(o => o.id === osId);
   const [status, setStatus] = useState<OSStatus | string>(os?.status || '');
   const [subStatus, setSubStatus] = useState(os?.subStatus || '');
   const [showPaymentDialog, setShowPaymentDialog] = useState(false);
-  const [isPrintViewOpen, setIsPrintViewOpen] = useState(false);
-  const [printAction, setPrintAction] = useState<'print' | 'pdf' | null>(null);
+  const [showCancelDialog, setShowCancelDialog] = useState(false);
+  const [cancelReason, setCancelReason] = useState('');
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const osPrintAreaRef = useRef<HTMLDivElement | null>(null);
+  const [templateToPrint, setTemplateToPrint] = useState<PrintTemplate | null>(null);
 
   const isOwner = user?.role === 'ADMIN-USER' || user?.role === 'ADMIN-SAAS';
 
@@ -1933,18 +3362,189 @@ function ServiceOrderDetailsView({
 
   const products = allProducts;
 
-  const openPrintView = (action: 'print' | 'pdf') => {
-    setPrintAction(action);
-    setIsPrintViewOpen(true);
-  };
-
   const handlePrint = () => {
-    openPrintView('print');
+    const target = osPrintAreaRef.current;
+    if (!target) {
+      toast.error('Nao foi possivel localizar o layout de impressao.');
+      return;
+    }
+
+    const styles = Array.from(document.querySelectorAll('style, link[rel="stylesheet"]'))
+      .map((node) => node.outerHTML)
+      .join('\n');
+
+    const printHtml = `
+      <!doctype html>
+      <html>
+        <head>
+          <title>${os.number}</title>
+          ${styles}
+          <style>
+            @page { size: A4; margin: 0; }
+            html, body {
+              width: 210mm;
+              min-height: 297mm;
+              margin: 0;
+              padding: 0;
+              background: #ffffff;
+            }
+            body {
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+            #os-print-area {
+              width: 210mm !important;
+              min-height: 297mm !important;
+              margin: 0 auto !important;
+              padding: 12mm !important;
+              box-sizing: border-box !important;
+              background: #ffffff !important;
+              color: #000000 !important;
+              overflow: visible !important;
+            }
+          </style>
+        </head>
+        <body>${target.outerHTML}</body>
+      </html>
+    `;
+
+    const started = printHtmlUsingHiddenFrame(printHtml);
+    if (!started) {
+      toast.error('Nao foi possivel iniciar a impressao nativa do navegador.');
+    }
   };
 
-  const handlePDF = () => {
-    openPrintView('pdf');
+  const resolveTemplateByType = (templates: PrintTemplate[], type: PrintTemplate['type']) => {
+    const filtered = templates.filter((template) => template.type === type);
+    return filtered.find((template) => template.isDefault) || filtered[0] || null;
   };
+
+  const loadTemplatesFromBackend = async () => {
+    try {
+      const response = await axios.get('/api/app-state');
+      const payload = response?.data;
+      return Array.isArray(payload?.printTemplates) ? payload.printTemplates as PrintTemplate[] : [];
+    } catch (error) {
+      console.error('Erro ao carregar templates do backend:', error);
+      return [];
+    }
+  };
+
+  const handleEntryLabelPrint = async () => {
+    const backendTemplates = await loadTemplatesFromBackend();
+    const templatesSource = backendTemplates.length ? backendTemplates : printTemplates;
+    const template = resolveTemplateByType(templatesSource, 'Etiqueta');
+    if (!template) {
+      toast.error('Nenhum layout de etiqueta salvo em Personalizar Impressao.');
+      return;
+    }
+    setTemplateToPrint(template);
+  };
+
+  const handleCupomPrint = async () => {
+    const backendTemplates = await loadTemplatesFromBackend();
+    const templatesSource = backendTemplates.length ? backendTemplates : printTemplates;
+    const template = resolveTemplateByType(templatesSource, 'Cupom');
+    if (!template) {
+      toast.error('Nenhum layout de cupom salvo em Personalizar Impressao.');
+      return;
+    }
+    setTemplateToPrint(template);
+  };
+
+  const handlePDF = async () => {
+    const target = osPrintAreaRef.current;
+    if (!target) {
+      toast.error('Nao foi possivel localizar o layout de impressao.');
+      return;
+    }
+
+    try {
+      setIsGeneratingPdf(true);
+
+      // Use html2canvas cloning step to strip unsupported oklch colors
+      const pdfCloneId = `pdf-clone-${os.id}`;
+      target.setAttribute('data-pdf-clone-id', pdfCloneId);
+
+      const canvas = await html2canvas(target, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        allowTaint: true,
+        onclone: (clonedDoc) => {
+          const clonedTarget = clonedDoc.querySelector(`[data-pdf-clone-id="${pdfCloneId}"]`) as HTMLElement | null;
+          if (!clonedTarget) {
+            return;
+          }
+
+          // Drop stylesheets that use oklch and inline computed styles instead.
+          clonedDoc.querySelectorAll('style, link[rel="stylesheet"]').forEach((node) => node.remove());
+
+          const originalElements = [target, ...Array.from(target.querySelectorAll('*'))];
+          const clonedElements = [clonedTarget, ...Array.from(clonedTarget.querySelectorAll('*'))];
+          const safeFallbacks: Record<string, string> = {
+            color: '#000000',
+            backgroundColor: '#ffffff',
+            borderColor: '#e5e7eb',
+            fill: '#000000',
+            stroke: '#000000',
+          };
+
+          originalElements.forEach((originalEl, index) => {
+            const clonedEl = clonedElements[index] as HTMLElement | undefined;
+            if (!clonedEl) {
+              return;
+            }
+
+            const computed = window.getComputedStyle(originalEl as Element);
+            for (let i = 0; i < computed.length; i += 1) {
+              const prop = computed[i];
+              let val = computed.getPropertyValue(prop);
+              const priority = computed.getPropertyPriority(prop);
+
+              if (val && val.includes('oklch')) {
+                const fallback = safeFallbacks[prop];
+                if (fallback) {
+                  val = fallback;
+                } else {
+                  continue;
+                }
+              }
+
+              if (val) {
+                clonedEl.style.setProperty(prop, val, priority);
+              }
+            }
+          });
+        },
+      });
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const imgHeight = (canvas.height * pageWidth) / canvas.width;
+      const totalPages = Math.max(1, Math.ceil((imgHeight - 1) / pageHeight));
+
+      pdf.addImage(imgData, 'PNG', 0, 0, pageWidth, imgHeight);
+
+      for (let page = 1; page < totalPages; page += 1) {
+        const position = -pageHeight * page;
+        pdf.addPage();
+        pdf.addImage(imgData, 'PNG', 0, position, pageWidth, imgHeight);
+      }
+
+      pdf.save(`os-${os.number}.pdf`);
+      toast.success('PDF baixado com sucesso!');
+    } catch (error) {
+      console.error('Erro ao gerar PDF:', error);
+      toast.error('Falha ao gerar o PDF.');
+    } finally {
+      target.removeAttribute('data-pdf-clone-id');
+      setIsGeneratingPdf(false);
+    }
+  };
+
+
 
   const handleEdit = () => {
     setIsUpdating(true);
@@ -1962,6 +3562,27 @@ function ServiceOrderDetailsView({
     setAllOrders(prev => prev.map(o => o.id === osId ? { ...o, status: 'Finalizada' as OSStatus, updatedAt: new Date().toISOString() } : o));
     setStatus('Finalizada');
     toast.success('Conferência realizada! OS Finalizada com sucesso.');
+  };
+
+  const handleConfirmCancel = () => {
+    if (!cancelReason.trim()) {
+      toast.error('Informe o motivo do cancelamento.');
+      return;
+    }
+    const now = new Date().toISOString();
+    setAllOrders(prev => prev.map(o => o.id === osId ? {
+      ...o,
+      status: 'Cancelada' as OSStatus,
+      subStatus: '',
+      cancellationReason: cancelReason.trim(),
+      cancellationDate: now,
+      updatedAt: now,
+    } : o));
+    setStatus('Cancelada');
+    setShowCancelDialog(false);
+    setCancelReason('');
+    setIsUpdating(false);
+    toast.success('OS cancelada com sucesso.');
   };
 
   if (!os) {
@@ -2057,7 +3678,13 @@ function ServiceOrderDetailsView({
             <Settings className="w-4 h-4" /> Atualizar OS
           </Button>
           <Button variant="outline" size="sm" className="gap-2" onClick={handlePrint}>
-            <Printer className="w-4 h-4" /> Imprimir
+            <Printer className="w-4 h-4" /> Imprimir A4
+          </Button>
+          <Button variant="outline" size="sm" className="gap-2" onClick={handleEntryLabelPrint}>
+            <Tag className="w-4 h-4" /> Imprimir Etiqueta Entrada
+          </Button>
+          <Button variant="outline" size="sm" className="gap-2" onClick={handleCupomPrint}>
+            <Receipt className="w-4 h-4" /> Cupom Nao Fiscal (Status Atual)
           </Button>
           <Button variant="outline" size="sm" className="gap-2" onClick={handlePDF}>
             <FileText className="w-4 h-4" /> PDF
@@ -2221,11 +3848,18 @@ function ServiceOrderDetailsView({
                         />
                       </div>
                       <Button onClick={() => {
+                        if (status === 'Cancelada') {
+                          setShowCancelDialog(true);
+                          return;
+                        }
+                        const now = new Date().toISOString();
                         setAllOrders(prev => prev.map(o => o.id === osId ? {
                           ...o,
                           status: status as OSStatus,
                           subStatus: subStatus,
-                          updatedAt: new Date().toISOString()
+                          cancellationReason: undefined,
+                          cancellationDate: undefined,
+                          updatedAt: now,
                         } : o));
                         toast.success('Status e Sub-status atualizados com sucesso!');
                         setIsUpdating(false);
@@ -2504,6 +4138,36 @@ function ServiceOrderDetailsView({
             </DialogContent>
           </Dialog>
 
+          <Dialog open={showCancelDialog} onOpenChange={(open) => {
+            setShowCancelDialog(open);
+            if (!open) {
+              setCancelReason('');
+              if (os.status !== 'Cancelada' && status === 'Cancelada') {
+                setStatus(os.status);
+              }
+            }
+          }}>
+            <DialogContent className="max-w-md">
+              <DialogHeader>
+                <DialogTitle>Cancelar Ordem de Serviço</DialogTitle>
+                <DialogDescription>Informe o motivo do cancelamento para análise no dashboard.</DialogDescription>
+              </DialogHeader>
+              <div className="space-y-2 py-2">
+                <Label>Motivo do Cancelamento</Label>
+                <textarea
+                  className="flex min-h-[90px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="Descreva o motivo do cancelamento..."
+                  value={cancelReason}
+                  onChange={(e) => setCancelReason(e.target.value)}
+                />
+              </div>
+              <DialogFooter>
+                <Button variant="ghost" onClick={() => setShowCancelDialog(false)}>Voltar</Button>
+                <Button variant="destructive" onClick={handleConfirmCancel}>Confirmar Cancelamento</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+
           {/* Ações Rápidas */}
           <Card className="border-none shadow-sm">
             <CardHeader className="pb-2">
@@ -2520,6 +4184,21 @@ function ServiceOrderDetailsView({
           </Card>
         </div>
       </div>
+
+      <div className="hidden">
+        <OSPrintContentForRef ref={osPrintAreaRef} os={os} company={company} customer={customerRecord} />
+      </div>
+
+      {templateToPrint && (
+        <DynamicPrintView
+          template={templateToPrint}
+          data={os}
+          company={company}
+          onClose={() => setTemplateToPrint(null)}
+        />
+      )}
+
+
     </div>
   );
 }
@@ -2562,8 +4241,8 @@ function TechnicianDashboardView({
   ].filter(item => item.value > 0);
 
   const productivityData = [
-    { name: 'Equipe', abertas: allOrders.filter(o => o.status === 'Aberta').length, concluídas: allOrders.filter(o => o.status === 'Finalizada').length },
-    { name: 'Minhas', abertas: openOrders.length, concluídas: monthDone },
+    { name: 'Equipe', abertas: allOrders.filter(o => o.status === 'Aberta').length, concluidas: allOrders.filter(o => o.status === 'Finalizada').length },
+    { name: 'Minhas', abertas: openOrders.length, concluidas: monthDone },
   ];
 
   return (
@@ -2594,7 +4273,7 @@ function TechnicianDashboardView({
                 <YAxis axisLine={false} tickLine={false} />
                 <Tooltip />
                 <Legend verticalAlign="bottom" height={36} />
-                <Bar dataKey="concluídas" fill="#10b981" radius={[4, 4, 0, 0]} name="Concluídas" />
+                <Bar dataKey="concluidas" fill="#10b981" radius={[4, 4, 0, 0]} name="Concluídas" />
                 <Bar dataKey="abertas" fill="#3b82f6" radius={[4, 4, 0, 0]} name="Novas" />
               </BarChart>
             </ResponsiveContainer>
@@ -3006,6 +4685,24 @@ function DashboardView({
     .sort((a, b) => a.sortValue - b.sortValue)
     .slice(0, 5);
 
+  const canceledOrders = allOrders.filter((order) => order.status === 'Cancelada');
+  const canceledThisMonth = canceledOrders.filter((order) => {
+    const parsed = parseRecordDate(order.cancellationDate || order.updatedAt || order.createdAt);
+    if (!parsed) return false;
+    const now = new Date();
+    return parsed.getMonth() === now.getMonth() && parsed.getFullYear() === now.getFullYear();
+  }).length;
+
+  const cancelReasonSummary = Object.entries(
+    canceledOrders.reduce((acc, order) => {
+      const reason = (order.cancellationReason || 'Sem motivo informado').trim();
+      acc[reason] = (acc[reason] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>)
+  )
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
   useEffect(() => {
     if (reminders.length > 0 && !hasPlayedAlert) {
       const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
@@ -3112,6 +4809,27 @@ function DashboardView({
         <StatCard title="Vendas Hoje" value={todaySalesCount.toString()} icon={ShoppingCart} trend={todaySalesCount > 0 ? todaySalesCount : 0} color="bg-indigo-500" description="Quantidade de vendas registradas hoje no banco de dados." />
         <StatCard title="Estoque Baixo" value={lowStockCount.toString()} icon={Package} color="bg-rose-500" description="Produtos com quantidade abaixo do limite mínimo." />
       </div>
+
+      <Card className="border-none shadow-sm">
+        <CardHeader>
+          <CardTitle>Motivos de Cancelamento</CardTitle>
+          <CardDescription>{canceledOrders.length} canceladas no total • {canceledThisMonth} neste mês</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {cancelReasonSummary.length > 0 ? (
+            <div className="space-y-2">
+              {cancelReasonSummary.map(([reason, count]) => (
+                <div key={reason} className="flex items-center justify-between text-sm">
+                  <span className="truncate">{reason}</span>
+                  <Badge variant="outline" className="text-[10px]">{count}</Badge>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">Nenhuma OS cancelada registrada.</p>
+          )}
+        </CardContent>
+      </Card>
 
       <div className="grid gap-4 lg:grid-cols-7">
         <Card className="lg:col-span-4 border-none shadow-sm">
@@ -3352,9 +5070,71 @@ function OSPrintView({
 }) {
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
   const autoTriggered = useRef(false);
+  const printPreviewHostRef = useRef<HTMLDivElement | null>(null);
+  const printPreviewAreaRef = useRef<HTMLDivElement | null>(null);
+  const [printPreviewScale, setPrintPreviewScale] = useState(1);
+  const [printPreviewAreaSize, setPrintPreviewAreaSize] = useState({ width: 0, height: 0 });
+  const orderTotalValue = getOrderTotalValue(os);
+  const pixPayload = buildPixPayload({
+    key: company.pixKey || '',
+    keyType: company.pixKeyType,
+    amount: orderTotalValue,
+    merchantName: company.name || company.razaoSocial || 'TechManager',
+    merchantCity: company.address || 'Sao Paulo',
+    txid: os.number.replace(/[^A-Za-z0-9]/g, '').slice(0, 25) || '***',
+  });
+  const pixQrCodeUrl = pixPayload ? buildQrCodeImageUrl(pixPayload, 180) : '';
 
   const handlePrint = () => {
-    window.print();
+    const target = document.getElementById('os-print-area');
+    if (!target) {
+      toast.error('Nao foi possivel localizar o layout de impressao.');
+      return;
+    }
+
+    const styles = Array.from(document.querySelectorAll('style, link[rel="stylesheet"]'))
+      .map((node) => node.outerHTML)
+      .join('\n');
+
+    const printHtml = `
+      <!doctype html>
+      <html>
+        <head>
+          <title>${os.number}</title>
+          ${styles}
+          <style>
+            @page { size: A4; margin: 0; }
+            html, body {
+              width: 210mm;
+              min-height: 297mm;
+              margin: 0;
+              padding: 0;
+              background: #ffffff;
+            }
+            body {
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+            #os-print-area {
+              width: 210mm !important;
+              min-height: 297mm !important;
+              margin: 0 auto !important;
+              padding: 12mm !important;
+              box-sizing: border-box !important;
+              background: #ffffff !important;
+              color: #000000 !important;
+              overflow: visible !important;
+            }
+          </style>
+        </head>
+        <body>${target.outerHTML}</body>
+      </html>
+    `;
+
+    const started = printHtmlUsingHiddenFrame(printHtml);
+    if (!started) {
+      toast.error('Nao foi possivel iniciar a impressao nativa do navegador.');
+    }
   };
 
   const handleDownloadPDF = async () => {
@@ -3366,16 +5146,29 @@ function OSPrintView({
 
     try {
       setIsGeneratingPdf(true);
-      const canvas = await html2canvas(target, { scale: 2, useCORS: true });
-      const imgData = canvas.toDataURL('image/png');
-      const orientation = canvas.width > canvas.height ? 'l' : 'p';
-      const pdf = new jsPDF({
-        orientation,
-        unit: 'px',
-        format: [canvas.width, canvas.height],
+      const canvas = await html2canvas(target, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
       });
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const imgHeight = (canvas.height * pageWidth) / canvas.width;
+      let remainingHeight = imgHeight;
+      let position = 0;
 
-      pdf.addImage(imgData, 'PNG', 0, 0, canvas.width, canvas.height);
+      pdf.addImage(imgData, 'PNG', 0, position, pageWidth, imgHeight);
+      remainingHeight -= pageHeight;
+
+      while (remainingHeight > 0) {
+        position -= pageHeight;
+        pdf.addPage();
+        pdf.addImage(imgData, 'PNG', 0, position, pageWidth, imgHeight);
+        remainingHeight -= pageHeight;
+      }
+
       pdf.save(`os-${os.number}.pdf`);
       toast.success('PDF baixado com sucesso!');
     } catch (error) {
@@ -3398,20 +5191,61 @@ function OSPrintView({
     }
   }, [autoAction]);
 
+  useEffect(() => {
+    const updateScale = () => {
+      const hostWidth = printPreviewHostRef.current?.clientWidth || 0;
+      const hostHeight = printPreviewHostRef.current?.clientHeight || 0;
+      const contentWidth = printPreviewAreaRef.current?.scrollWidth || 0;
+      const contentHeight = printPreviewAreaRef.current?.scrollHeight || 0;
+      if (!hostWidth || !hostHeight || !contentWidth || !contentHeight) return;
+
+      const nextScale = Math.min(
+        1,
+        Math.max(
+          0.25,
+          Math.min((hostWidth - 24) / contentWidth, (hostHeight - 24) / contentHeight)
+        )
+      );
+
+      setPrintPreviewAreaSize({ width: contentWidth, height: contentHeight });
+      setPrintPreviewScale(nextScale);
+    };
+
+    updateScale();
+    const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(updateScale) : null;
+    if (observer && printPreviewHostRef.current) {
+      observer.observe(printPreviewHostRef.current);
+    }
+    if (observer && printPreviewAreaRef.current) {
+      observer.observe(printPreviewAreaRef.current);
+    }
+    window.addEventListener('resize', updateScale);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', updateScale);
+    };
+  }, [company.osCopiesPerPage, os.id, os.items?.length, os.diagnosis, os.defect]);
+
   const OSContent = () => (
-    <div className="p-4 md:p-8 print:p-0 bg-white text-black font-sans">
+    <div className="bg-white text-black font-sans">
       {/* Header */}
-      <div className="flex flex-col md:flex-row justify-between items-start gap-4 border-b-2 border-black pb-6 mb-6">
+      <div className="flex flex-row justify-between items-start gap-4 border-b-2 border-black pb-6 mb-6">
         <div className="flex gap-4 items-center">
-          <div className="w-12 h-12 md:w-16 md:h-16 bg-black text-white rounded-lg flex items-center justify-center text-xl font-bold shrink-0">TM</div>
+          <div className="w-16 h-16 bg-black text-white rounded-lg flex items-center justify-center text-xl font-bold shrink-0 overflow-hidden">
+            {company.logo ? (
+              <img src={company.logo} alt={company.name || 'Logo'} className="w-full h-full object-contain bg-white" />
+            ) : (
+              'TM'
+            )}
+          </div>
           <div>
-            <h1 className="text-xl md:text-2xl font-black uppercase tracking-tight">{company.name}</h1>
-            <p className="text-[10px] md:text-xs uppercase font-bold text-gray-600">{company.address}</p>
-            <p className="text-[10px] md:text-xs font-bold text-gray-600">{company.cnpj} • {company.phone}</p>
+            <h1 className="text-2xl font-black uppercase tracking-tight">{company.name}</h1>
+            <p className="text-xs uppercase font-bold text-gray-600">{company.address}</p>
+            <p className="text-xs font-bold text-gray-600">{company.cnpj} • {company.phone}</p>
           </div>
         </div>
-        <div className="text-left md:text-right shrink-0 w-full md:w-auto">
-          <div className="bg-black text-white px-4 py-2 rounded-md mb-2 inline-block md:block w-full md:w-auto">
+        <div className="text-right shrink-0 w-auto">
+          <div className="bg-black text-white px-4 py-2 rounded-md mb-2 block w-auto">
             <p className="text-[10px] font-bold uppercase tracking-widest whitespace-nowrap">Ordem de Serviço</p>
             <p className="text-xl font-black">{os.number}</p>
           </div>
@@ -3420,15 +5254,15 @@ function OSPrintView({
       </div>
 
       {/* Customer & Equipment */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-8 mb-8">
-        <div className="space-y-2 md:space-y-4">
+      <div className="grid grid-cols-2 gap-8 mb-8">
+        <div className="space-y-4">
           <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-gray-200 pb-1">Dados do Cliente</h3>
           <div>
             <p className="text-sm font-black">{os.customerName}</p>
             <p className="text-xs text-gray-600">Cliente registrado por nome</p>
           </div>
         </div>
-        <div className="space-y-2 md:space-y-4">
+        <div className="space-y-4">
           <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-gray-200 pb-1">Equipamento</h3>
           <div>
             <p className="text-sm font-black">{os.equipment}</p>
@@ -3453,24 +5287,24 @@ function OSPrintView({
       </div>
 
       {/* Status & Priority */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4 mb-8">
-        <div className="border p-2 md:p-3 rounded-lg text-center">
+      <div className="grid grid-cols-4 gap-4 mb-8">
+        <div className="border p-3 rounded-lg text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Status</p>
-          <p className="text-xs md:text-sm font-black">{os.status}</p>
+          <p className="text-sm font-black">{os.status}</p>
         </div>
-        <div className="border p-2 md:p-3 rounded-lg text-center">
+        <div className="border p-3 rounded-lg text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prioridade</p>
-          <p className="text-xs md:text-sm font-black">{os.priority}</p>
+          <p className="text-sm font-black">{os.priority}</p>
         </div>
-        <div className="border p-2 md:p-3 rounded-lg text-center">
+        <div className="border p-3 rounded-lg text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prazo Diag.</p>
-          <p className="text-xs md:text-sm font-black">
+          <p className="text-sm font-black">
             {os.diagnosisDeadline ? format(new Date(os.diagnosisDeadline), 'dd/MM/yyyy') : '--/--/----'}
           </p>
         </div>
-        <div className="border p-2 md:p-3 rounded-lg text-center">
+        <div className="border p-3 rounded-lg text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prazo Entrega</p>
-          <p className="text-xs md:text-sm font-black">
+          <p className="text-sm font-black">
             {os.completionDeadline ? format(new Date(os.completionDeadline), 'dd/MM/yyyy') : '--/--/----'}
           </p>
         </div>
@@ -3478,7 +5312,7 @@ function OSPrintView({
 
       {/* Items / Parts / Services */}
       <div className="mb-8 border rounded-xl overflow-x-auto">
-        <table className="w-full text-sm min-w-[600px] md:min-w-full">
+        <table className="w-full text-sm min-w-full">
           <thead className="bg-gray-100 border-b">
             <tr>
               <th className="px-4 py-2 text-left text-[10px] uppercase font-black">Descrição</th>
@@ -3508,11 +5342,26 @@ function OSPrintView({
           <tfoot className="bg-gray-50 font-black">
             <tr>
               <td colSpan={4} className="px-4 py-3 text-right uppercase tracking-widest text-xs">Valor Total da OS:</td>
-              <td className="px-4 py-3 text-right text-lg">R$ {os.value.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</td>
+              <td className="px-4 py-3 text-right text-lg">R$ {orderTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</td>
             </tr>
           </tfoot>
         </table>
       </div>
+
+      {pixPayload && (
+        <div className="mb-8 border rounded-xl p-4">
+          <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-gray-200 pb-1">Pagamento PIX</h3>
+          <div className="mt-3 flex items-center gap-4">
+            <img src={pixQrCodeUrl} alt="QRCode PIX" className="w-[150px] h-[150px] border" />
+            <div className="text-xs flex-1">
+              <p className="font-bold">Valor para pagamento: R$ {orderTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
+              <p className="mt-1 text-[10px] uppercase font-bold">Chave ({company.pixKeyType || 'PIX'}): {company.pixKey}</p>
+              <p className="mt-2 text-[10px] uppercase font-bold">Copia e Cola PIX:</p>
+              <p className="mt-1 break-all font-mono text-[9px]">{pixPayload}</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Terms & Signatures */}
       <div className="grid grid-cols-2 gap-12 mt-12">
@@ -3543,20 +5392,37 @@ function OSPrintView({
 
   return (
     <Dialog open={!!os} onOpenChange={() => onClose()}>
-      <DialogContent className="max-w-[850px] w-[95vw] max-h-[95vh] overflow-y-auto p-0 border-none bg-white">
-        <div id="os-print-area">
-          <OSContent />
-          
-          {company.osCopiesPerPage === 2 && (
-            <>
-              <div className="border-y-2 border-dashed border-gray-300 my-8 py-4 text-center print:my-4 print:py-2">
-                <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2">
-                  <Scissors className="w-3 h-3" /> Cortar aqui - Via do {company.name} / Via do Cliente
-                </p>
+      <DialogContent className="w-[98vw] max-w-[1200px] max-h-[98vh] overflow-hidden p-0 border-none bg-gray-100">
+        <div ref={printPreviewHostRef} className="h-[calc(98vh-88px)] overflow-auto p-4">
+          <div
+            className="mx-auto"
+            style={{
+              width: `${(printPreviewAreaSize.width || 794) * printPreviewScale}px`,
+              minHeight: `${(printPreviewAreaSize.height || 1123) * printPreviewScale}px`,
+            }}
+          >
+            <div style={{ transform: `scale(${printPreviewScale})`, transformOrigin: 'top left' }}>
+              <div
+                id="os-print-area"
+                ref={printPreviewAreaRef}
+                className="mx-auto bg-white text-black shadow-sm"
+                style={{ width: '210mm', minHeight: '297mm', padding: '12mm', boxSizing: 'border-box' }}
+              >
+                <OSContent />
+
+                {company.osCopiesPerPage === 2 && (
+                  <>
+                    <div className="border-y-2 border-dashed border-gray-300 my-8 py-4 text-center print:my-4 print:py-2">
+                      <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2">
+                        <Scissors className="w-3 h-3" /> Cortar aqui - Via do {company.name} / Via do Cliente
+                      </p>
+                    </div>
+                    <OSContent />
+                  </>
+                )}
               </div>
-              <OSContent />
-            </>
-          )}
+            </div>
+          </div>
         </div>
 
         <div className="p-4 bg-gray-100 border-t flex justify-end gap-2 print:hidden">
@@ -3604,6 +5470,7 @@ function OSListView({
   user,
   equipmentTypes,
   globalCustomers,
+  setGlobalCustomers,
   setAllOrders,
   printTemplates,
   company
@@ -3615,6 +5482,7 @@ function OSListView({
   user: User | null,
   equipmentTypes: EquipmentType[],
   globalCustomers: Array<{ id: string; name: string; doc?: string; phone?: string; email?: string }>,
+  setGlobalCustomers: React.Dispatch<React.SetStateAction<any[]>>,
   setAllOrders: React.Dispatch<React.SetStateAction<ServiceOrder[]>>,
   printTemplates: PrintTemplate[],
   company: Company
@@ -3623,6 +5491,23 @@ function OSListView({
   const [isNewCustomerOpen, setIsNewCustomerOpen] = useState(false);
   const [customerSearch, setCustomerSearch] = useState('');
   const [selectedCustomerId, setSelectedCustomerId] = useState('');
+  const [quickCustomer, setQuickCustomer] = useState({
+    name: '',
+    doc: '',
+    ie: '',
+    email: '',
+    phone: '',
+    zip: '',
+    street: '',
+    number: '',
+    complement: '',
+    neighborhood: '',
+    city: '',
+    state: 'SP'
+  });
+  const [isQuickCustomerCepLookupLoading, setIsQuickCustomerCepLookupLoading] = useState(false);
+  const lastQuickCustomerCepLookupRef = useRef('');
+  const [newOSTechnicianId, setNewOSTechnicianId] = useState('');
   const [showCustomerResults, setShowCustomerResults] = useState(false);
   const [showPostSavePrintDialog, setShowPostSavePrintDialog] = useState(false);
   const [lastCreatedOS, setLastCreatedOS] = useState<ServiceOrder | null>(null);
@@ -3631,13 +5516,59 @@ function OSListView({
     entry: true,
     warranty: false
   });
-  const [osSearch, setOsSearch] = useState('');
+  const [availablePrinters, setAvailablePrinters] = useState<string[]>([]);
+  const [isLoadingPrinters, setIsLoadingPrinters] = useState(false);
+  const [isDirectPrinting, setIsDirectPrinting] = useState(false);
+  const [directPrintTargets, setDirectPrintTargets] = useState({
+    label: '',
+    entry: '',
+    warranty: '',
+  });
+  const [filterField, setFilterField] = useState<'status' | 'nome' | 'data' | 'os' | 'equipamento' | 'marca' | 'modelo'>('nome');
+  const [filterQuery, setFilterQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('todos');
+  const [isCancelDialogOpen, setIsCancelDialogOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState('');
+  const [cancelTargetId, setCancelTargetId] = useState<string | null>(null);
   const [selectedOSForA4Print, setSelectedOSForA4Print] = useState<ServiceOrder | null>(null);
+  const [selectedOSForA4Action, setSelectedOSForA4Action] = useState<'print' | 'pdf' | null>(null);
   const [selectedOSForTemplatePrint, setSelectedOSForTemplatePrint] = useState<ServiceOrder | null>(null);
   const [isPrintTemplateDialogOpen, setIsPrintTemplateDialogOpen] = useState(false);
   const [isTemplatePreviewOpen, setIsTemplatePreviewOpen] = useState(false);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
+  const directA4PrintRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!showPostSavePrintDialog) return;
+    let cancelled = false;
+
+    const loadPrinters = async () => {
+      try {
+        setIsLoadingPrinters(true);
+        const response = await axios.get('/api/system/printers');
+        const printers = Array.isArray(response.data?.printers) ? response.data.printers as string[] : [];
+        if (cancelled) return;
+        setAvailablePrinters(printers);
+        setDirectPrintTargets((prev) => ({
+          label: prev.label || printers[0] || '',
+          entry: prev.entry || printers[0] || '',
+          warranty: prev.warranty || printers[0] || '',
+        }));
+      } catch {
+        if (!cancelled) {
+          setAvailablePrinters([]);
+          toast.error('Não foi possível carregar as impressoras do sistema.');
+        }
+      } finally {
+        if (!cancelled) setIsLoadingPrinters(false);
+      }
+    };
+
+    loadPrinters();
+    return () => {
+      cancelled = true;
+    };
+  }, [showPostSavePrintDialog]);
 
   const handleTemplatePrint = (os: ServiceOrder) => {
     if (printTemplates.length === 0) {
@@ -3650,6 +5581,104 @@ function OSListView({
     setIsPrintTemplateDialogOpen(true);
   };
 
+  const handleEntryLabelPrint = (os: ServiceOrder) => {
+    const labelTemplates = printTemplates.filter((template) => template.type === 'Etiqueta');
+    const template =
+      labelTemplates.find((item) => item.isDefault) ||
+      labelTemplates.find((item) => /entrada|o\.?s|ordem/i.test(item.name || '')) ||
+      labelTemplates[0];
+
+    if (!template) {
+      toast.error('Nenhum layout de etiqueta salvo em Personalizar Impressão.');
+      return;
+    }
+
+    setSelectedOSForTemplatePrint(os);
+    setSelectedTemplateId(template.id);
+    setIsPrintTemplateDialogOpen(false);
+    setIsTemplatePreviewOpen(true);
+  };
+
+  const handleA4Print = (os: ServiceOrder) => {
+    setSelectedOSForA4Action('print');
+    setSelectedOSForA4Print(os);
+  };
+
+  const handleA4Pdf = (os: ServiceOrder) => {
+    setSelectedOSForA4Action('pdf');
+    setSelectedOSForA4Print(os);
+  };
+
+  const parseOrderDate = (value?: string) => {
+    if (!value) return null;
+    const direct = new Date(value);
+    if (!Number.isNaN(direct.getTime())) return direct;
+    if (value.includes('/')) {
+      const [day, month, year] = value.split('/').map(Number);
+      if (!day || !month || !year) return null;
+      return new Date(year, month - 1, day);
+    }
+    return null;
+  };
+
+  const openCancelDialog = (osId: string) => {
+    setCancelTargetId(osId);
+    setCancelReason('');
+    setIsCancelDialogOpen(true);
+  };
+
+  const confirmCancel = () => {
+    if (!cancelTargetId) return;
+    if (!cancelReason.trim()) {
+      toast.error('Informe o motivo do cancelamento.');
+      return;
+    }
+    const now = new Date().toISOString();
+    setAllOrders((prev) => prev.map((order) =>
+      order.id === cancelTargetId
+        ? {
+            ...order,
+            status: 'Cancelada',
+            subStatus: '',
+            cancellationReason: cancelReason.trim(),
+            cancellationDate: now,
+            updatedAt: now,
+          }
+        : order
+    ));
+    setIsCancelDialogOpen(false);
+    setCancelTargetId(null);
+    setCancelReason('');
+    toast.success('OS cancelada com sucesso.');
+  };
+
+  const handleStatusChange = (osId: string, nextStatus: OSStatus) => {
+    if (nextStatus === 'Cancelada') {
+      openCancelDialog(osId);
+      return;
+    }
+    const now = new Date().toISOString();
+    setAllOrders((prev) => prev.map((order) =>
+      order.id === osId
+        ? {
+            ...order,
+            status: nextStatus,
+            subStatus: '',
+            cancellationReason: undefined,
+            cancellationDate: undefined,
+            updatedAt: now,
+          }
+        : order
+    ));
+    toast.success(`Status atualizado para ${nextStatus}.`);
+  };
+
+  const handleDeleteOrder = (osId: string) => {
+    if (!confirm('Tem certeza que deseja apagar esta OS?')) return;
+    setAllOrders((prev) => prev.filter((order) => order.id !== osId));
+    toast.success('OS apagada com sucesso.');
+  };
+
   const selectedTemplate = useMemo(
     () => printTemplates.find(t => t.id === selectedTemplateId) || null,
     [printTemplates, selectedTemplateId]
@@ -3659,11 +5688,110 @@ function OSListView({
   const [newItemPrice, setNewItemPrice] = useState('0');
   const [newItemQty, setNewItemQty] = useState('1');
   const [newItemType, setNewItemType] = useState<'Produto' | 'Serviço'>('Serviço');
+  const [newOSEquipmentTypeId, setNewOSEquipmentTypeId] = useState('');
+  const [newOSEquipment, setNewOSEquipment] = useState('');
+  const [newOSBrand, setNewOSBrand] = useState('');
+  const [newOSModel, setNewOSModel] = useState('');
+  const [isServiceSuggestionOpen, setIsServiceSuggestionOpen] = useState(false);
+
+  const normalizeUpperText = (value: string) => String(value || '').trim().toUpperCase();
+
+  const brandSuggestions = useMemo(() => {
+    const equipmentQuery = normalizeUpperText(newOSEquipment);
+    const brandQuery = normalizeUpperText(newOSBrand);
+    const unique = new Set<string>();
+
+    allOrders.forEach((order) => {
+      const orderEquipment = normalizeUpperText(order.equipment);
+      const orderBrand = normalizeUpperText(order.brand);
+      if (!orderBrand) return;
+      if (equipmentQuery && !fuzzyMatch(orderEquipment, equipmentQuery)) return;
+      if (brandQuery && !fuzzyMatch(orderBrand, brandQuery)) return;
+      unique.add(orderBrand);
+    });
+
+    return Array.from(unique).sort((a, b) => a.localeCompare(b)).slice(0, 20);
+  }, [allOrders, newOSEquipment, newOSBrand]);
+
+  const modelSuggestions = useMemo(() => {
+    const equipmentQuery = normalizeUpperText(newOSEquipment);
+    const brandQuery = normalizeUpperText(newOSBrand);
+    const modelQuery = normalizeUpperText(newOSModel);
+    const unique = new Set<string>();
+
+    allOrders.forEach((order) => {
+      const orderEquipment = normalizeUpperText(order.equipment);
+      const orderBrand = normalizeUpperText(order.brand);
+      const orderModel = normalizeUpperText(order.model);
+      if (!orderModel) return;
+      if (equipmentQuery && !fuzzyMatch(orderEquipment, equipmentQuery)) return;
+      if (brandQuery && !fuzzyMatch(orderBrand, brandQuery)) return;
+      if (modelQuery && !fuzzyMatch(orderModel, modelQuery)) return;
+      unique.add(orderModel);
+    });
+
+    return Array.from(unique).sort((a, b) => a.localeCompare(b)).slice(0, 20);
+  }, [allOrders, newOSEquipment, newOSBrand, newOSModel]);
+
+  const serviceSuggestions = useMemo(() => {
+    const equipmentQuery = normalizeUpperText(newOSEquipment);
+    const brandQuery = normalizeUpperText(newOSBrand);
+    const modelQuery = normalizeUpperText(newOSModel);
+    const descriptionQuery = normalizeUpperText(newItemDesc);
+
+    if (!equipmentQuery && !brandQuery && !modelQuery) return [];
+
+    const map = new Map<string, { description: string; unitPrice: number; occurrences: number; lastUsedAt: string }>();
+
+    allOrders.forEach((order) => {
+      const orderEquipment = normalizeUpperText(order.equipment);
+      const orderBrand = normalizeUpperText(order.brand);
+      const orderModel = normalizeUpperText(order.model);
+      if (equipmentQuery && !fuzzyMatch(orderEquipment, equipmentQuery)) return;
+      if (brandQuery && !fuzzyMatch(orderBrand, brandQuery)) return;
+      if (modelQuery && !fuzzyMatch(orderModel, modelQuery)) return;
+
+      (order.items || []).forEach((item) => {
+        if (item.type !== 'Serviço') return;
+        const description = String(item.description || '').trim();
+        if (!description) return;
+        if (descriptionQuery && !fuzzyMatch(description, descriptionQuery)) return;
+
+        const key = normalizeUpperText(description);
+        const current = map.get(key);
+        const itemDate = order.updatedAt || order.createdAt || '';
+        const itemUnitPrice = Number(item.unitPrice) || 0;
+
+        if (!current) {
+          map.set(key, {
+            description,
+            unitPrice: itemUnitPrice,
+            occurrences: 1,
+            lastUsedAt: itemDate,
+          });
+          return;
+        }
+
+        const currentDateMs = current.lastUsedAt ? new Date(current.lastUsedAt).getTime() : 0;
+        const itemDateMs = itemDate ? new Date(itemDate).getTime() : 0;
+        map.set(key, {
+          description: current.description,
+          unitPrice: itemDateMs >= currentDateMs ? itemUnitPrice : current.unitPrice,
+          occurrences: current.occurrences + 1,
+          lastUsedAt: itemDateMs >= currentDateMs ? itemDate : current.lastUsedAt,
+        });
+      });
+    });
+
+    return Array.from(map.values())
+      .sort((a, b) => (b.occurrences - a.occurrences) || (new Date(b.lastUsedAt).getTime() - new Date(a.lastUsedAt).getTime()))
+      .slice(0, 8);
+  }, [allOrders, newOSEquipment, newOSBrand, newOSModel, newItemDesc]);
 
   const addItem = () => {
     if (!newItemDesc.trim()) return;
-    const price = parseFloat(newItemPrice);
-    const qty = parseInt(newItemQty);
+    const price = Number.parseFloat(newItemPrice) || 0;
+    const qty = Math.max(1, Number.parseInt(newItemQty, 10) || 1);
     const item: OSItem = {
       id: Math.random().toString(36).substr(2, 9),
       description: newItemDesc,
@@ -3692,14 +5820,34 @@ function OSListView({
   );
 
   const filteredOrders = allOrders.filter(os => {
-    const matchesSearch = 
-      fuzzyMatch(os.customerName, osSearch) ||
-      fuzzyMatch(os.equipment, osSearch) ||
-      os.number.toLowerCase().includes(osSearch.toLowerCase()) ||
-      fuzzyMatch(os.brand, osSearch) ||
-      fuzzyMatch(os.model, osSearch);
-    
-    const matchesStatus = statusFilter === 'todos' || os.status === statusFilter;
+    const normalizedQuery = filterQuery.trim();
+    const matchesText = (() => {
+      if (!normalizedQuery) return true;
+      switch (filterField) {
+        case 'nome':
+          return fuzzyMatch(os.customerName, normalizedQuery);
+        case 'os':
+          return os.number.toLowerCase().includes(normalizedQuery.toLowerCase());
+        case 'equipamento':
+          return fuzzyMatch(os.equipment, normalizedQuery);
+        case 'marca':
+          return fuzzyMatch(os.brand, normalizedQuery);
+        case 'modelo':
+          return fuzzyMatch(os.model, normalizedQuery);
+        case 'data': {
+          const filterDate = parseOrderDate(normalizedQuery);
+          const createdAt = parseOrderDate(os.createdAt || os.updatedAt);
+          if (!filterDate || !createdAt) return false;
+          return isSameDay(filterDate, createdAt);
+        }
+        default:
+          return true;
+      }
+    })();
+
+    const matchesStatus = filterField === 'status'
+      ? (statusFilter === 'todos' || os.status === statusFilter)
+      : true;
 
     // Filtro por equipamento permitido para técnicos
     const isTech = user?.role === 'USUARIO';
@@ -3709,7 +5857,7 @@ function OSListView({
     
     const matchesEquipPerm = !isTech || allowedEquipmentNames.includes(os.equipment.toLowerCase());
     
-    return matchesSearch && matchesStatus && matchesEquipPerm;
+    return matchesText && matchesStatus && matchesEquipPerm;
   });
 
   const sortedOrders = useMemo(() => {
@@ -3733,9 +5881,12 @@ function OSListView({
   const handleSaveOS = (e: any) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
-    const eqTypeId = formData.get('equipmentType') as string;
-    const equipment = formData.get('equipment') as string;
+    const eqTypeId = newOSEquipmentTypeId || (formData.get('equipmentType') as string);
+    const equipment = normalizeUpperText(newOSEquipment || (formData.get('equipment') as string));
+    const brand = normalizeUpperText(newOSBrand || (formData.get('brand') as string));
+    const model = normalizeUpperText(newOSModel || (formData.get('model') as string));
     const eqType = equipmentTypes.find(et => et.id === eqTypeId);
+    const selectedTechnician = teamUsers.find(u => u.id === newOSTechnicianId);
 
     const now = new Date();
     const diagDays = eqType?.defaultDiagnosisDays || 1;
@@ -3743,6 +5894,10 @@ function OSListView({
     const customerName = customerSearch.trim();
     if (!customerName) {
       toast.error('Informe o nome do cliente para continuar.');
+      return;
+    }
+    if (!equipment) {
+      toast.error('Selecione o equipamento para continuar.');
       return;
     }
     const exactCustomer = selectedCustomerId
@@ -3757,21 +5912,21 @@ function OSListView({
       number: `OS-${new Date().getFullYear()}-${(allOrders.length + 1).toString().padStart(3, '0')}`,
       customerId: exactCustomer?.id || `manual-${Date.now()}`,
       customerName,
-      equipment: (equipment || '').toUpperCase(),
-      brand: (formData.get('brand') as string || '').toUpperCase(),
-      model: (formData.get('model') as string || '').toUpperCase(),
+      equipment,
+      brand,
+      model,
       serialNumber: (formData.get('serial') as string || '').toUpperCase(),
       defect: (formData.get('defeito') as string || '').toUpperCase(),
       details: (formData.get('defeito_balcao') as string || '').toUpperCase(),
       accessories: (formData.get('acessorios') as string || '').toUpperCase(),
       status: formData.get('status') as any || 'Aberta',
       serviceType: formData.get('serviceType') as any,
-      isApproved: formData.get('isApproved') === 'Sim',
+      isApproved: formData.get('isApproved') !== null,
       priority: formData.get('priority') as any,
       value: totalOSValue,
       items: newOsItems,
-      technicianId: formData.get('technicianId') as string,
-      technicianName: teamUsers.find(u => u.id === formData.get('technicianId'))?.name || '',
+      technicianId: selectedTechnician?.id || '',
+      technicianName: selectedTechnician?.name || '',
       diagnosisDeadline: diagDeadline,
       completionDeadline: compDeadline,
       createdAt: now.toISOString(),
@@ -3786,6 +5941,14 @@ function OSListView({
     setNewOsItems([]);
     setCustomerSearch('');
     setSelectedCustomerId('');
+    setNewOSTechnicianId('');
+    setNewOSEquipmentTypeId('');
+    setNewOSEquipment('');
+    setNewOSBrand('');
+    setNewOSModel('');
+    setNewItemDesc('');
+    setNewItemPrice('0');
+    setNewItemQty('1');
     
     // Open Print Selection Dialog
     setLastCreatedOS(newOS);
@@ -3797,6 +5960,140 @@ function OSListView({
     const url = `https://wa.me/?text=${encodeURIComponent(text)}`;
     window.open(url, '_blank');
     toast.success('Link de acompanhamento gerado!');
+  };
+
+  const captureElementAsPngDataUrl = async (element: HTMLElement) => {
+    const canvas = await html2canvas(element, {
+      scale: 2,
+      useCORS: true,
+      backgroundColor: '#ffffff',
+      windowWidth: element.scrollWidth,
+      windowHeight: element.scrollHeight,
+    });
+    return canvas.toDataURL('image/png');
+  };
+
+  const buildEntryLabelDataUrl = (os: ServiceOrder) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 900;
+    canvas.height = 560;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return '';
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = '#111111';
+    ctx.lineWidth = 4;
+    ctx.strokeRect(8, 8, canvas.width - 16, canvas.height - 16);
+
+    ctx.fillStyle = '#111111';
+    ctx.font = 'bold 52px Arial';
+    ctx.fillText(os.number, 32, 74);
+
+    ctx.font = 'bold 28px Arial';
+    ctx.fillText('CLIENTE', 32, 124);
+    ctx.font = '26px Arial';
+    ctx.fillText(String(os.customerName || '-').slice(0, 52), 32, 162);
+
+    ctx.font = 'bold 28px Arial';
+    ctx.fillText('EQUIPAMENTO', 32, 220);
+    ctx.font = '26px Arial';
+    ctx.fillText(String(os.equipment || '-').slice(0, 52), 32, 258);
+
+    ctx.font = 'bold 24px Arial';
+    ctx.fillText('MARCA/MODELO', 32, 312);
+    ctx.font = '22px Arial';
+    ctx.fillText(`${os.brand || '-'} ${os.model || ''}`.trim().slice(0, 58), 32, 346);
+
+    ctx.font = 'bold 22px Arial';
+    ctx.fillText(`ENTRADA: ${format(new Date(os.createdAt), 'dd/MM/yyyy HH:mm')}`, 32, 404);
+    ctx.fillText(`STATUS: ${os.status}`, 32, 444);
+    ctx.font = '20px Arial';
+    ctx.fillText('TechManager', 32, 510);
+
+    return canvas.toDataURL('image/png');
+  };
+
+  const handleDirectPrintJobs = async () => {
+    if (!lastCreatedOS) {
+      toast.error('Não foi possível localizar a OS criada.');
+      return;
+    }
+
+    const hasSelectedPrint = printCheckboxes.label || printCheckboxes.entry || printCheckboxes.warranty;
+    if (!hasSelectedPrint) {
+      toast.error('Selecione pelo menos uma impressão.');
+      return;
+    }
+
+    if (printCheckboxes.label && !directPrintTargets.label) {
+      toast.error('Selecione a impressora da Etiqueta de Entrada.');
+      return;
+    }
+    if (printCheckboxes.entry && !directPrintTargets.entry) {
+      toast.error('Selecione a impressora do Comprovante de Entrada.');
+      return;
+    }
+    if (printCheckboxes.warranty && !directPrintTargets.warranty) {
+      toast.error('Selecione a impressora do Termo de Garantia.');
+      return;
+    }
+
+    try {
+      setIsDirectPrinting(true);
+      const jobs: Array<{ printerName: string; documentName: string; dataUrl: string }> = [];
+
+      if (printCheckboxes.label) {
+        const labelDataUrl = buildEntryLabelDataUrl(lastCreatedOS);
+        if (labelDataUrl) {
+          jobs.push({
+            printerName: directPrintTargets.label,
+            documentName: `${lastCreatedOS.number}-etiqueta`,
+            dataUrl: labelDataUrl,
+          });
+        }
+      }
+
+      if ((printCheckboxes.entry || printCheckboxes.warranty) && directA4PrintRef.current) {
+        const a4DataUrl = await captureElementAsPngDataUrl(directA4PrintRef.current);
+        if (printCheckboxes.entry) {
+          jobs.push({
+            printerName: directPrintTargets.entry,
+            documentName: `${lastCreatedOS.number}-comprovante`,
+            dataUrl: a4DataUrl,
+          });
+        }
+        if (printCheckboxes.warranty) {
+          jobs.push({
+            printerName: directPrintTargets.warranty,
+            documentName: `${lastCreatedOS.number}-garantia`,
+            dataUrl: a4DataUrl,
+          });
+        }
+      }
+
+      if (jobs.length === 0) {
+        toast.error('Não foi possível montar os arquivos de impressão.');
+        return;
+      }
+
+      const response = await axios.post('/api/system/print-jobs', { jobs });
+      const results = Array.isArray(response.data?.results) ? response.data.results : [];
+      const successCount = results.filter((item: any) => item?.success).length;
+      const failureCount = results.length - successCount;
+
+      if (failureCount === 0) {
+        toast.success(`Impressão direta enviada (${successCount} job${successCount > 1 ? 's' : ''}).`);
+      } else {
+        toast.error(`Algumas impressões falharam (${failureCount}). Verifique as impressoras.`);
+      }
+      setShowPostSavePrintDialog(false);
+    } catch (error: any) {
+      const message = error?.response?.data?.error || 'Falha ao enviar impressão direta.';
+      toast.error(message);
+    } finally {
+      setIsDirectPrinting(false);
+    }
   };
 
   const handleDeleteOS = (id: string) => {
@@ -3816,6 +6113,82 @@ function OSListView({
       toast.success('OS excluída com sucesso!');
     }
   };
+
+  const resetQuickCustomer = () => {
+    lastQuickCustomerCepLookupRef.current = '';
+    setQuickCustomer({
+      name: '',
+      doc: '',
+      ie: '',
+      email: '',
+      phone: '',
+      zip: '',
+      street: '',
+      number: '',
+      complement: '',
+      neighborhood: '',
+      city: '',
+      state: 'SP'
+    });
+  };
+
+  const handleLookupQuickCustomerCep = async (rawCep: string) => {
+    const cep = onlyDigits(rawCep || '');
+    if (cep.length !== 8) return;
+    if (lastQuickCustomerCepLookupRef.current === cep) return;
+
+    try {
+      setIsQuickCustomerCepLookupLoading(true);
+      const data = await fetchCepByBrasilApi(cep);
+      setQuickCustomer((prev) => ({
+        ...prev,
+        zip: formatCep(cep),
+        street: data.street || prev.street,
+        neighborhood: data.neighborhood || prev.neighborhood,
+        city: data.city || prev.city,
+        state: (data.state || prev.state || 'SP').toUpperCase().slice(0, 2),
+      }));
+      lastQuickCustomerCepLookupRef.current = cep;
+    } catch {
+      toast.error('Não foi possível consultar este CEP na BrasilAPI.');
+    } finally {
+      setIsQuickCustomerCepLookupLoading(false);
+    }
+  };
+
+  const handleSaveQuickCustomer = () => {
+    const email = normalizeEmail(quickCustomer.email);
+    if (!quickCustomer.name.trim()) {
+      toast.error('Nome do cliente é obrigatório.');
+      return;
+    }
+    if (!isValidOptionalEmail(email)) {
+      toast.error('Informe um e-mail válido, como nome@provedor.com, ou deixe vazio.');
+      return;
+    }
+
+    const customer = {
+      ...quickCustomer,
+      id: Math.random().toString(36).substr(2, 9),
+      name: quickCustomer.name.trim(),
+      doc: formatCpfCnpj(quickCustomer.doc),
+      ie: formatStateRegistration(quickCustomer.ie),
+      email,
+      phone: formatPhone(quickCustomer.phone),
+    };
+
+    setGlobalCustomers(prev => [...prev, customer]);
+    setCustomerSearch(customer.name);
+    setSelectedCustomerId(customer.id);
+    setShowCustomerResults(false);
+    setIsNewCustomerOpen(false);
+    resetQuickCustomer();
+    toast.success('Cliente cadastrado e selecionado!');
+  };
+
+  const lastCreatedCustomerRecord = lastCreatedOS
+    ? (globalCustomers.find((c) => c.id === lastCreatedOS.customerId) as any)
+    : null;
 
   return (
     <div className="space-y-6">
@@ -3876,45 +6249,134 @@ function OSListView({
                           ))}
                         </div>
                       )}
+                      {showCustomerResults && customerSearch.trim() && filteredCustomers.length === 0 && (
+                        <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg p-3">
+                          <p className="text-sm font-medium text-rose-600">Este cliente não existe no cadastro.</p>
+                          <p className="text-xs text-muted-foreground mt-1">Clique no botão + para cadastrar este nome.</p>
+                        </div>
+                      )}
                     </div>
                     <Dialog open={isNewCustomerOpen} onOpenChange={setIsNewCustomerOpen}>
                       <DialogTrigger render={
-                        <Button variant="outline" size="icon" title="Adicionar Novo Cliente">
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          title="Adicionar Novo Cliente"
+                          onClick={() => {
+                            const typedName = customerSearch.trim();
+                            if (!typedName) return;
+                            setQuickCustomer((prev) => ({ ...prev, name: typedName }));
+                          }}
+                        >
                           <Plus className="w-4 h-4" />
                         </Button>
                       } />
-                      <DialogContent className="max-w-2xl">
+                      <DialogContent className="max-w-3xl">
                         <DialogHeader>
                           <DialogTitle>Cadastrar Novo Cliente</DialogTitle>
                         </DialogHeader>
-                        <div className="grid gap-4 py-4">
-                          <div className="grid grid-cols-2 gap-4">
+                        <div className="grid gap-4 py-4 max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar">
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div className="space-y-2">
                               <Label>Nome / Razão Social</Label>
-                              <Input placeholder="Nome do cliente" />
+                              <Input
+                                placeholder="Nome do cliente"
+                                value={quickCustomer.name}
+                                onChange={(e) => setQuickCustomer({ ...quickCustomer, name: e.target.value })}
+                              />
                             </div>
                             <div className="space-y-2">
                               <Label>CPF / CNPJ</Label>
-                              <Input placeholder="Documento" />
+                              <Input
+                                placeholder="000.000.000-00 ou 00.000.000/0000-00"
+                                value={quickCustomer.doc}
+                                onChange={(e) => setQuickCustomer({ ...quickCustomer, doc: formatCpfCnpj(e.target.value) })}
+                              />
                             </div>
                           </div>
-                          <div className="grid grid-cols-2 gap-4">
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div className="space-y-2">
+                              <Label>Inscrição Estadual</Label>
+                              <Input
+                                placeholder="ISENTO ou números"
+                                value={quickCustomer.ie}
+                                onChange={(e) => setQuickCustomer({ ...quickCustomer, ie: formatStateRegistration(e.target.value) })}
+                              />
+                            </div>
                             <div className="space-y-2">
                               <Label>E-mail</Label>
-                              <Input type="email" placeholder="email@exemplo.com" />
+                              <Input
+                                type="email"
+                                placeholder="email@provedor.com"
+                                value={quickCustomer.email}
+                                onChange={(e) => setQuickCustomer({ ...quickCustomer, email: normalizeEmail(e.target.value) })}
+                              />
                             </div>
                             <div className="space-y-2">
                               <Label>Telefone</Label>
-                              <Input placeholder="(00) 00000-0000" />
+                              <Input
+                                placeholder="(00) 0000-0000 ou (00) 00000-0000"
+                                value={quickCustomer.phone}
+                                onChange={(e) => setQuickCustomer({ ...quickCustomer, phone: formatPhone(e.target.value) })}
+                              />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t">
+                            <div className="space-y-2">
+                              <Label>CEP</Label>
+                              <Input
+                                placeholder="00000-000"
+                                value={quickCustomer.zip}
+                                onChange={(e) => {
+                                  const formattedCep = formatCep(e.target.value);
+                                  setQuickCustomer((prev) => ({ ...prev, zip: formattedCep }));
+                                  const cepDigits = onlyDigits(formattedCep);
+                                  if (cepDigits.length === 8) {
+                                    handleLookupQuickCustomerCep(cepDigits);
+                                  }
+                                }}
+                                onBlur={() => handleLookupQuickCustomerCep(quickCustomer.zip)}
+                              />
+                              {isQuickCustomerCepLookupLoading && (
+                                <p className="text-[10px] text-muted-foreground">Consultando CEP...</p>
+                              )}
+                            </div>
+                            <div className="md:col-span-2 space-y-2">
+                              <Label>Logradouro</Label>
+                              <Input placeholder="Rua, avenida..." value={quickCustomer.street} onChange={(e) => setQuickCustomer({ ...quickCustomer, street: e.target.value })} />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div className="space-y-2">
+                              <Label>Número</Label>
+                              <Input placeholder="123" value={quickCustomer.number} onChange={(e) => setQuickCustomer({ ...quickCustomer, number: e.target.value })} />
+                            </div>
+                            <div className="space-y-2">
+                              <Label>Complemento</Label>
+                              <Input placeholder="Sala, apto..." value={quickCustomer.complement} onChange={(e) => setQuickCustomer({ ...quickCustomer, complement: e.target.value })} />
+                            </div>
+                            <div className="space-y-2">
+                              <Label>Bairro</Label>
+                              <Input placeholder="Centro" value={quickCustomer.neighborhood} onChange={(e) => setQuickCustomer({ ...quickCustomer, neighborhood: e.target.value })} />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div className="md:col-span-2 space-y-2">
+                              <Label>Cidade</Label>
+                              <Input placeholder="Cidade" value={quickCustomer.city} onChange={(e) => setQuickCustomer({ ...quickCustomer, city: e.target.value })} />
+                            </div>
+                            <div className="space-y-2">
+                              <Label>Estado</Label>
+                              <Input placeholder="UF" maxLength={2} value={quickCustomer.state} onChange={(e) => setQuickCustomer({ ...quickCustomer, state: e.target.value.toUpperCase().slice(0, 2) })} />
                             </div>
                           </div>
                         </div>
                         <DialogFooter>
-                          <Button variant="outline" onClick={() => setIsNewCustomerOpen(false)}>Cancelar</Button>
-                          <Button onClick={() => {
-                            toast.success('Cliente cadastrado!');
+                          <Button variant="outline" onClick={() => {
                             setIsNewCustomerOpen(false);
-                          }}>Salvar e Continuar</Button>
+                            resetQuickCustomer();
+                          }}>Cancelar</Button>
+                          <Button onClick={handleSaveQuickCustomer}>Salvar e Continuar</Button>
                         </DialogFooter>
                       </DialogContent>
                     </Dialog>
@@ -3923,14 +6385,16 @@ function OSListView({
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="equipamento">Equipamento</Label>
-                  <Select name="equipmentType" onValueChange={(val) => {
+                  <Label>Equipamento</Label>
+                  <Select name="equipmentType" value={newOSEquipmentTypeId} onValueChange={(val) => {
+                    setNewOSEquipmentTypeId(val);
                     const eqType = equipmentTypes.find(e => e.id === val);
-                    const equipmentInput = document.getElementById('equipamento') as HTMLInputElement;
-                    if(equipmentInput) equipmentInput.value = (eqType?.name || '').toUpperCase();
+                    setNewOSEquipment((eqType?.name || '').toUpperCase());
                   }}>
                     <SelectTrigger className="h-10 text-xs w-full">
-                      <SelectValue placeholder="SELECIONE O TIPO..." />
+                      <span className="truncate">
+                        {equipmentTypes.find((e) => e.id === newOSEquipmentTypeId)?.name.toUpperCase() || 'SELECIONE O TIPO...'}
+                      </span>
                     </SelectTrigger>
                     <SelectContent>
                       {equipmentTypes.map(eq => (
@@ -3938,13 +6402,12 @@ function OSListView({
                       ))}
                     </SelectContent>
                   </Select>
-                  <Input id="equipamento" name="equipment" placeholder="DESCRIÇÃO (EX: IPHONE 13)" required className="uppercase" onInput={(e) => e.currentTarget.value = e.currentTarget.value.toUpperCase()} />
                 </div>
                 <div className="space-y-2">
                   <Label className="uppercase text-[10px] font-bold">Técnico Responsável</Label>
-                  <Select name="technicianId">
+                  <Select value={newOSTechnicianId} onValueChange={setNewOSTechnicianId}>
                     <SelectTrigger className="h-10 text-xs w-full">
-                      <SelectValue placeholder="SELECIONE UM TÉCNICO..." />
+                      <span className="truncate">{teamUsers.find(u => u.id === newOSTechnicianId)?.name.toUpperCase() || 'SELECIONE UM TÉCNICO...'}</span>
                     </SelectTrigger>
                     <SelectContent>
                       {teamUsers.filter(u => u.role === 'USUARIO').map(u => (
@@ -3952,12 +6415,27 @@ function OSListView({
                       ))}
                     </SelectContent>
                   </Select>
+                  <input type="hidden" name="technicianId" value={newOSTechnicianId} />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="marca" className="uppercase text-[10px] font-bold">Marca</Label>
-                  <Input id="marca" name="brand" placeholder="EX: APPLE" required className="uppercase" onInput={(e) => e.currentTarget.value = e.currentTarget.value.toUpperCase()} />
+                  <Input
+                    id="marca"
+                    name="brand"
+                    list="os-brand-suggestions"
+                    placeholder="EX: APPLE"
+                    required
+                    className="uppercase"
+                    value={newOSBrand}
+                    onChange={(e) => setNewOSBrand(e.target.value.toUpperCase())}
+                  />
+                  <datalist id="os-brand-suggestions">
+                    {brandSuggestions.map((brand) => (
+                      <option key={brand} value={brand} />
+                    ))}
+                  </datalist>
                 </div>
                 <div className="space-y-2">
                   <Label className="uppercase text-[10px] font-bold">Prioridade</Label>
@@ -3977,7 +6455,21 @@ function OSListView({
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="modelo" className="uppercase text-[10px] font-bold">Modelo</Label>
-                  <Input id="modelo" name="model" placeholder="EX: PRO MAX" required className="uppercase" onInput={(e) => e.currentTarget.value = e.currentTarget.value.toUpperCase()} />
+                  <Input
+                    id="modelo"
+                    name="model"
+                    list="os-model-suggestions"
+                    placeholder="EX: PRO MAX"
+                    required
+                    className="uppercase"
+                    value={newOSModel}
+                    onChange={(e) => setNewOSModel(e.target.value.toUpperCase())}
+                  />
+                  <datalist id="os-model-suggestions">
+                    {modelSuggestions.map((model) => (
+                      <option key={model} value={model} />
+                    ))}
+                  </datalist>
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="serial" className="uppercase text-[10px] font-bold">Nº de Série / IMEI</Label>
@@ -4024,14 +6516,38 @@ function OSListView({
                   </div>
                 </div>
                 <div className="grid grid-cols-12 gap-2">
-                  <div className="col-span-5">
+                  <div className="col-span-5 relative">
+                    <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Descrição</Label>
                     <Input 
                       placeholder="Descrição..." 
                       value={newItemDesc} 
                       onChange={(e) => setNewItemDesc(e.target.value)} 
+                      onFocus={() => setIsServiceSuggestionOpen(true)}
+                      onBlur={() => setTimeout(() => setIsServiceSuggestionOpen(false), 120)}
                     />
+                    {isServiceSuggestionOpen && serviceSuggestions.length > 0 && (
+                      <div className="absolute z-50 mt-1 w-full rounded-md border bg-white shadow-lg max-h-44 overflow-y-auto">
+                        {serviceSuggestions.map((suggestion) => (
+                          <button
+                            key={suggestion.description}
+                            type="button"
+                            className="w-full px-3 py-2 text-left hover:bg-secondary/40 text-xs"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => {
+                              setNewItemDesc(suggestion.description.toUpperCase());
+                              setNewItemPrice(String(suggestion.unitPrice || 0));
+                              setIsServiceSuggestionOpen(false);
+                            }}
+                          >
+                            <span className="font-semibold">{suggestion.description}</span>
+                            <span className="ml-2 text-muted-foreground">R$ {(suggestion.unitPrice || 0).toFixed(2)}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div className="col-span-2">
+                    <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Serviço</Label>
                     <Select value={newItemType} onValueChange={(v: any) => setNewItemType(v)}>
                       <SelectTrigger><SelectValue /></SelectTrigger>
                       <SelectContent>
@@ -4041,6 +6557,7 @@ function OSListView({
                     </Select>
                   </div>
                   <div className="col-span-2">
+                    <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Qtd</Label>
                     <Input 
                       type="number" 
                       placeholder="Qtd" 
@@ -4049,6 +6566,7 @@ function OSListView({
                     />
                   </div>
                   <div className="col-span-2">
+                    <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Valor (R$)</Label>
                     <Input 
                       type="number" 
                       placeholder="Valor" 
@@ -4060,6 +6578,9 @@ function OSListView({
                     <Button type="button" size="icon" onClick={addItem}><Plus className="w-4 h-4" /></Button>
                   </div>
                 </div>
+                <p className="text-[10px] text-muted-foreground">
+                  Digite descrição, marca e modelo para buscar serviços já usados nesse equipamento. Ao selecionar uma sugestão, o valor é preenchido automaticamente.
+                </p>
 
                 <div className="space-y-2">
                   {newOsItems.map(item => (
@@ -4154,22 +6675,46 @@ function OSListView({
     </div>
 
     <div className="flex flex-col md:flex-row gap-4">
-      <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input 
-            placeholder="Filtrar por cliente, equipamento ou número..." 
-            className="pl-9" 
-            value={osSearch}
-            onChange={(e) => setOsSearch(e.target.value)}
-          />
-        </div>
-        <div className="flex gap-2">
+      <div className="flex flex-1 gap-2">
+        <Select
+          value={filterField}
+          onValueChange={(value) => {
+            const nextField = value as typeof filterField;
+            setFilterField(nextField);
+            setFilterQuery('');
+            if (nextField === 'status') {
+              setStatusFilter('todos');
+            }
+          }}
+        >
+          <SelectTrigger className="w-[180px]">
+            <div className="flex items-center gap-2">
+              <Filter className="w-4 h-4" />
+              <span>
+                {filterField === 'status' ? 'Status' :
+                filterField === 'nome' ? 'Nome' :
+                filterField === 'data' ? 'Data' :
+                filterField === 'os' ? 'O.S.' :
+                filterField === 'equipamento' ? 'Equipamento' :
+                filterField === 'marca' ? 'Marca' : 'Modelo'}
+              </span>
+            </div>
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="status">Status</SelectItem>
+            <SelectItem value="nome">Nome</SelectItem>
+            <SelectItem value="data">Data</SelectItem>
+            <SelectItem value="os">O.S.</SelectItem>
+            <SelectItem value="equipamento">Equipamento</SelectItem>
+            <SelectItem value="marca">Marca</SelectItem>
+            <SelectItem value="modelo">Modelo</SelectItem>
+          </SelectContent>
+        </Select>
+
+        {filterField === 'status' ? (
           <Select value={statusFilter} onValueChange={setStatusFilter}>
-            <SelectTrigger className="w-[180px]">
-              <div className="flex items-center gap-2">
-                <Filter className="w-4 h-4" />
-                <span>{statusFilter === 'todos' ? 'Todos Status' : statusFilter}</span>
-              </div>
+            <SelectTrigger className="flex-1 min-w-[180px]">
+              <span>{statusFilter === 'todos' ? 'Todos Status' : statusFilter}</span>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="todos">Todos Status</SelectItem>
@@ -4178,11 +6723,32 @@ function OSListView({
               ))}
             </SelectContent>
           </Select>
-          <Button variant="outline" className="gap-2" onClick={() => window.print()}>
-            <Printer className="w-4 h-4" /> Imprimir Lista
-          </Button>
-        </div>
+        ) : (
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              type={filterField === 'data' ? 'date' : 'text'}
+              placeholder={
+                filterField === 'nome' ? 'Filtrar por nome...' :
+                filterField === 'data' ? 'Selecionar data...' :
+                filterField === 'os' ? 'Filtrar por O.S...' :
+                filterField === 'equipamento' ? 'Filtrar por equipamento...' :
+                filterField === 'marca' ? 'Filtrar por marca...' :
+                'Filtrar por modelo...'
+              }
+              className={cn('pl-9', filterField === 'data' && 'pl-3')}
+              value={filterQuery}
+              onChange={(e) => setFilterQuery(e.target.value)}
+            />
+          </div>
+        )}
       </div>
+      <div className="flex gap-2">
+        <Button variant="outline" className="gap-2" onClick={() => window.print()}>
+          <Printer className="w-4 h-4" /> Imprimir Lista
+        </Button>
+      </div>
+    </div>
 
       <Card className="border-none shadow-sm overflow-hidden">
         <div className="overflow-x-auto">
@@ -4214,16 +6780,16 @@ function OSListView({
 
                 const getStatusColor = (status: OSStatus) => {
                   switch (status) {
-                    case 'Aberta': return 'bg-blue-50/60';
-                    case 'Em análise': return 'bg-purple-50/60';
-                    case 'Aguardando aprovação': return 'bg-yellow-50/60';
-                    case 'Aguardando peça': return 'bg-orange-50/60';
-                    case 'Em reparo': return 'bg-indigo-50/60';
-                    case 'Testes finais': return 'bg-cyan-50/60';
-                    case 'Pronta': return 'bg-emerald-50/60';
-                    case 'Entregue': return 'bg-slate-50/60';
-                    case 'Finalizada': return 'bg-green-50/60';
-                    case 'Cancelada': return 'bg-rose-50/60';
+                    case 'Aberta': return 'bg-blue-50/60 dark:bg-blue-500/10';
+                    case 'Em análise': return 'bg-purple-50/60 dark:bg-purple-500/10';
+                    case 'Aguardando aprovação': return 'bg-yellow-50/60 dark:bg-yellow-500/10';
+                    case 'Aguardando peça': return 'bg-orange-50/60 dark:bg-orange-500/10';
+                    case 'Em reparo': return 'bg-indigo-50/60 dark:bg-indigo-500/10';
+                    case 'Testes finais': return 'bg-cyan-50/60 dark:bg-cyan-500/10';
+                    case 'Pronta': return 'bg-emerald-50/60 dark:bg-emerald-500/10';
+                    case 'Entregue': return 'bg-slate-50/60 dark:bg-slate-500/10';
+                    case 'Finalizada': return 'bg-green-50/60 dark:bg-green-500/10';
+                    case 'Cancelada': return 'bg-rose-50/60 dark:bg-rose-500/10';
                     default: return '';
                   }
                 };
@@ -4252,7 +6818,7 @@ function OSListView({
                         {os.number}
                       </div>
                     </td>
-                    <td className="px-6 py-4">{os.customerName}</td>
+                    <td className="px-6 py-4"><span className="flex items-center flex-wrap gap-0.5">{os.customerName}{(os as any).importedFromBackup && <BackupBadge />}</span></td>
                     <td className="px-6 py-4">
                       <div className="flex flex-col">
                         <span>{os.equipment}</span>
@@ -4300,38 +6866,71 @@ function OSListView({
                         size="icon" 
                         className="h-8 w-8 text-primary"
                         onClick={() => onViewOS(os.id)}
-                        title="Ver Detalhes / Gerenciar O.S"
+                        title="Ver detalhes"
                       >
                         <Eye className="w-4 h-4" />
                       </Button>
-                      
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-8 w-8"
+                        onClick={() => onViewOS(os.id)}
+                        title="Editar"
+                      >
+                        <Edit className="w-4 h-4" />
+                      </Button>
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-8 w-8"
+                        onClick={() => handleA4Print(os)}
+                        title="Imprimir A4"
+                      >
+                        <Printer className="w-4 h-4" />
+                      </Button>
                       <DropdownMenu>
-                        <DropdownMenuTrigger render={
-                          <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Ações da OS">
-                            <MoreVertical className="w-4 h-4" />
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="icon" className="h-8 w-8" title="Alterar status">
+                            <RefreshCw className="w-4 h-4" />
                           </Button>
-                        } />
-                        <DropdownMenuContent align="end" className="w-48 shadow-xl border-none p-1">
-                          <DropdownMenuLabel>Ações da OS</DropdownMenuLabel>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem onClick={() => onViewOS(os.id)}>
-                            <Edit className="w-4 h-4 mr-2" /> Editar OS
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => setSelectedOSForA4Print(os)}>
-                            <FileText className="w-4 h-4 mr-2" /> PDF / Impressão A4
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleTemplatePrint(os)}>
-                            <Printer className="w-4 h-4 mr-2" /> Etiqueta / Cupom
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleShareLink(os)}>
-                            <Share2 className="w-4 h-4 mr-2" /> Compartilhar Link
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem className="text-rose-600" onClick={() => handleDeleteOS(os.id)}>
-                            <Trash2 className="w-4 h-4 mr-2" /> Excluir OS
-                          </DropdownMenuItem>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {STATUS_COLUMNS.map((status) => (
+                            <DropdownMenuItem key={status} onClick={() => handleStatusChange(os.id, status as OSStatus)}>
+                              {status}
+                            </DropdownMenuItem>
+                          ))}
                         </DropdownMenuContent>
                       </DropdownMenu>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-amber-600"
+                        onClick={() => handleStatusChange(os.id, 'Cancelada')}
+                        title="Cancelar"
+                      >
+                        <XCircle className="w-4 h-4" />
+                      </Button>
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-8 w-8"
+                        onClick={() => handleA4Pdf(os)}
+                        title="Baixar PDF"
+                      >
+                        <FileDown className="w-4 h-4" />
+                      </Button>
+                      {(user?.role === 'ADMIN-USER' || user?.role === 'ADMIN-SAAS') && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 text-rose-500"
+                          onClick={() => handleDeleteOrder(os.id)}
+                          title="Apagar"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </Button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -4348,11 +6947,43 @@ function OSListView({
         </div>
       </Card>
 
+      <Dialog open={isCancelDialogOpen} onOpenChange={(open) => {
+        setIsCancelDialogOpen(open);
+        if (!open) {
+          setCancelReason('');
+          setCancelTargetId(null);
+        }
+      }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Cancelar Ordem de Serviço</DialogTitle>
+            <DialogDescription>Informe o motivo do cancelamento para análise no dashboard.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Label>Motivo do Cancelamento</Label>
+            <textarea
+              className="flex min-h-[90px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              placeholder="Descreva o motivo do cancelamento..."
+              value={cancelReason}
+              onChange={(e) => setCancelReason(e.target.value)}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setIsCancelDialogOpen(false)}>Voltar</Button>
+            <Button variant="destructive" onClick={confirmCancel}>Confirmar Cancelamento</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {selectedOSForA4Print && (
         <OSPrintView 
           os={selectedOSForA4Print} 
-          onClose={() => setSelectedOSForA4Print(null)} 
+          onClose={() => {
+            setSelectedOSForA4Print(null);
+            setSelectedOSForA4Action(null);
+          }} 
           company={company}
+          autoAction={selectedOSForA4Action}
         />
       )}
 
@@ -4422,6 +7053,7 @@ function OSListView({
         <DynamicPrintView 
           template={selectedTemplate} 
           data={selectedOSForTemplatePrint} 
+          company={company}
           onClose={() => {
             setIsTemplatePreviewOpen(false);
             setSelectedTemplateId('');
@@ -4475,6 +7107,27 @@ function OSListView({
                 {printCheckboxes.label && <Check className="w-4 h-4 text-white" strokeWidth={4} />}
               </div>
             </div>
+            {printCheckboxes.label && (
+              <div className="space-y-1">
+                <Label className="text-[10px] uppercase font-bold text-muted-foreground">Impressora da Etiqueta</Label>
+                <Select
+                  value={directPrintTargets.label}
+                  onValueChange={(value) => setDirectPrintTargets((prev) => ({ ...prev, label: value }))}
+                >
+                  <SelectTrigger className="h-9 text-xs">
+                    <SelectValue placeholder={isLoadingPrinters ? 'Carregando impressoras...' : 'Selecione a impressora'} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availablePrinters.map((printer) => (
+                      <SelectItem key={printer} value={printer}>{printer}</SelectItem>
+                    ))}
+                    {!isLoadingPrinters && availablePrinters.length === 0 && (
+                      <SelectItem value="none" disabled>Nenhuma impressora encontrada</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
 
             <div 
               className={cn(
@@ -4502,6 +7155,27 @@ function OSListView({
                 {printCheckboxes.entry && <Check className="w-4 h-4 text-white" strokeWidth={4} />}
               </div>
             </div>
+            {printCheckboxes.entry && (
+              <div className="space-y-1">
+                <Label className="text-[10px] uppercase font-bold text-muted-foreground">Impressora do Comprovante</Label>
+                <Select
+                  value={directPrintTargets.entry}
+                  onValueChange={(value) => setDirectPrintTargets((prev) => ({ ...prev, entry: value }))}
+                >
+                  <SelectTrigger className="h-9 text-xs">
+                    <SelectValue placeholder={isLoadingPrinters ? 'Carregando impressoras...' : 'Selecione a impressora'} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availablePrinters.map((printer) => (
+                      <SelectItem key={printer} value={printer}>{printer}</SelectItem>
+                    ))}
+                    {!isLoadingPrinters && availablePrinters.length === 0 && (
+                      <SelectItem value="none" disabled>Nenhuma impressora encontrada</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
 
             <div 
               className={cn(
@@ -4529,27 +7203,54 @@ function OSListView({
                 {printCheckboxes.warranty && <Check className="w-4 h-4 text-white" strokeWidth={4} />}
               </div>
             </div>
+            {printCheckboxes.warranty && (
+              <div className="space-y-1">
+                <Label className="text-[10px] uppercase font-bold text-muted-foreground">Impressora do Termo</Label>
+                <Select
+                  value={directPrintTargets.warranty}
+                  onValueChange={(value) => setDirectPrintTargets((prev) => ({ ...prev, warranty: value }))}
+                >
+                  <SelectTrigger className="h-9 text-xs">
+                    <SelectValue placeholder={isLoadingPrinters ? 'Carregando impressoras...' : 'Selecione a impressora'} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availablePrinters.map((printer) => (
+                      <SelectItem key={printer} value={printer}>{printer}</SelectItem>
+                    ))}
+                    {!isLoadingPrinters && availablePrinters.length === 0 && (
+                      <SelectItem value="none" disabled>Nenhuma impressora encontrada</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
 
             <div className="flex gap-3 pt-6">
               <Button variant="ghost" className="flex-1 h-12 font-bold uppercase" onClick={() => setShowPostSavePrintDialog(false)}>
                 Sair sem imprimir
               </Button>
               <Button 
-                className="flex-1 h-12 font-black bg-emerald-600 hover:bg-emerald-700 gap-2 shadow-lg shadow-emerald-200" 
-                onClick={() => {
-                  toast.success('Gerando impressões selecionadas...');
-                  setShowPostSavePrintDialog(false);
-                  if (lastCreatedOS) {
-                    setSelectedOSForA4Print(lastCreatedOS);
-                  }
-                }}
+                className="flex-1 h-12 font-black bg-emerald-600 hover:bg-emerald-700 gap-2 shadow-lg shadow-emerald-200"
+                disabled={isDirectPrinting || isLoadingPrinters}
+                onClick={handleDirectPrintJobs}
               >
-                <Printer className="w-5 h-5" strokeWidth={3} /> IMPRIMIR SELECIONADOS
+                <Printer className="w-5 h-5" strokeWidth={3} /> {isDirectPrinting ? 'ENVIANDO...' : 'IMPRIMIR DIRETO'}
               </Button>
             </div>
           </div>
         </DialogContent>
       </Dialog>
+
+      {lastCreatedOS && (
+        <div className="sr-only" aria-hidden="true">
+          <OSPrintContentForRef
+            ref={directA4PrintRef}
+            os={lastCreatedOS}
+            company={company}
+            customer={lastCreatedCustomerRecord as Customer}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -4564,6 +7265,7 @@ function CustomerView({
   const emptyCustomer = {
     name: '',
     doc: '',
+    ie: '',
     email: '',
     phone: '',
     zip: '',
@@ -4578,6 +7280,8 @@ function CustomerView({
   const [customerSearch, setCustomerSearch] = useState('');
   const [newCustomer, setNewCustomer] = useState<any>(emptyCustomer);
   const [editingCustomerId, setEditingCustomerId] = useState<string | null>(null);
+  const [isCustomerCnpjLookupLoading, setIsCustomerCnpjLookupLoading] = useState(false);
+  const [isCustomerCepLookupLoading, setIsCustomerCepLookupLoading] = useState(false);
   
   const filteredCustomers = customers.filter(c => 
     fuzzyMatch(c.name, customerSearch) ||
@@ -4586,18 +7290,91 @@ function CustomerView({
     fuzzyMatch(c.email || '', customerSearch)
   );
 
+  const handleLookupCustomerByCnpj = async () => {
+    const cnpj = onlyDigits(newCustomer.doc || '');
+    if (cnpj.length !== 14) {
+      toast.error('Digite um CNPJ válido no campo CPF/CNPJ para consultar.');
+      return;
+    }
+
+    try {
+      setIsCustomerCnpjLookupLoading(true);
+      const data = await fetchCnpjByBrasilApi(cnpj);
+
+      setNewCustomer((prev: any) => ({
+        ...prev,
+        doc: formatCpfCnpj(cnpj),
+        name: data.razao_social || data.nome_fantasia || prev.name,
+        email: normalizeEmail(data.email || prev.email),
+        phone: formatPhone(data.ddd_telefone_1 || prev.phone),
+        zip: formatCep(data.cep || prev.zip),
+        street: data.logradouro || prev.street,
+        number: data.numero || prev.number,
+        complement: data.complemento || prev.complement,
+        neighborhood: data.bairro || prev.neighborhood,
+        city: data.municipio || prev.city,
+        state: (data.uf || prev.state || 'SP').toUpperCase().slice(0, 2),
+      }));
+
+      toast.success('Dados de cadastro preenchidos via CNPJ.');
+    } catch {
+      toast.error('Não foi possível consultar este CNPJ na BrasilAPI.');
+    } finally {
+      setIsCustomerCnpjLookupLoading(false);
+    }
+  };
+
+  const handleLookupCustomerCep = async () => {
+    const cep = onlyDigits(newCustomer.zip || '');
+    if (cep.length !== 8) {
+      toast.error('Digite um CEP válido com 8 dígitos.');
+      return;
+    }
+
+    try {
+      setIsCustomerCepLookupLoading(true);
+      const data = await fetchCepByBrasilApi(cep);
+      setNewCustomer((prev: any) => ({
+        ...prev,
+        zip: formatCep(cep),
+        street: data.street || prev.street,
+        neighborhood: data.neighborhood || prev.neighborhood,
+        city: data.city || prev.city,
+        state: (data.state || prev.state || 'SP').toUpperCase().slice(0, 2),
+      }));
+      toast.success('Endereço preenchido via CEP.');
+    } catch {
+      toast.error('Não foi possível consultar este CEP na BrasilAPI.');
+    } finally {
+      setIsCustomerCepLookupLoading(false);
+    }
+  };
+
   const handleSaveCustomer = () => {
     if (!newCustomer.name?.trim()) {
       toast.error('Nome do cliente é obrigatório');
       return;
     }
+    const email = normalizeEmail(newCustomer.email);
+    if (!isValidOptionalEmail(email)) {
+      toast.error('Informe um e-mail válido, como nome@provedor.com, ou deixe vazio.');
+      return;
+    }
+    const normalizedCustomer = {
+      ...newCustomer,
+      name: newCustomer.name.trim(),
+      doc: formatCpfCnpj(newCustomer.doc),
+      ie: formatStateRegistration(newCustomer.ie),
+      email,
+      phone: formatPhone(newCustomer.phone),
+    };
 
     if (editingCustomerId) {
-      setCustomers(prev => prev.map((customer) => customer.id === editingCustomerId ? { ...customer, ...newCustomer } : customer));
+      setCustomers(prev => prev.map((customer) => customer.id === editingCustomerId ? { ...customer, ...normalizedCustomer } : customer));
       toast.success('Cliente atualizado com sucesso!');
     } else {
       const customer = {
-        ...newCustomer,
+        ...normalizedCustomer,
         id: Math.random().toString(36).substr(2, 9)
       };
       setCustomers(prev => [...prev, customer]);
@@ -4654,15 +7431,15 @@ function CustomerView({
                 <Plus className="w-4 h-4" /> Novo Cliente
               </Button>
             } />
-            <DialogContent className="max-w-2xl px-0 overflow-hidden shadow-2xl rounded-3xl">
-              <div className="bg-primary p-6 text-white">
-                <DialogTitle className="text-2xl font-black">{editingCustomerId ? 'Editar Cliente' : 'Cadastrar Novo Cliente'}</DialogTitle>
-                <DialogDescription className="text-white/70">
+            <DialogContent className="w-full max-w-[calc(100%-2rem)] sm:max-w-5xl">
+              <DialogHeader>
+                <DialogTitle>{editingCustomerId ? 'Editar Cliente' : 'Cadastrar Novo Cliente'}</DialogTitle>
+                <DialogDescription>
                   {editingCustomerId ? 'Atualize os dados do cliente selecionado.' : 'Preencha os dados abaixo para registrar um novo cliente no sistema.'}
                 </DialogDescription>
-              </div>
-              
-              <div className="grid gap-6 p-8 max-h-[70vh] overflow-y-auto custom-scrollbar">
+              </DialogHeader>
+
+              <div className="grid gap-4 py-4 max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar">
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="name" className="font-bold">Nome Completo / Razão Social</Label>
@@ -4670,18 +7447,29 @@ function CustomerView({
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="doc" className="font-bold">CPF / CNPJ</Label>
-                    <Input id="doc" placeholder="000.000.000-00" value={newCustomer.doc} onChange={e => setNewCustomer({...newCustomer, doc: e.target.value})} />
+                    <div className="flex gap-2">
+                      <Input id="doc" placeholder="000.000.000-00 ou 00.000.000/0000-00" value={newCustomer.doc} onChange={e => setNewCustomer({...newCustomer, doc: formatCpfCnpj(e.target.value)})} />
+                      <Button type="button" variant="outline" onClick={handleLookupCustomerByCnpj} disabled={isCustomerCnpjLookupLoading}>
+                        {isCustomerCnpjLookupLoading ? 'Consultando...' : 'Buscar CNPJ'}
+                      </Button>
+                    </div>
                   </div>
                 </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="email" className="font-bold">E-mail</Label>
-                  <Input id="email" type="email" placeholder="cliente@email.com" value={newCustomer.email} onChange={e => setNewCustomer({...newCustomer, email: e.target.value})} />
+                  <Label htmlFor="ie" className="font-bold">Inscrição Estadual</Label>
+                  <Input id="ie" placeholder="ISENTO ou números" value={newCustomer.ie} onChange={e => setNewCustomer({...newCustomer, ie: formatStateRegistration(e.target.value)})} />
                 </div>
                 <div className="space-y-2">
+                  <Label htmlFor="email" className="font-bold">E-mail</Label>
+                  <Input id="email" type="email" placeholder="cliente@provedor.com" value={newCustomer.email} onChange={e => setNewCustomer({...newCustomer, email: normalizeEmail(e.target.value)})} />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
                   <Label htmlFor="phone" className="font-bold">Telefone / WhatsApp</Label>
-                  <Input id="phone" placeholder="(00) 00000-0000" value={newCustomer.phone} onChange={e => setNewCustomer({...newCustomer, phone: e.target.value})} />
+                  <Input id="phone" placeholder="(00) 0000-0000 ou (00) 00000-0000" value={newCustomer.phone} onChange={e => setNewCustomer({...newCustomer, phone: formatPhone(e.target.value)})} />
                 </div>
               </div>
 
@@ -4690,7 +7478,12 @@ function CustomerView({
                 <div className="grid grid-cols-3 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="cep" className="font-bold">CEP</Label>
-                    <Input id="cep" placeholder="00000-000" value={newCustomer.zip} onChange={e => setNewCustomer({...newCustomer, zip: e.target.value})} />
+                    <div className="flex gap-2">
+                      <Input id="cep" placeholder="00000-000" value={newCustomer.zip} onChange={e => setNewCustomer({...newCustomer, zip: formatCep(e.target.value)})} />
+                      <Button type="button" variant="outline" onClick={handleLookupCustomerCep} disabled={isCustomerCepLookupLoading}>
+                        {isCustomerCepLookupLoading ? 'Consultando...' : 'Buscar CEP'}
+                      </Button>
+                    </div>
                   </div>
                   <div className="col-span-2 space-y-2">
                     <Label htmlFor="address" className="font-bold">Logradouro (Rua, Av.)</Label>
@@ -4736,24 +7529,24 @@ function CustomerView({
                   </div>
                 </div>
               </div>
-            </div>
 
-            <div className="p-6 bg-secondary/10 flex justify-end gap-3 border-t">
-              <Button
-                variant="outline"
-                className="font-bold h-12 px-6"
-                onClick={() => {
-                  setIsDialogOpen(false);
-                  setEditingCustomerId(null);
-                  setNewCustomer(emptyCustomer);
-                }}
-              >
-                Cancelar
-              </Button>
-              <Button className="font-black h-12 px-8" onClick={handleSaveCustomer}>
-                {editingCustomerId ? 'Salvar Alterações' : 'Salvar Cliente'}
-              </Button>
-            </div>
+              </div>
+
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    setIsDialogOpen(false);
+                    setEditingCustomerId(null);
+                    setNewCustomer(emptyCustomer);
+                  }}
+                >
+                  Cancelar
+                </Button>
+                <Button onClick={handleSaveCustomer}>
+                  {editingCustomerId ? 'Salvar Alterações' : 'Salvar Cliente'}
+                </Button>
+              </DialogFooter>
           </DialogContent>
         </Dialog>
       </div>
@@ -4786,7 +7579,7 @@ function CustomerView({
             <tbody className="divide-y">
               {filteredCustomers.map((c) => (
                 <tr key={c.id} className="hover:bg-secondary/10 transition-colors">
-                  <td className="px-6 py-4 font-medium">{c.name}</td>
+                  <td className="px-6 py-4 font-medium"><span className="flex items-center flex-wrap gap-0.5">{c.name}{c.importedFromBackup && <BackupBadge />}</span></td>
                   <td className="px-6 py-4 text-muted-foreground">{c.doc}</td>
                   <td className="px-6 py-4">
                     <div className="flex flex-col">
@@ -4829,6 +7622,8 @@ function CustomerView({
 
 function StockView({ 
   fiscalEnabled, 
+  fiscalStrictModeEnabled = true,
+  companyFiscalSettings,
   allProducts, 
   setAllProducts,
   rmaHistory,
@@ -4836,6 +7631,8 @@ function StockView({
   salesHistory = []
 }: { 
   fiscalEnabled: boolean, 
+  fiscalStrictModeEnabled?: boolean,
+  companyFiscalSettings?: Pick<Company, 'fiscalUf' | 'fiscalActivitySector' | 'fiscalActivityCode' | 'accountantAssistantEnabled'>,
   allProducts: any[], 
   setAllProducts: React.Dispatch<React.SetStateAction<any[]>>,
   rmaHistory: any[],
@@ -4847,6 +7644,7 @@ function StockView({
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [buySearch, setBuySearch] = useState('');
   const [productImage, setProductImage] = useState<string | null>(null);
+  const [productImageFit, setProductImageFit] = useState<'cover' | 'contain' | 'fill'>('cover');
   const [bestSellersPeriod, setBestSellersPeriod] = useState('30d');
   const [bestSellersDisplayCount, setBestSellersDisplayCount] = useState(10);
   
@@ -4857,7 +7655,135 @@ function StockView({
   const [stockSearch, setStockSearch] = useState('');
   const [stockFilterCategory, setStockFilterCategory] = useState('todas');
   const [editingProduct, setEditingProduct] = useState<any>(null);
+  const [productNameValue, setProductNameValue] = useState('');
+  const [isNcmLookupLoading, setIsNcmLookupLoading] = useState(false);
+  const [ncmLookupResults, setNcmLookupResults] = useState<BrasilApiNcmItem[]>([]);
+  const [isNcmResultsModalOpen, setIsNcmResultsModalOpen] = useState(false);
+  const [ncmModalSearch, setNcmModalSearch] = useState('');
+  const [ncmModalChapterFilter, setNcmModalChapterFilter] = useState('all');
+  const [selectedNcmLookupCode, setSelectedNcmLookupCode] = useState('');
+  const [ncmChosenFromList, setNcmChosenFromList] = useState(false);
+  const [ncmInputValue, setNcmInputValue] = useState('');
+  const [cestInputValue, setCestInputValue] = useState('');
+  const [taxApiCodeValue, setTaxApiCodeValue] = useState('');
+  const [taxCategoryValue, setTaxCategoryValue] = useState('');
+  const [fiscalCfopValue, setFiscalCfopValue] = useState('');
+  const [fiscalCstIcmsValue, setFiscalCstIcmsValue] = useState('');
+  const [fiscalCstPisValue, setFiscalCstPisValue] = useState('');
+  const [fiscalCstCofinsValue, setFiscalCstCofinsValue] = useState('');
   const products = allProducts;
+
+  const productImageFitClass = {
+    cover: 'object-cover',
+    contain: 'object-contain',
+    fill: 'object-fill',
+  }[productImageFit];
+
+  const activeFiscalProfile = useMemo(() => getFiscalProfileByNcm(ncmInputValue), [ncmInputValue]);
+
+  const companyActivityTemplate = useMemo(
+    () => resolveFiscalActivityTemplate(companyFiscalSettings?.fiscalActivityCode, companyFiscalSettings?.fiscalActivitySector),
+    [companyFiscalSettings?.fiscalActivityCode, companyFiscalSettings?.fiscalActivitySector]
+  );
+
+  const prioritizeFiscalOptions = (options: FiscalOption[], preferredValue?: string): FiscalOption[] => {
+    if (!preferredValue) return options;
+    const existing = options.find((item) => item.value === preferredValue);
+    if (existing) return [existing, ...options.filter((item) => item.value !== preferredValue)];
+
+    return [
+      {
+        value: preferredValue,
+        label: preferredValue,
+        description: 'Sugestao com base no ramo/codigo de atividade fiscal da empresa.',
+      },
+      ...options,
+    ];
+  };
+
+  const taxCategoryOptions = useMemo(
+    () => prioritizeFiscalOptions(activeFiscalProfile.taxCategoryOptions, companyActivityTemplate?.suggestedTaxCategory),
+    [activeFiscalProfile.taxCategoryOptions, companyActivityTemplate?.suggestedTaxCategory]
+  );
+  const cfopOptions = useMemo(
+    () => prioritizeFiscalOptions(activeFiscalProfile.cfopOptions, companyActivityTemplate?.suggestedCfop),
+    [activeFiscalProfile.cfopOptions, companyActivityTemplate?.suggestedCfop]
+  );
+  const cstIcmsOptions = useMemo(
+    () => prioritizeFiscalOptions(activeFiscalProfile.cstIcmsOptions, companyActivityTemplate?.suggestedCstIcms),
+    [activeFiscalProfile.cstIcmsOptions, companyActivityTemplate?.suggestedCstIcms]
+  );
+  const cstPisOptions = useMemo(
+    () => prioritizeFiscalOptions(activeFiscalProfile.cstPisOptions, companyActivityTemplate?.suggestedCstPis),
+    [activeFiscalProfile.cstPisOptions, companyActivityTemplate?.suggestedCstPis]
+  );
+  const cstCofinsOptions = useMemo(
+    () => prioritizeFiscalOptions(activeFiscalProfile.cstCofinsOptions, companyActivityTemplate?.suggestedCstCofins),
+    [activeFiscalProfile.cstCofinsOptions, companyActivityTemplate?.suggestedCstCofins]
+  );
+
+  const selectedTaxCategoryOption = taxCategoryOptions.find((opt) => opt.value === taxCategoryValue);
+  const selectedCfopOption = cfopOptions.find((opt) => opt.value === fiscalCfopValue);
+  const selectedCstIcmsOption = cstIcmsOptions.find((opt) => opt.value === fiscalCstIcmsValue);
+  const selectedCstPisOption = cstPisOptions.find((opt) => opt.value === fiscalCstPisValue);
+  const selectedCstCofinsOption = cstCofinsOptions.find((opt) => opt.value === fiscalCstCofinsValue);
+  const strictFiscalModeActive = fiscalEnabled && fiscalStrictModeEnabled;
+
+  const getProductFiscalConfidence = (product: any) => {
+    const ncmDigits = onlyDigits(String(product?.ncm || ''));
+    const hasValidNcm = ncmDigits.length === 8;
+    const fromList = String(product?.ncmSource || '') === 'list';
+    const hasCest = !!String(product?.cest || '').trim();
+    const hasCfop = !!String(product?.fiscalCfop || '').trim();
+    const hasCstIcms = !!String(product?.fiscalCstIcms || '').trim();
+    const hasCstPis = !!String(product?.fiscalCstPis || '').trim();
+    const hasCstCofins = !!String(product?.fiscalCstCofins || '').trim();
+    const hasTaxCategory = !!String(product?.taxCategory || '').trim();
+
+    let score = 0;
+    if (hasValidNcm) score += 35;
+    if (fromList) score += 25;
+    if (hasCest) score += 10;
+    if (hasCfop) score += 10;
+    if (hasCstIcms) score += 7;
+    if (hasCstPis) score += 7;
+    if (hasCstCofins) score += 6;
+    if (hasTaxCategory) score += 5;
+
+    const clamped = Math.max(0, Math.min(100, score));
+    if (clamped >= 80) {
+      return { score: clamped, level: 'Alta', className: 'bg-emerald-100 text-emerald-700 border-emerald-200' };
+    }
+    if (clamped >= 55) {
+      return { score: clamped, level: 'Media', className: 'bg-amber-100 text-amber-700 border-amber-200' };
+    }
+    return { score: clamped, level: 'Baixa', className: 'bg-rose-100 text-rose-700 border-rose-200' };
+  };
+
+  const ncmModalChapterOptions = useMemo(() => {
+    const chapters = new Set<string>();
+    ncmLookupResults.forEach((item) => {
+      const chapter = normalizeNcmCode(item.codigo).slice(0, 2);
+      if (chapter.length === 2) chapters.add(chapter);
+    });
+    return Array.from(chapters).sort((a, b) => a.localeCompare(b));
+  }, [ncmLookupResults]);
+
+  const filteredNcmModalResults = useMemo(() => {
+    const q = normalizeLookupText(ncmModalSearch);
+    const qDigits = normalizeNcmCode(ncmModalSearch);
+    return ncmLookupResults.filter((item) => {
+      const chapter = normalizeNcmCode(item.codigo).slice(0, 2);
+      const chapterMatches = ncmModalChapterFilter === 'all' || chapter === ncmModalChapterFilter;
+      if (!chapterMatches) return false;
+      if (!q && !qDigits) return true;
+
+      const itemCodeDigits = normalizeNcmCode(item.codigo);
+      const codeMatches = qDigits ? itemCodeDigits.startsWith(qDigits) || itemCodeDigits.includes(qDigits) : false;
+      const textMatches = q ? normalizeLookupText(item.descricao).includes(q) : false;
+      return codeMatches || textMatches;
+    });
+  }, [ncmLookupResults, ncmModalSearch, ncmModalChapterFilter]);
 
   useEffect(() => {
     if (categories.length > 0) return;
@@ -4890,11 +7816,17 @@ function StockView({
   const lowStockProducts = allProducts.filter(p => p.stock <= p.min);
   const filteredBuyProducts = allProducts.filter(p => 
     p.name.toLowerCase().includes(buySearch.toLowerCase()) || 
-    p.sku.toLowerCase().includes(buySearch.toLowerCase())
+    p.sku.toLowerCase().includes(buySearch.toLowerCase()) ||
+    String(p.brand || '').toLowerCase().includes(buySearch.toLowerCase()) ||
+    String(p.model || '').toLowerCase().includes(buySearch.toLowerCase())
   );
 
   const filteredStockProducts = allProducts.filter(p => {
-    const matchesSearch = fuzzyMatch(p.name, stockSearch) || fuzzyMatch(p.sku, stockSearch);
+    const matchesSearch =
+      fuzzyMatch(p.name, stockSearch) ||
+      fuzzyMatch(p.sku, stockSearch) ||
+      fuzzyMatch(String(p.brand || ''), stockSearch) ||
+      fuzzyMatch(String(p.model || ''), stockSearch);
     const matchesCategory = stockFilterCategory === 'todas' || p.cat === stockFilterCategory;
     return matchesSearch && matchesCategory;
   });
@@ -4973,6 +7905,113 @@ function StockView({
     }
   };
 
+  const resetProductFiscalLookup = () => {
+    setNcmLookupResults([]);
+    setIsNcmResultsModalOpen(false);
+    setNcmModalSearch('');
+    setNcmModalChapterFilter('all');
+    setSelectedNcmLookupCode('');
+    setNcmChosenFromList(false);
+    setNcmInputValue('');
+    setCestInputValue('');
+    setTaxApiCodeValue('');
+    setTaxCategoryValue('');
+    setFiscalCfopValue('');
+    setFiscalCstIcmsValue('');
+    setFiscalCstPisValue('');
+    setFiscalCstCofinsValue('');
+    setProductNameValue('');
+    setIsNcmLookupLoading(false);
+  };
+
+  const initializeProductFiscalLookup = (product?: any | null) => {
+    setNcmLookupResults([]);
+    setIsNcmResultsModalOpen(false);
+    setNcmModalSearch('');
+    setNcmModalChapterFilter('all');
+    setSelectedNcmLookupCode(product?.ncm || '');
+    setNcmChosenFromList(!!product?.ncm);
+    setNcmInputValue(product?.ncm || '');
+    setCestInputValue(product?.cest || '');
+    setTaxApiCodeValue(product?.taxApiCode || '');
+    setTaxCategoryValue(product?.taxCategory || '');
+    setFiscalCfopValue(product?.fiscalCfop || '');
+    setFiscalCstIcmsValue(product?.fiscalCstIcms || '');
+    setFiscalCstPisValue(product?.fiscalCstPis || '');
+    setFiscalCstCofinsValue(product?.fiscalCstCofins || '');
+    setProductNameValue(product?.name || '');
+    setIsNcmLookupLoading(false);
+  };
+
+  const handleLookupNcmByProductName = async () => {
+    const queryByName = String(productNameValue || '').trim();
+    const queryByCode = String(ncmInputValue || '').trim();
+    const query = queryByName || queryByCode;
+    if (!query) {
+      toast.error('Informe o nome do produto ou os primeiros dígitos do NCM para buscar.');
+      return;
+    }
+
+    try {
+      setIsNcmLookupLoading(true);
+      const foundItems = await fetchNcmByBrasilApi(query);
+      if (!foundItems.length) {
+        setNcmLookupResults([]);
+        setSelectedNcmLookupCode('');
+        toast.error('Nenhum NCM encontrado. Tente nome mais específico ou prefixo numérico do NCM.');
+        return;
+      }
+      setNcmLookupResults(foundItems);
+      setNcmModalSearch('');
+      setNcmModalChapterFilter('all');
+      setSelectedNcmLookupCode('');
+      setNcmChosenFromList(false);
+      setIsNcmResultsModalOpen(true);
+    } catch {
+      toast.error('Não foi possível consultar NCM na BrasilAPI.');
+    } finally {
+      setIsNcmLookupLoading(false);
+    }
+  };
+
+  const handleSelectNcmLookupResult = (item: BrasilApiNcmItem) => {
+    const profile = getFiscalProfileByNcm(item.codigo);
+    const template = resolveFiscalActivityTemplate(
+      companyFiscalSettings?.fiscalActivityCode,
+      companyFiscalSettings?.fiscalActivitySector
+    );
+    setSelectedNcmLookupCode(item.codigo);
+    setNcmChosenFromList(true);
+    setNcmInputValue(item.codigo);
+    if (!cestInputValue && profile.cestOptions[0]?.value) setCestInputValue(profile.cestOptions[0].value);
+    if (!taxCategoryValue) {
+      setTaxCategoryValue(template?.suggestedTaxCategory || profile.taxCategoryOptions[0]?.value || '');
+    }
+    if (!fiscalCfopValue) {
+      setFiscalCfopValue(template?.suggestedCfop || profile.cfopOptions[0]?.value || '');
+    }
+    if (!fiscalCstIcmsValue) {
+      setFiscalCstIcmsValue(template?.suggestedCstIcms || profile.cstIcmsOptions[0]?.value || '');
+    }
+    if (!fiscalCstPisValue) {
+      setFiscalCstPisValue(template?.suggestedCstPis || profile.cstPisOptions[0]?.value || '');
+    }
+    if (!fiscalCstCofinsValue) {
+      setFiscalCstCofinsValue(template?.suggestedCstCofins || profile.cstCofinsOptions[0]?.value || '');
+    }
+    setTaxApiCodeValue(item.codigo);
+    setIsNcmResultsModalOpen(false);
+    toast.success(`NCM selecionado: ${item.codigo} — ${item.descricao}`);
+  };
+
+  useEffect(() => {
+    if (!isProductModalOpen) return;
+    initializeProductFiscalLookup(editingProduct);
+    loadNcmLocalBase().catch(() => {
+      // ignore preload failures
+    });
+  }, [isProductModalOpen, editingProduct]);
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -5011,7 +8050,12 @@ function StockView({
                             setBuySearch('');
                           }}
                         >
-                          <span className="text-sm">{p.name}</span>
+                          <div>
+                            <p className="text-sm">{p.name}</p>
+                            {(p.brand || p.model) && (
+                              <p className="text-[10px] text-muted-foreground uppercase">{[p.brand, p.model].filter(Boolean).join(' / ')}</p>
+                            )}
+                          </div>
                           <Plus className="w-3 h-3 text-primary" />
                         </div>
                       ))}
@@ -5180,30 +8224,77 @@ function StockView({
             if (!open) {
               setEditingProduct(null);
               setProductImage(null);
+              setProductImageFit('cover');
+              resetProductFiscalLookup();
+            } else {
+              initializeProductFiscalLookup(editingProduct);
+              setProductImageFit((editingProduct?.imageFit as 'cover' | 'contain' | 'fill') || 'cover');
             }
           }}>
             <DialogTrigger render={
               <Button className="gap-2" onClick={() => {
                 setEditingProduct(null);
                 setProductImage(null);
+                setProductImageFit('cover');
+                resetProductFiscalLookup();
               }}><Plus className="w-4 h-4" /> Novo Produto</Button>
             } />
-            <DialogContent className="max-w-2xl">
+            <DialogContent className="w-full max-w-[calc(100%-2rem)] sm:max-w-5xl">
               <DialogHeader>
                 <DialogTitle>{editingProduct ? 'Editar Produto' : 'Cadastrar Produto'}</DialogTitle>
                 <DialogDescription>Preencha os dados abaixo para {editingProduct ? 'atualizar' : 'cadastrar'} um item no estoque.</DialogDescription>
               </DialogHeader>
-              <form onSubmit={(e) => {
+              <form onSubmit={async (e) => {
                 e.preventDefault();
                 const formData = new FormData(e.currentTarget);
+                const rawNcm = String(formData.get('ncm') || ncmInputValue || '').trim();
+                const rawCest = String(formData.get('cest') || cestInputValue || '').trim();
+                const normalizedCest = rawCest === '__none__' ? '' : rawCest;
+                const rawTaxApiCode = String(formData.get('taxApiCode') || taxApiCodeValue || '').trim();
+
+                const ncmDigits = onlyDigits(rawNcm);
+                if (strictFiscalModeActive) {
+                  if (ncmDigits.length !== 8) {
+                    toast.error('Modo fiscal estrito: informe um NCM válido com 8 dígitos.');
+                    return;
+                  }
+
+                  if (!ncmChosenFromList) {
+                    toast.error('Modo fiscal estrito: selecione o NCM pela lista de resultados.');
+                    return;
+                  }
+
+                  const localNcmBase = await loadNcmLocalBase();
+                  const hasNcmInOfficialBase = localNcmBase.some((item) => normalizeNcmCode(item.codigo) === ncmDigits);
+                  if (!hasNcmInOfficialBase) {
+                    toast.error('Modo fiscal estrito: NCM não encontrado na base oficial local.');
+                    return;
+                  }
+                }
+
                 const prodData: any = {
+                  ...(editingProduct || {}),
                   id: editingProduct?.id || Math.random().toString(36).substr(2, 9),
-                  name: formData.get('name') as string,
-                  sku: formData.get('sku') as string,
+                  name: String(formData.get('name') || '').trim(),
+                  brand: String(formData.get('brand') || '').trim(),
+                  model: String(formData.get('model') || '').trim(),
+                  image: productImage || editingProduct?.image || '',
+                  imageFit: productImageFit,
+                  sku: String(formData.get('sku') || '').trim(),
                   price: Number(formData.get('price')),
                   stock: Number(formData.get('stock')),
                   min: Number(formData.get('min')),
                   cat: formData.get('cat') as string,
+                  ncm: rawNcm,
+                  ncmSource: ncmChosenFromList ? 'list' : 'manual',
+                  cest: normalizedCest,
+                  origin: String(formData.get('origin') || '').trim(),
+                  taxApiCode: rawTaxApiCode,
+                  taxCategory: String(formData.get('taxCategory') || taxCategoryValue || '').trim(),
+                  fiscalCfop: String(formData.get('fiscalCfop') || fiscalCfopValue || '').trim(),
+                  fiscalCstIcms: String(formData.get('fiscalCstIcms') || fiscalCstIcmsValue || '').trim(),
+                  fiscalCstPis: String(formData.get('fiscalCstPis') || fiscalCstPisValue || '').trim(),
+                  fiscalCstCofins: String(formData.get('fiscalCstCofins') || fiscalCstCofinsValue || '').trim(),
                 };
 
                 if (editingProduct) {
@@ -5216,18 +8307,22 @@ function StockView({
                 setIsProductModalOpen(false);
                 setEditingProduct(null);
                 setProductImage(null);
+                setProductImageFit('cover');
               }}>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 py-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 py-4 max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar">
                   <div className="space-y-4">
                     <div className="space-y-2">
                       <Label>Imagem do Produto</Label>
+                      <p className="text-[10px] text-muted-foreground">
+                        Campo opcional. Essa imagem ajuda a identificar o produto na venda, estoque e impressão.
+                      </p>
                       <div 
                         className="border-2 border-dashed rounded-xl h-48 flex flex-col items-center justify-center gap-2 bg-secondary/20 hover:bg-secondary/30 transition-colors cursor-pointer relative overflow-hidden group"
                         onClick={() => document.getElementById('product-image-upload')?.click()}
                       >
                         {productImage || editingProduct?.image ? (
                           <>
-                            <img src={productImage || editingProduct?.image} alt="Preview" className="w-full h-full object-cover" />
+                            <img src={productImage || editingProduct?.image} alt="Preview" className={cn('w-full h-full', productImageFitClass)} />
                             <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                               <Upload className="w-8 h-8 text-white" />
                             </div>
@@ -5255,10 +8350,31 @@ function StockView({
                           }}
                         />
                       </div>
+                      <div className="space-y-2">
+                        <Label className="text-xs">Ajuste de Enquadramento da Imagem</Label>
+                        <Select value={productImageFit} onValueChange={(value: 'cover' | 'contain' | 'fill') => setProductImageFit(value)}>
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue placeholder="Selecione o ajuste" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="cover">Preencher (corta bordas, mantém proporção)</SelectItem>
+                            <SelectItem value="contain">Ajustar (mostra tudo, pode sobrar espaço)</SelectItem>
+                            <SelectItem value="fill">Esticar (preenche sem sobras)</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p className="text-[10px] text-muted-foreground">Esse ajuste será salvo para o produto e aplicado nas visualizações.</p>
+                      </div>
                     </div>
                     <div className="space-y-2">
                       <Label htmlFor="prod-name">Nome do Produto</Label>
-                      <Input id="prod-name" name="name" defaultValue={editingProduct?.name} placeholder="Ex: Tela iPhone 14" required />
+                      <Input
+                        id="prod-name"
+                        name="name"
+                        value={productNameValue}
+                        onChange={(e) => setProductNameValue(e.target.value)}
+                        placeholder="Ex: Tela iPhone 14"
+                        required
+                      />
                     </div>
                   </div>
 
@@ -5276,6 +8392,17 @@ function StockView({
                             {categories.map(c => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
                           </SelectContent>
                         </Select>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="prod-brand">Marca</Label>
+                        <Input id="prod-brand" name="brand" defaultValue={editingProduct?.brand || ''} placeholder="Ex: Samsung, Apple, JBL" />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="prod-model">Modelo</Label>
+                        <Input id="prod-model" name="model" defaultValue={editingProduct?.model || ''} placeholder="Ex: A54, iPhone 14, Tune 510BT" />
                       </div>
                     </div>
 
@@ -5306,24 +8433,139 @@ function StockView({
                       </div>
                     </div>
 
-                    {fiscalEnabled && (
-                      <div className="pt-4 border-t mt-4 space-y-4 animate-in fade-in slide-in-from-top-2">
+                    <div className="pt-4 border-t mt-4 space-y-4 animate-in fade-in slide-in-from-top-2">
                          <h4 className="text-[10px] font-black uppercase text-primary tracking-widest flex items-center gap-2">
                            <ShieldCheck className="w-3 h-3" /> Dados Fiscais (NFC-e)
                          </h4>
+                         <div className="flex items-center gap-2 rounded-md border px-3 py-2 bg-secondary/20">
+                           <span
+                             className={cn(
+                               'inline-flex items-center rounded-md px-2 py-1 text-[10px] font-black uppercase',
+                               strictFiscalModeActive ? 'bg-emerald-100 text-emerald-700 border border-emerald-200' : 'bg-amber-100 text-amber-700 border border-amber-200'
+                             )}
+                           >
+                             {strictFiscalModeActive ? 'Estrito Ativo' : 'Estrito Desativado'}
+                           </span>
+                           <p className="text-[11px] text-muted-foreground">
+                             {strictFiscalModeActive
+                               ? 'Exige NCM valido e selecionado da lista oficial para salvar.'
+                               : 'Permite cadastro fiscal flexivel; ainda recomendamos selecionar NCM pela lista.'}
+                           </p>
+                         </div>
+                         {!fiscalEnabled && (
+                           <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
+                             Módulo fiscal da empresa está inativo. Você ainda pode preencher os campos fiscais para preparar o cadastro.
+                           </div>
+                         )}
+                         <div className="space-y-2">
+                           <Label className="text-xs">Buscar NCM por nome do produto</Label>
+                           <div className="flex gap-2 flex-wrap items-center">
+                             <Button
+                               type="button"
+                               variant="outline"
+                               className="h-8 text-xs"
+                               onClick={handleLookupNcmByProductName}
+                               disabled={isNcmLookupLoading}
+                             >
+                               {isNcmLookupLoading ? 'Consultando...' : 'Buscar NCM e Tributos'}
+                             </Button>
+                             {selectedNcmLookupCode && (
+                               <button
+                                 type="button"
+                                 className="text-xs text-primary underline underline-offset-2"
+                                 onClick={() => setIsNcmResultsModalOpen(true)}
+                               >
+                                 {selectedNcmLookupCode} — ver resultados
+                               </button>
+                             )}
+                           </div>
+                         </div>
                          <div className="grid grid-cols-2 gap-4">
                            <div className="space-y-2">
                              <Label className="text-xs">NCM</Label>
-                             <Input name="ncm" placeholder="Ex: 8517.13.00" className="h-8 text-xs" />
+                             <Input
+                               name="ncm"
+                               placeholder="Ex: 8517.13.00"
+                               className="h-8 text-xs"
+                               value={ncmInputValue}
+                                onChange={(e) => {
+                                  setNcmInputValue(e.target.value);
+                                  setNcmChosenFromList(false);
+                                }}
+                               list="ncm-suggestions"
+                             />
+                             <datalist id="ncm-suggestions">
+                               {ncmLookupResults.map((item) => (
+                                 <option key={`${item.codigo}-ncm`} value={item.codigo}>{item.descricao}</option>
+                               ))}
+                             </datalist>
                            </div>
                            <div className="space-y-2">
                              <Label className="text-xs">CEST</Label>
-                             <Input name="cest" placeholder="Ex: 21.053.01" className="h-8 text-xs" />
+                             <Select name="cest" value={cestInputValue} onValueChange={(value) => setCestInputValue(value)}>
+                               <SelectTrigger className="h-8 text-xs">
+                                 <SelectValue placeholder="Selecione o CEST sugerido" />
+                               </SelectTrigger>
+                               <SelectContent>
+                                 {activeFiscalProfile.cestOptions.map((opt) => (
+                                   <SelectItem key={`cest-${opt.value}-${opt.label}`} value={opt.value}>
+                                     {opt.label} - {opt.description}
+                                   </SelectItem>
+                                 ))}
+                               </SelectContent>
+                             </Select>
+                             <p className="text-[10px] text-muted-foreground">Sugestoes relacionadas ao NCM selecionado.</p>
+                             {strictFiscalModeActive && !ncmChosenFromList && (
+                               <p className="text-[10px] text-amber-700">Modo fiscal estrito: escolha um NCM da lista de resultados para salvar.</p>
+                             )}
+                           </div>
+                         </div>
+                         <div className="rounded-md border bg-secondary/20 px-3 py-2">
+                           <p className="text-[10px] font-black uppercase tracking-wider text-primary">
+                             Perfil Fiscal Ativo: {activeFiscalProfile.title}
+                           </p>
+                           <p className="text-[11px] text-muted-foreground mt-1">
+                             As opcoes abaixo sao sugestoes por NCM para afinar o cadastro. Valide com seu contador para a UF de emissao.
+                           </p>
+                           {companyFiscalSettings?.accountantAssistantEnabled && (
+                             <p className="text-[11px] text-emerald-700 mt-1">
+                               Assistente Contador IA ativo para apoiar sugestoes fiscais neste cadastro.
+                             </p>
+                           )}
+                           {companyActivityTemplate && (
+                             <p className="text-[11px] text-emerald-700 mt-1">
+                               Relacao por atividade fiscal ({companyFiscalSettings?.fiscalActivityCode || 'sem codigo'}):
+                               {' '}{companyActivityTemplate.name}.
+                             </p>
+                           )}
+                         </div>
+                         <div className="grid grid-cols-2 gap-4">
+                           <div className="space-y-2">
+                             <Label className="text-xs">Código API de Tributo</Label>
+                             <Input
+                               name="taxApiCode"
+                               placeholder="Código para consulta fiscal"
+                               className="h-8 text-xs"
+                               value={taxApiCodeValue}
+                               onChange={(e) => setTaxApiCodeValue(e.target.value)}
+                             />
+                           </div>
+                           <div className="space-y-2">
+                             <Label className="text-xs">Categoria Fiscal (Opcional)</Label>
+                             <Select name="taxCategory" value={taxCategoryValue} onValueChange={setTaxCategoryValue}>
+                               <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Selecione" /></SelectTrigger>
+                               <SelectContent>
+                                 {taxCategoryOptions.map((opt) => (
+                                   <SelectItem key={`taxcat-${opt.value}`} value={opt.value}>{opt.label}</SelectItem>
+                                 ))}
+                               </SelectContent>
+                             </Select>
+                             <p className="text-[10px] text-muted-foreground">{selectedTaxCategoryOption?.description || 'Escolha a categoria fiscal mais adequada para a operacao.'}</p>
                            </div>
                          </div>
                          <div className="space-y-2">
                            <Label className="text-xs">Origem da Mercadoria</Label>
-                           <Select name="origin" defaultValue="0">
+                           <Select name="origin" defaultValue={editingProduct?.origin || '0'}>
                              <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
                              <SelectContent>
                                <SelectItem value="0">0 - Nacional</SelectItem>
@@ -5332,8 +8574,59 @@ function StockView({
                              </SelectContent>
                            </Select>
                          </div>
-                      </div>
-                    )}
+                         <div className="grid grid-cols-2 gap-4">
+                           <div className="space-y-2">
+                             <Label className="text-xs">CFOP (Opcional)</Label>
+                             <Select name="fiscalCfop" value={fiscalCfopValue} onValueChange={setFiscalCfopValue}>
+                               <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Selecione CFOP" /></SelectTrigger>
+                               <SelectContent>
+                                 {cfopOptions.map((opt) => (
+                                   <SelectItem key={`cfop-${opt.value}`} value={opt.value}>{opt.value}</SelectItem>
+                                 ))}
+                               </SelectContent>
+                             </Select>
+                             <p className="text-[10px] text-muted-foreground">{selectedCfopOption?.description || 'Codigo fiscal da natureza da operacao de venda.'}</p>
+                           </div>
+                           <div className="space-y-2">
+                             <Label className="text-xs">CST ICMS (Opcional)</Label>
+                             <Select name="fiscalCstIcms" value={fiscalCstIcmsValue} onValueChange={setFiscalCstIcmsValue}>
+                               <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Selecione CST ICMS" /></SelectTrigger>
+                               <SelectContent>
+                                 {cstIcmsOptions.map((opt) => (
+                                   <SelectItem key={`icms-${opt.value}`} value={opt.value}>{opt.value}</SelectItem>
+                                 ))}
+                               </SelectContent>
+                             </Select>
+                             <p className="text-[10px] text-muted-foreground">{selectedCstIcmsOption?.description || 'Situacao tributaria do ICMS para esta operacao.'}</p>
+                           </div>
+                         </div>
+                         <div className="grid grid-cols-2 gap-4">
+                           <div className="space-y-2">
+                             <Label className="text-xs">CST PIS (Opcional)</Label>
+                             <Select name="fiscalCstPis" value={fiscalCstPisValue} onValueChange={setFiscalCstPisValue}>
+                               <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Selecione CST PIS" /></SelectTrigger>
+                               <SelectContent>
+                                 {cstPisOptions.map((opt) => (
+                                   <SelectItem key={`pis-${opt.value}`} value={opt.value}>{opt.value}</SelectItem>
+                                 ))}
+                               </SelectContent>
+                             </Select>
+                             <p className="text-[10px] text-muted-foreground">{selectedCstPisOption?.description || 'Classificacao da tributacao do PIS na saida.'}</p>
+                           </div>
+                           <div className="space-y-2">
+                             <Label className="text-xs">CST COFINS (Opcional)</Label>
+                             <Select name="fiscalCstCofins" value={fiscalCstCofinsValue} onValueChange={setFiscalCstCofinsValue}>
+                               <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Selecione CST COFINS" /></SelectTrigger>
+                               <SelectContent>
+                                 {cstCofinsOptions.map((opt) => (
+                                   <SelectItem key={`cofins-${opt.value}`} value={opt.value}>{opt.value}</SelectItem>
+                                 ))}
+                               </SelectContent>
+                             </Select>
+                             <p className="text-[10px] text-muted-foreground">{selectedCstCofinsOption?.description || 'Classificacao da tributacao da COFINS na saida.'}</p>
+                           </div>
+                         </div>
+                    </div>
                   </div>
                 </div>
                 <DialogFooter>
@@ -5345,6 +8638,91 @@ function StockView({
                   <Button type="submit">Salvar Produto</Button>
                 </DialogFooter>
               </form>
+            </DialogContent>
+          </Dialog>
+
+          {/* Modal de resultados NCM */}
+          <Dialog open={isNcmResultsModalOpen} onOpenChange={setIsNcmResultsModalOpen}>
+            <DialogContent className="w-full max-w-[calc(100%-2rem)] sm:max-w-4xl">
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-primary" />
+                  Resultados NCM — {productNameValue}
+                </DialogTitle>
+                <DialogDescription>
+                  {filteredNcmModalResults.length} de {ncmLookupResults.length} resultado(s). Você pode filtrar por capítulo e pesquisar por código NCM ou descrição.
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="space-y-3">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                  <div className="md:col-span-2">
+                    <Input
+                      placeholder="Filtrar por código (ex: 8517) ou descrição..."
+                      value={ncmModalSearch}
+                      onChange={(e) => setNcmModalSearch(e.target.value)}
+                      className="h-9 text-sm"
+                      autoFocus
+                    />
+                  </div>
+                  <div>
+                    <Select value={ncmModalChapterFilter} onValueChange={setNcmModalChapterFilter}>
+                      <SelectTrigger className="h-9 text-xs">
+                        <SelectValue placeholder="Capítulo" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">Todos os capítulos</SelectItem>
+                        {ncmModalChapterOptions.map((chapter) => (
+                          <SelectItem key={`chapter-${chapter}`} value={chapter}>Capítulo {chapter}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <p className="text-[10px] text-muted-foreground">
+                  Base local de NCM com atualização automática periódica. A API externa é usada como backup quando necessário.
+                </p>
+                <div className="max-h-[55vh] overflow-y-auto rounded-md border custom-scrollbar">
+                  <table className="w-full text-sm">
+                    <thead className="sticky top-0 bg-secondary/80 backdrop-blur-sm z-10">
+                      <tr>
+                        <th className="px-4 py-2 text-left text-[10px] font-black uppercase tracking-widest w-32">Código NCM</th>
+                        <th className="px-4 py-2 text-left text-[10px] font-black uppercase tracking-widest">Descrição</th>
+                        <th className="px-4 py-2 w-24"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredNcmModalResults
+                        .map((item, index) => (
+                          <tr
+                            key={`${item.codigo}-${index}`}
+                            className={`border-b transition-colors cursor-pointer hover:bg-primary/8 ${selectedNcmLookupCode === item.codigo ? 'bg-primary/10 font-medium' : index % 2 === 0 ? 'bg-background' : 'bg-secondary/10'}`}
+                            onClick={() => handleSelectNcmLookupResult(item)}
+                          >
+                            <td className="px-4 py-2.5 font-mono text-xs font-bold text-primary">{item.codigo}</td>
+                            <td className="px-4 py-2.5 text-xs leading-snug">{item.descricao}</td>
+                            <td className="px-4 py-2.5 text-right">
+                              {selectedNcmLookupCode === item.codigo ? (
+                                <span className="text-[10px] font-black uppercase text-primary">Selecionado</span>
+                              ) : (
+                                <span className="text-[10px] text-muted-foreground">Selecionar</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                  {filteredNcmModalResults.length === 0 && (
+                    <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+                      <p className="text-sm">Nenhum resultado para "{ncmModalSearch}"</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setIsNcmResultsModalOpen(false)}>Fechar</Button>
+              </DialogFooter>
             </DialogContent>
           </Dialog>
         </div>
@@ -5577,7 +8955,7 @@ function StockView({
               <div className="relative flex-1">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
                 <Input 
-                  placeholder="Buscar produto por nome ou SKU..." 
+                  placeholder="Buscar produto por nome, marca, modelo ou SKU..." 
                   className="pl-9" 
                   value={stockSearch}
                   onChange={(e) => setStockSearch(e.target.value)}
@@ -5615,6 +8993,7 @@ function StockView({
                     <th className="px-6 py-3">Categoria</th>
                     <th className="px-6 py-3">Preço Venda</th>
                     <th className="px-6 py-3">Estoque</th>
+                    <th className="px-6 py-3">Conf. Fiscal</th>
                     <th className="px-6 py-3 text-center">Status</th>
                     <th className="px-6 py-3 text-right">Ações</th>
                   </tr>
@@ -5622,7 +9001,36 @@ function StockView({
                 <tbody className="divide-y">
                   {filteredStockProducts.length > 0 ? filteredStockProducts.map((p) => (
                     <tr key={p.id} className="hover:bg-secondary/10 transition-colors">
-                      <td className="px-6 py-4 font-medium">{p.name}</td>
+                      <td className="px-6 py-4 font-medium">
+                        <div className="flex items-center gap-3">
+                          <div className="w-12 h-12 rounded-lg border bg-secondary/20 overflow-hidden flex items-center justify-center">
+                            {p.image ? (
+                              <img
+                                src={p.image}
+                                alt={p.name}
+                                className={cn(
+                                  'w-full h-full',
+                                  p.imageFit === 'contain'
+                                    ? 'object-contain'
+                                    : p.imageFit === 'fill'
+                                      ? 'object-fill'
+                                      : 'object-cover'
+                                )}
+                              />
+                            ) : (
+                              <ImageIcon className="w-4 h-4 text-muted-foreground" />
+                            )}
+                          </div>
+                          <div>
+                            <p className="flex items-center flex-wrap gap-0.5">{p.name}{p.importedFromBackup && <BackupBadge />}</p>
+                            {(p.brand || p.model) && (
+                              <p className="text-[10px] text-muted-foreground uppercase tracking-wide">
+                                {[p.brand, p.model].filter(Boolean).join(' / ')}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      </td>
                       <td className="px-6 py-4 text-xs font-mono">{p.sku}</td>
                       <td className="px-6 py-4">{p.cat}</td>
                       <td className="px-6 py-4 font-semibold">R$ {p.price.toFixed(2)}</td>
@@ -5633,6 +9041,19 @@ function StockView({
                           </span>
                           <span className="text-xs text-muted-foreground">/ min {p.min}</span>
                         </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        {(() => {
+                          const confidence = getProductFiscalConfidence(p);
+                          return (
+                            <div className="flex flex-col gap-1">
+                              <span className={cn('inline-flex items-center justify-center rounded-md border px-2 py-1 text-[10px] font-black uppercase w-fit', confidence.className)}>
+                                {confidence.level}
+                              </span>
+                              <span className="text-[10px] text-muted-foreground">{confidence.score}%</span>
+                            </div>
+                          );
+                        })()}
                       </td>
                       <td className="px-6 py-4 text-center">
                         <Badge variant={p.stock <= p.min ? 'destructive' : 'success'}>
@@ -6717,17 +10138,17 @@ function KanbanView({
                               "p-4 rounded-lg shadow-sm border transition-all cursor-pointer",
                               (() => {
                                 switch (os.status) {
-                                  case 'Aberta': return 'bg-blue-50/80';
-                                  case 'Em análise': return 'bg-purple-50/80';
-                                  case 'Aguardando aprovação': return 'bg-yellow-50/80';
-                                  case 'Aguardando peça': return 'bg-orange-50/80';
-                                  case 'Em reparo': return 'bg-indigo-50/80';
-                                  case 'Testes finais': return 'bg-cyan-50/80';
-                                  case 'Pronta': return 'bg-emerald-50/80';
-                                  case 'Entregue': return 'bg-slate-50/80';
-                                  case 'Finalizada': return 'bg-green-50/80';
-                                  case 'Cancelada': return 'bg-rose-50/80';
-                                  default: return 'bg-white';
+                                  case 'Aberta': return 'bg-blue-50/80 dark:bg-blue-500/10';
+                                  case 'Em análise': return 'bg-purple-50/80 dark:bg-purple-500/10';
+                                  case 'Aguardando aprovação': return 'bg-yellow-50/80 dark:bg-yellow-500/10';
+                                  case 'Aguardando peça': return 'bg-orange-50/80 dark:bg-orange-500/10';
+                                  case 'Em reparo': return 'bg-indigo-50/80 dark:bg-indigo-500/10';
+                                  case 'Testes finais': return 'bg-cyan-50/80 dark:bg-cyan-500/10';
+                                  case 'Pronta': return 'bg-emerald-50/80 dark:bg-emerald-500/10';
+                                  case 'Entregue': return 'bg-slate-50/80 dark:bg-slate-500/10';
+                                  case 'Finalizada': return 'bg-green-50/80 dark:bg-green-500/10';
+                                  case 'Cancelada': return 'bg-rose-50/80 dark:bg-rose-500/10';
+                                  default: return 'bg-white dark:bg-card';
                                 }
                               })(),
                               draggableSnapshot.isDragging ? "shadow-xl ring-2 ring-primary/20 border-primary" : "border-transparent hover:border-primary/20"
@@ -7131,7 +10552,9 @@ function POSView({
 
   const filteredProducts = products.filter(p => 
     fuzzyMatch(p.name, search) || 
-    fuzzyMatch(p.sku, search)
+    fuzzyMatch(p.sku, search) ||
+    fuzzyMatch(String(p.brand || ''), search) ||
+    fuzzyMatch(String(p.model || ''), search)
   );
 
   const addToCart = (product: typeof products[0]) => {
@@ -7468,7 +10891,7 @@ function POSView({
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
               <Input 
                 id="pos-search"
-                placeholder="Pesquisar Produto ou SKU (F4)..." 
+                placeholder="Pesquisar Produto, Marca, Modelo ou SKU (F4)..." 
                 className="pl-10 h-12 text-lg font-medium border-2 focus-visible:ring-primary"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
@@ -7484,6 +10907,9 @@ function POSView({
                       <div>
                         <p className="font-bold text-lg">{p.name}</p>
                         <p className="text-xs text-muted-foreground font-mono uppercase">{p.sku}</p>
+                        {(p.brand || p.model) && (
+                          <p className="text-[10px] text-muted-foreground uppercase tracking-wide">{[p.brand, p.model].filter(Boolean).join(' / ')}</p>
+                        )}
                       </div>
                       <div className="text-right">
                         <p className="font-black text-primary text-xl">R$ {p.price.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
@@ -8276,7 +11702,7 @@ function TechnicalSupportView({
     const intentTokens = new Set(tokenize(userMessageText));
     return allProducts
       .map((item) => {
-        const productText = `${item.name || ''} ${item.sku || ''}`;
+        const productText = `${item.name || ''} ${item.sku || ''} ${item.brand || ''} ${item.model || ''}`;
         const productTokens = tokenize(productText);
         const equipmentHits = productTokens.filter((token) => equipmentTokens.has(token)).length;
         const intentHits = productTokens.filter((token) => intentTokens.has(token)).length;
@@ -8894,6 +12320,757 @@ function TechnicalSupportView({
   );
 }
 
+// ─── Migration Assistant ──────────────────────────────────────────────────────
+
+type MigrationEntityType = 'produtos' | 'clientes' | 'os' | 'servicos' | 'fornecedores';
+
+interface MigrationFieldDef {
+  key: string;
+  label: string;
+  required?: boolean;
+}
+
+const MIGRATION_ENTITY_FIELDS: Record<MigrationEntityType, MigrationFieldDef[]> = {
+  produtos: [
+    { key: 'name', label: 'Nome', required: true },
+    { key: 'sku', label: 'SKU / Código' },
+    { key: 'category', label: 'Categoria' },
+    { key: 'brand', label: 'Marca' },
+    { key: 'model', label: 'Modelo' },
+    { key: 'cost', label: 'Valor de Custo' },
+    { key: 'price', label: 'Valor de Venda', required: true },
+    { key: 'stock', label: 'Estoque' },
+    { key: 'ncm', label: 'NCM' },
+    { key: 'cest', label: 'CEST' },
+    { key: 'fiscalCfop', label: 'CFOP' },
+    { key: 'fiscalCstIcms', label: 'CST ICMS' },
+    { key: 'fiscalCstPis', label: 'CST PIS' },
+    { key: 'fiscalCstCofins', label: 'CST COFINS' },
+    { key: 'origin', label: 'Origem (0-8)' },
+    { key: 'supplierId', label: 'Fornecedor (nome ou ID)' },
+  ],
+  clientes: [
+    { key: 'name', label: 'Nome Completo', required: true },
+    { key: 'document', label: 'CPF / CNPJ' },
+    { key: 'ie', label: 'Inscrição Estadual' },
+    { key: 'email', label: 'E-mail' },
+    { key: 'phone', label: 'Telefone Principal' },
+    { key: 'phone2', label: 'Telefone Secundário' },
+    { key: 'addressStreet', label: 'Logradouro' },
+    { key: 'addressNumber', label: 'Número' },
+    { key: 'addressNeighborhood', label: 'Bairro' },
+    { key: 'addressCity', label: 'Cidade' },
+    { key: 'addressState', label: 'Estado (UF)' },
+    { key: 'addressZip', label: 'CEP' },
+  ],
+  os: [
+    { key: 'customerName', label: 'Nome do Cliente', required: true },
+    { key: 'equipment', label: 'Equipamento', required: true },
+    { key: 'brand', label: 'Marca' },
+    { key: 'model', label: 'Modelo' },
+    { key: 'serialNumber', label: 'Número de Série' },
+    { key: 'defect', label: 'Defeito Relatado' },
+    { key: 'accessories', label: 'Acessórios' },
+    { key: 'status', label: 'Status' },
+    { key: 'value', label: 'Valor Total' },
+    { key: 'diagnosisDeadline', label: 'Prazo de Diagnóstico' },
+    { key: 'completionDeadline', label: 'Prazo de Conclusão / Data' },
+  ],
+  servicos: [
+    { key: 'name', label: 'Nome do Serviço', required: true },
+    { key: 'fiscalServiceCode', label: 'Código Fiscal (ISS/LC116)' },
+    { key: 'price', label: 'Valor', required: true },
+    { key: 'category', label: 'Categoria' },
+  ],
+  fornecedores: [
+    { key: 'name', label: 'Razão Social / Nome', required: true },
+    { key: 'document', label: 'CNPJ / CPF' },
+    { key: 'email', label: 'E-mail' },
+    { key: 'phone', label: 'Telefone' },
+    { key: 'contactName', label: 'Pessoa de Contato' },
+    { key: 'category', label: 'Categoria' },
+    { key: 'address', label: 'Endereço' },
+  ],
+};
+
+const MIGRATION_ENTITY_LABELS: Record<MigrationEntityType, string> = {
+  produtos: 'Produtos',
+  clientes: 'Clientes',
+  os: 'Ordens de Serviço',
+  servicos: 'Serviços',
+  fornecedores: 'Fornecedores',
+};
+
+function parseCsvText(text: string): { headers: string[]; rows: Record<string, string>[] } {
+  const lines = text.trim().split(/\r?\n/).filter(l => l.trim() !== '');
+  if (lines.length === 0) return { headers: [], rows: [] };
+
+  const parseLine = (line: string): string[] => {
+    const result: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if ((ch === ',' || ch === ';' || ch === '\t') && !inQuotes) {
+        result.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    result.push(current.trim());
+    return result;
+  };
+
+  const headers = parseLine(lines[0]);
+  const rows = lines.slice(1).map(line => {
+    const cols = parseLine(line);
+    const row: Record<string, string> = {};
+    headers.forEach((h, i) => { row[h] = cols[i] ?? ''; });
+    return row;
+  });
+  return { headers, rows };
+}
+
+function BackupBadge() {
+  return (
+    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-100 text-amber-700 border border-amber-300 ml-1 align-middle select-none">
+      <Database className="w-2.5 h-2.5" />
+      backup
+    </span>
+  );
+}
+
+function MigrationAssistantView({
+  activeCompanyId,
+  setAllProducts,
+  setGlobalCustomers,
+  setAllOrders,
+  setSuppliers,
+}: {
+  activeCompanyId: string;
+  setAllProducts: React.Dispatch<React.SetStateAction<any[]>>;
+  setGlobalCustomers: React.Dispatch<React.SetStateAction<any[]>>;
+  setAllOrders: React.Dispatch<React.SetStateAction<ServiceOrder[]>>;
+  setSuppliers: React.Dispatch<React.SetStateAction<Supplier[]>>;
+}) {
+  const [activeEntity, setActiveEntity] = useState<MigrationEntityType>('produtos');
+  const [step, setStep] = useState<'paste' | 'map' | 'preview' | 'done'>('paste');
+  const [csvText, setCsvText] = useState('');
+  const [parsedHeaders, setParsedHeaders] = useState<string[]>([]);
+  const [parsedRows, setParsedRows] = useState<Record<string, string>[]>([]);
+  const [columnMapping, setColumnMapping] = useState<Record<string, string>>({});
+  const [importedCount, setImportedCount] = useState(0);
+
+  const entityFields = MIGRATION_ENTITY_FIELDS[activeEntity];
+
+  const resetWizard = () => {
+    setStep('paste');
+    setCsvText('');
+    setParsedHeaders([]);
+    setParsedRows([]);
+    setColumnMapping({});
+    setImportedCount(0);
+  };
+
+  const handleEntityChange = (entity: MigrationEntityType) => {
+    setActiveEntity(entity);
+    resetWizard();
+  };
+
+  const handleParse = () => {
+    const { headers, rows } = parseCsvText(csvText);
+    if (headers.length === 0 || rows.length === 0) {
+      toast.error('Nenhum dado encontrado. Verifique o formato do arquivo.');
+      return;
+    }
+    setParsedHeaders(headers);
+    setParsedRows(rows);
+    // Auto-map columns by fuzzy label match
+    const autoMap: Record<string, string> = {};
+    entityFields.forEach(field => {
+      const match = headers.find(h =>
+        h.toLowerCase().replace(/[_\s-]/g, '') === field.label.toLowerCase().replace(/[_\s-]/g, '') ||
+        h.toLowerCase().replace(/[_\s-]/g, '') === field.key.toLowerCase()
+      );
+      if (match) autoMap[field.key] = match;
+    });
+    setColumnMapping(autoMap);
+    setStep('map');
+  };
+
+  const handleConfirmMapping = () => {
+    const requiredMissing = entityFields
+      .filter(f => f.required && !columnMapping[f.key])
+      .map(f => f.label);
+    if (requiredMissing.length > 0) {
+      toast.error(`Campos obrigatórios não mapeados: ${requiredMissing.join(', ')}`);
+      return;
+    }
+    setStep('preview');
+  };
+
+  const mapRow = (row: Record<string, string>): Record<string, string> => {
+    const result: Record<string, string> = {};
+    entityFields.forEach(field => {
+      const srcCol = columnMapping[field.key];
+      result[field.key] = srcCol ? (row[srcCol] ?? '') : '';
+    });
+    return result;
+  };
+
+  const handleImport = () => {
+    const now = new Date().toISOString();
+    const mapped = parsedRows.map(row => mapRow(row));
+
+    if (activeEntity === 'produtos') {
+      const newItems = mapped.map(r => ({
+        id: `mig_${Math.random().toString(36).slice(2)}`,
+        name: r.name || 'Produto Importado',
+        sku: r.sku || '',
+        brand: r.brand || '',
+        model: r.model || '',
+        category: r.category || '',
+        cost: parseFloat(r.cost) || 0,
+        price: parseFloat(r.price) || 0,
+        stock: parseInt(r.stock) || 0,
+        minStock: 0,
+        ncm: r.ncm || '',
+        cest: r.cest || '',
+        fiscalCfop: r.fiscalCfop || '',
+        fiscalCstIcms: r.fiscalCstIcms || '',
+        fiscalCstPis: r.fiscalCstPis || '',
+        fiscalCstCofins: r.fiscalCstCofins || '',
+        origin: r.origin || '0',
+        companyId: activeCompanyId,
+        importedFromBackup: true,
+      }));
+      setAllProducts(prev => [...prev, ...newItems]);
+    } else if (activeEntity === 'clientes') {
+      const newItems = mapped.map(r => ({
+        id: `mig_${Math.random().toString(36).slice(2)}`,
+        name: r.name || 'Cliente Importado',
+        document: r.document || '',
+        ie: r.ie || '',
+        email: r.email || '',
+        phone: r.phone || '',
+        phone2: r.phone2 || '',
+        address: [r.addressStreet, r.addressNumber, r.addressNeighborhood, r.addressCity, r.addressState].filter(Boolean).join(', '),
+        addressStreet: r.addressStreet || '',
+        addressNumber: r.addressNumber || '',
+        addressNeighborhood: r.addressNeighborhood || '',
+        addressCity: r.addressCity || '',
+        addressState: r.addressState || '',
+        addressZip: r.addressZip || '',
+        companyId: activeCompanyId,
+        importedFromBackup: true,
+      }));
+      setGlobalCustomers(prev => [...prev, ...newItems]);
+    } else if (activeEntity === 'os') {
+      const newItems: ServiceOrder[] = mapped.map(r => ({
+        id: `mig_${Math.random().toString(36).slice(2)}`,
+        number: `MIG-${Math.floor(Math.random() * 90000) + 10000}`,
+        customerId: '',
+        customerName: r.customerName || 'Cliente Importado',
+        equipment: r.equipment || '',
+        brand: r.brand || '',
+        model: r.model || '',
+        serialNumber: r.serialNumber || '',
+        defect: r.defect || '',
+        accessories: r.accessories || '',
+        status: (r.status as any) || 'Aberta',
+        priority: 'Média',
+        value: parseFloat(r.value) || 0,
+        diagnosisDeadline: r.diagnosisDeadline || undefined,
+        completionDeadline: r.completionDeadline || undefined,
+        createdAt: now,
+        updatedAt: now,
+        companyId: activeCompanyId,
+        importedFromBackup: true,
+      }));
+      setAllOrders(prev => [...prev, ...newItems]);
+    } else if (activeEntity === 'servicos') {
+      const newItems = mapped.map(r => ({
+        id: `mig_${Math.random().toString(36).slice(2)}`,
+        name: r.name || 'Serviço Importado',
+        sku: r.fiscalServiceCode || '',
+        price: parseFloat(r.price) || 0,
+        stock: 9999,
+        minStock: 0,
+        cost: 0,
+        category: r.category || 'Serviço',
+        brand: '',
+        model: '',
+        companyId: activeCompanyId,
+        isService: true,
+        fiscalServiceCode: r.fiscalServiceCode || '',
+        importedFromBackup: true,
+      }));
+      setAllProducts(prev => [...prev, ...newItems]);
+    } else if (activeEntity === 'fornecedores') {
+      const newItems: Supplier[] = mapped.map(r => ({
+        id: `mig_${Math.random().toString(36).slice(2)}`,
+        name: r.name || 'Fornecedor Importado',
+        document: r.document || '',
+        email: r.email || '',
+        phone: r.phone || '',
+        address: r.address || '',
+        contactName: r.contactName || '',
+        category: r.category || '',
+        companyId: activeCompanyId,
+        importedFromBackup: true,
+      }));
+      setSuppliers(prev => [...prev, ...newItems]);
+    }
+
+    setImportedCount(mapped.length);
+    setStep('done');
+    toast.success(`${mapped.length} registros importados com tag de backup!`);
+  };
+
+  const entityIcons: Record<MigrationEntityType, React.ReactNode> = {
+    produtos: <Package className="w-4 h-4" />,
+    clientes: <Users className="w-4 h-4" />,
+    os: <Wrench className="w-4 h-4" />,
+    servicos: <Briefcase className="w-4 h-4" />,
+    fornecedores: <Truck className="w-4 h-4" />,
+  };
+
+  const entityColors: Record<MigrationEntityType, string> = {
+    produtos: 'bg-emerald-100 text-emerald-700 border-emerald-300',
+    clientes: 'bg-blue-100 text-blue-700 border-blue-300',
+    os: 'bg-purple-100 text-purple-700 border-purple-300',
+    servicos: 'bg-orange-100 text-orange-700 border-orange-300',
+    fornecedores: 'bg-rose-100 text-rose-700 border-rose-300',
+  };
+
+  const previewRows = parsedRows.slice(0, 5).map(mapRow);
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Assistente de Migração</h1>
+        <p className="text-muted-foreground">Importe dados de qualquer sistema externo e converta automaticamente para o formato do TechManager. Os registros importados recebem a tag <BackupBadge /> para identificação de origem.</p>
+      </div>
+
+      {/* Entity selector */}
+      <div className="flex flex-wrap gap-2">
+        {(Object.keys(MIGRATION_ENTITY_LABELS) as MigrationEntityType[]).map(entity => (
+          <button
+            key={entity}
+            onClick={() => handleEntityChange(entity)}
+            className={cn(
+              'flex items-center gap-2 px-4 py-2 rounded-full border text-sm font-semibold transition-all',
+              activeEntity === entity
+                ? entityColors[entity] + ' shadow-sm'
+                : 'bg-secondary/30 text-muted-foreground border-secondary hover:bg-secondary/60'
+            )}
+          >
+            {entityIcons[entity]}
+            {MIGRATION_ENTITY_LABELS[entity]}
+          </button>
+        ))}
+      </div>
+
+      <Card className="border-none shadow-sm">
+        <CardHeader className="pb-3">
+          <div className="flex items-center gap-3">
+            <div className={cn('p-2 rounded-lg border', entityColors[activeEntity])}>
+              {entityIcons[activeEntity]}
+            </div>
+            <div>
+              <CardTitle>Importar {MIGRATION_ENTITY_LABELS[activeEntity]}</CardTitle>
+              <CardDescription>
+                {step === 'paste' && 'Cole os dados em CSV, TSV ou JSON, ou faça upload de um arquivo.'}
+                {step === 'map' && `Mapeie as colunas do seu arquivo para os campos do TechManager. (${parsedRows.length} registros encontrados)`}
+                {step === 'preview' && `Pré-visualização dos primeiros 5 registros antes de importar.`}
+                {step === 'done' && `Importação concluída!`}
+              </CardDescription>
+            </div>
+          </div>
+          {/* Step indicator */}
+          <div className="flex items-center gap-2 pt-2">
+            {(['paste', 'map', 'preview', 'done'] as const).map((s, i) => (
+              <React.Fragment key={s}>
+                <div className={cn(
+                  'flex items-center gap-1.5 text-xs font-semibold px-2 py-1 rounded-full',
+                  step === s ? 'bg-primary text-primary-foreground' : 
+                  (['paste','map','preview','done'].indexOf(step) > i ? 'bg-emerald-100 text-emerald-700' : 'bg-secondary text-muted-foreground')
+                )}>
+                  {['paste','map','preview','done'].indexOf(step) > i ? <Check className="w-3 h-3" /> : <span>{i + 1}</span>}
+                  {s === 'paste' ? 'Dados' : s === 'map' ? 'Mapeamento' : s === 'preview' ? 'Prévia' : 'Concluído'}
+                </div>
+                {i < 3 && <ChevronRight className="w-3 h-3 text-muted-foreground" />}
+              </React.Fragment>
+            ))}
+          </div>
+        </CardHeader>
+
+        <CardContent className="space-y-4">
+          {/* Step 1: Paste data */}
+          {step === 'paste' && (
+            <div className="space-y-4">
+              <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700 flex gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <div>
+                  <p className="font-bold mb-1">Como usar:</p>
+                  <p>Exporte os dados do sistema de origem em formato CSV (separado por vírgula, ponto-e-vírgula ou tabulação). A primeira linha deve conter os nomes das colunas. Cole o conteúdo abaixo ou faça upload do arquivo.</p>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label className="font-semibold">Campos esperados para {MIGRATION_ENTITY_LABELS[activeEntity]}:</Label>
+                <div className="flex flex-wrap gap-1.5">
+                  {entityFields.map(f => (
+                    <span key={f.key} className={cn(
+                      'text-[11px] px-2 py-0.5 rounded-full border font-medium',
+                      f.required ? 'bg-rose-50 text-rose-700 border-rose-300' : 'bg-secondary/50 text-muted-foreground border-secondary'
+                    )}>
+                      {f.label}{f.required ? ' *' : ''}
+                    </span>
+                  ))}
+                </div>
+                <p className="text-[11px] text-muted-foreground">* Campos obrigatórios</p>
+              </div>
+
+              <div className="space-y-2">
+                <Label className="font-semibold">Cole aqui os dados (CSV / TSV / JSON):</Label>
+                <textarea
+                  className="w-full h-48 p-3 rounded-xl border bg-secondary/10 font-mono text-xs resize-y focus:outline-none focus:ring-2 focus:ring-primary/30"
+                  placeholder={`Exemplo CSV:\nnome,cpf,email,telefone\nJoão Silva,123.456.789-00,joao@email.com,(11) 99999-0000`}
+                  value={csvText}
+                  onChange={(e) => setCsvText(e.target.value)}
+                />
+              </div>
+
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-2 cursor-pointer px-4 py-2 border rounded-lg text-sm font-medium hover:bg-secondary/30 transition-colors">
+                  <Upload className="w-4 h-4" />
+                  Upload de Arquivo (.csv, .txt, .tsv)
+                  <input
+                    type="file"
+                    className="hidden"
+                    accept=".csv,.txt,.tsv,.xls,.xlsx"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const reader = new FileReader();
+                      reader.onload = (ev) => setCsvText(ev.target?.result as string || '');
+                      reader.readAsText(file, 'UTF-8');
+                    }}
+                  />
+                </label>
+                <Button onClick={handleParse} disabled={csvText.trim().length === 0} className="gap-2">
+                  <ArrowRight className="w-4 h-4" /> Avançar para Mapeamento
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 2: Column mapping */}
+          {step === 'map' && (
+            <div className="space-y-4">
+              <div className="rounded-xl border overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead className="bg-secondary/40 text-xs uppercase text-muted-foreground">
+                    <tr>
+                      <th className="px-4 py-3 text-left font-semibold">Campo TechManager</th>
+                      <th className="px-4 py-3 text-left font-semibold">Obrigatório</th>
+                      <th className="px-4 py-3 text-left font-semibold">Coluna do Arquivo</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y bg-white">
+                    {entityFields.map(field => (
+                      <tr key={field.key} className={cn('hover:bg-secondary/5', field.required && !columnMapping[field.key] ? 'bg-rose-50/40' : '')}>
+                        <td className="px-4 py-2.5 font-medium">{field.label}</td>
+                        <td className="px-4 py-2.5">
+                          {field.required ? (
+                            <span className="text-xs font-bold text-rose-600">Obrigatório</span>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">Opcional</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <Select
+                            value={columnMapping[field.key] || '__none__'}
+                            onValueChange={(val) => setColumnMapping(prev => ({
+                              ...prev,
+                              [field.key]: val === '__none__' ? '' : val,
+                            }))}
+                          >
+                            <SelectTrigger className="h-8 text-xs">
+                              <SelectValue placeholder="— não mapear —" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="__none__">— não mapear —</SelectItem>
+                              {parsedHeaders.map(h => (
+                                <SelectItem key={h} value={h}>{h}</SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex gap-3">
+                <Button variant="outline" onClick={() => setStep('paste')} className="gap-2">
+                  <ChevronLeft className="w-4 h-4" /> Voltar
+                </Button>
+                <Button onClick={handleConfirmMapping} className="gap-2">
+                  <ArrowRight className="w-4 h-4" /> Ver Pré-visualização
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 3: Preview */}
+          {step === 'preview' && (
+            <div className="space-y-4">
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700 flex gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <p>Mostrando os primeiros 5 de <strong>{parsedRows.length}</strong> registros a importar. Todos receberão a tag <strong>backup</strong> como identificador de origem externa.</p>
+              </div>
+              <div className="overflow-x-auto rounded-xl border">
+                <table className="w-full text-xs">
+                  <thead className="bg-secondary/40 text-[10px] uppercase text-muted-foreground">
+                    <tr>
+                      {entityFields.filter(f => columnMapping[f.key]).map(f => (
+                        <th key={f.key} className="px-3 py-2 text-left font-semibold whitespace-nowrap">{f.label}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y bg-white">
+                    {previewRows.map((row, i) => (
+                      <tr key={i} className="hover:bg-secondary/5">
+                        {entityFields.filter(f => columnMapping[f.key]).map(f => (
+                          <td key={f.key} className="px-3 py-2 max-w-[160px] truncate">
+                            {f.key === 'name' || f.key === 'customerName' ? (
+                              <span className="font-medium">{row[f.key]} <BackupBadge /></span>
+                            ) : row[f.key]}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex gap-3">
+                <Button variant="outline" onClick={() => setStep('map')} className="gap-2">
+                  <ChevronLeft className="w-4 h-4" /> Voltar
+                </Button>
+                <Button onClick={handleImport} className="gap-2 bg-emerald-600 hover:bg-emerald-700">
+                  <UploadCloud className="w-4 h-4" /> Importar {parsedRows.length} Registros
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 4: Done */}
+          {step === 'done' && (
+            <div className="py-8 flex flex-col items-center gap-4 text-center">
+              <div className="p-4 rounded-full bg-emerald-100 text-emerald-600">
+                <CheckCircle2 className="w-10 h-10" />
+              </div>
+              <div>
+                <h3 className="text-xl font-bold">Importação concluída!</h3>
+                <p className="text-muted-foreground mt-1"><strong>{importedCount}</strong> registros de <strong>{MIGRATION_ENTITY_LABELS[activeEntity]}</strong> foram importados com sucesso.</p>
+                <p className="text-sm text-muted-foreground mt-2">Todos os registros estão marcados com a tag <BackupBadge /> para indicar que vieram de outro sistema.</p>
+              </div>
+              <div className="flex gap-3">
+                <Button variant="outline" onClick={resetWizard} className="gap-2">
+                  <Upload className="w-4 h-4" /> Importar Mais Dados
+                </Button>
+                <Button onClick={() => handleEntityChange(activeEntity)} className="gap-2">
+                  <RefreshCw className="w-4 h-4" /> Nova Importação
+                </Button>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Field reference card */}
+      {step === 'paste' && (
+        <Card className="border-none shadow-sm">
+          <CardHeader>
+            <CardTitle className="text-base">Referência de campos — todos os módulos</CardTitle>
+            <CardDescription>Consulte aqui os campos aceitos por cada tipo de registro.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {(Object.entries(MIGRATION_ENTITY_FIELDS) as [MigrationEntityType, MigrationFieldDef[]][]).map(([entity, fields]) => (
+                <div key={entity} className="p-3 rounded-xl border space-y-2">
+                  <div className={cn('flex items-center gap-2 text-xs font-bold px-2 py-1 rounded-full w-fit border', entityColors[entity])}>
+                    {entityIcons[entity]}
+                    {MIGRATION_ENTITY_LABELS[entity]}
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {fields.map(f => (
+                      <span key={f.key} className={cn(
+                        'text-[10px] px-1.5 py-0.5 rounded border',
+                        f.required ? 'bg-rose-50 text-rose-600 border-rose-200 font-bold' : 'bg-secondary/40 text-muted-foreground border-secondary'
+                      )}>{f.label}</span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function AccountantAssistantView({
+  company,
+  allProducts,
+}: {
+  company: Company;
+  allProducts: any[];
+}) {
+  const [activityQuery, setActivityQuery] = useState(company.fiscalActivitySearchTerm || company.fiscalActivitySector || '');
+
+  const activityMatches = useMemo(() => searchFiscalActivities(activityQuery).slice(0, 8), [activityQuery]);
+  const selectedServices = useMemo(
+    () => ACCOUNTANT_ASSISTANT_SERVICE_OPTIONS.filter((item) => (company.accountantServices || []).includes(item.id)),
+    [company.accountantServices]
+  );
+
+  const fiscalSummary = useMemo(() => {
+    const total = allProducts.length;
+    const missingNcm = allProducts.filter((p) => onlyDigits(String(p?.ncm || '')).length !== 8).length;
+    const missingCest = allProducts.filter((p) => !String(p?.cest || '').trim()).length;
+    const missingCfop = allProducts.filter((p) => !String(p?.fiscalCfop || '').trim()).length;
+    const missingCst = allProducts.filter(
+      (p) => !String(p?.fiscalCstIcms || '').trim() || !String(p?.fiscalCstPis || '').trim() || !String(p?.fiscalCstCofins || '').trim()
+    ).length;
+    return { total, missingNcm, missingCest, missingCfop, missingCst };
+  }, [allProducts]);
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Assistente Contador</h1>
+        <p className="text-muted-foreground">Painel fiscal com foco em cadastro de produtos, NCM e codigos tributarios.</p>
+      </div>
+
+      <Card className="border-none shadow-sm">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Briefcase className="w-4 h-4 text-primary" /> Estado do Assistente
+          </CardTitle>
+          <CardDescription>Visao geral das configuracoes fiscais e dos servicos ativos.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <div className="rounded-lg border p-3 bg-secondary/20">
+              <p className="text-[11px] text-muted-foreground">Status</p>
+              <p className="text-sm font-semibold">{company.accountantAssistantEnabled ? 'Ativo' : 'Inativo'}</p>
+            </div>
+            <div className="rounded-lg border p-3 bg-secondary/20">
+              <p className="text-[11px] text-muted-foreground">UF fiscal</p>
+              <p className="text-sm font-semibold">{company.fiscalUf || 'Nao definida'}</p>
+            </div>
+            <div className="rounded-lg border p-3 bg-secondary/20">
+              <p className="text-[11px] text-muted-foreground">Codigo atividade</p>
+              <p className="text-sm font-semibold">{company.fiscalActivityCode || 'Nao definido'}</p>
+            </div>
+            <div className="rounded-lg border p-3 bg-secondary/20">
+              <p className="text-[11px] text-muted-foreground">Lembrete</p>
+              <p className="text-sm font-semibold">
+                {company.accountantReminderEnabled === false
+                  ? 'Desativado'
+                  : `A cada ${Math.max(1, Number(company.accountantReminderFrequencyDays) || 7)} dia(s)`}
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <p className="text-xs font-semibold">Servicos acompanhados</p>
+            {selectedServices.length === 0 ? (
+              <div className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+                  Nenhum servico selecionado. Configure em Configuracoes {'>'} Config. Sistema {'>'} Assistente Contador.
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {selectedServices.map((service) => (
+                  <Badge key={`svc-${service.id}`} variant="outline" className="text-[11px]">
+                    {service.label}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-none shadow-sm">
+        <CardHeader>
+          <CardTitle>Diagnostico Fiscal dos Produtos</CardTitle>
+          <CardDescription>Resumo rapido dos pontos que normalmente exigem revisao contabil.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+            <div className="rounded-lg border p-3">
+              <p className="text-[11px] text-muted-foreground">Total de produtos</p>
+              <p className="text-2xl font-bold">{fiscalSummary.total}</p>
+            </div>
+            <div className="rounded-lg border p-3">
+              <p className="text-[11px] text-muted-foreground">NCM pendente</p>
+              <p className="text-2xl font-bold text-rose-600">{fiscalSummary.missingNcm}</p>
+            </div>
+            <div className="rounded-lg border p-3">
+              <p className="text-[11px] text-muted-foreground">CEST pendente</p>
+              <p className="text-2xl font-bold text-amber-600">{fiscalSummary.missingCest}</p>
+            </div>
+            <div className="rounded-lg border p-3">
+              <p className="text-[11px] text-muted-foreground">CFOP pendente</p>
+              <p className="text-2xl font-bold text-amber-600">{fiscalSummary.missingCfop}</p>
+            </div>
+            <div className="rounded-lg border p-3">
+              <p className="text-[11px] text-muted-foreground">CST incompleto</p>
+              <p className="text-2xl font-bold text-amber-600">{fiscalSummary.missingCst}</p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-none shadow-sm">
+        <CardHeader>
+          <CardTitle>Consulta de Atividade Fiscal</CardTitle>
+          <CardDescription>Digite ramo, palavra-chave ou codigo para ver sugestoes de atividade.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Input
+            value={activityQuery}
+            onChange={(e) => setActivityQuery(e.target.value)}
+            placeholder="Ex: telefonia, assistencia tecnica, 4752100"
+          />
+          <div className="grid gap-2">
+            {activityMatches.map((item) => (
+              <div key={`acc-activity-${item.code}`} className="rounded-md border px-3 py-2 text-xs bg-secondary/10">
+                <p className="font-semibold">{item.code} - {item.name}</p>
+                <p className="text-muted-foreground mt-1">
+                  Sugestao: {item.suggestedTaxCategory || '-'} | CFOP {item.suggestedCfop || '-'} | CST ICMS {item.suggestedCstIcms || '-'}
+                </p>
+              </div>
+            ))}
+            {activityMatches.length === 0 && (
+              <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
+                Nenhuma atividade encontrada para o termo informado.
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function SettingsView({ 
   user, 
   companyLogo, 
@@ -9500,19 +13677,63 @@ function SettingsView({
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setCompanyLogo(reader.result as string);
-        toast.success('Logotipo atualizado com sucesso!');
-      };
-      reader.readAsDataURL(file);
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      toast.error('Selecione uma imagem valida para o logotipo.');
+      e.target.value = '';
+      return;
     }
+
+    const maxLogoSize = 2 * 1024 * 1024;
+    if (file.size > maxLogoSize) {
+      toast.error('O logotipo deve ter no maximo 2MB.');
+      e.target.value = '';
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const logo = reader.result as string;
+      setCompanyLogo(logo);
+      setCompany((prev) => ({ ...prev, logo }));
+      toast.success('Logotipo atualizado com sucesso!');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleLogoRemove = () => {
+    setCompanyLogo(null);
+    setCompany((prev) => ({ ...prev, logo: undefined }));
+    toast.success('Logotipo removido.');
   };
 
   const saasCatalogOptions = aiProviderConfig.providerCatalogs || [];
   const selectedSaasCatalogForCompany =
     saasCatalogOptions.find((catalog) => catalog.id === company.aiSaasCatalogId) || saasCatalogOptions[0] || null;
+  const fiscalActivityMatches = useMemo(
+    () => searchFiscalActivities(company.fiscalActivitySearchTerm || `${company.fiscalActivitySector || ''} ${company.fiscalActivityCode || ''}`).slice(0, 6),
+    [company.fiscalActivitySearchTerm, company.fiscalActivitySector, company.fiscalActivityCode]
+  );
+
+  const applyFiscalActivitySuggestion = (item: FiscalActivityTemplate) => {
+    setCompany((prev) => ({
+      ...prev,
+      fiscalActivitySearchTerm: `${item.code} - ${item.name}`,
+      fiscalActivityCode: item.code,
+      fiscalActivitySector: item.name,
+    }));
+  };
+
+  const toggleAccountantService = (serviceId: string) => {
+    setCompany((prev) => {
+      const current = Array.isArray(prev.accountantServices) ? prev.accountantServices : [];
+      const next = current.includes(serviceId)
+        ? current.filter((item) => item !== serviceId)
+        : [...current, serviceId];
+      return { ...prev, accountantServices: next };
+    });
+  };
 
   return (
     <div className="space-y-6">
@@ -10034,7 +14255,7 @@ function SettingsView({
                         </label>
                       </Button>
                       {companyLogo && (
-                        <Button variant="ghost" size="sm" className="text-rose-500 block" onClick={() => setCompanyLogo(null)}>
+                        <Button variant="ghost" size="sm" className="text-rose-500 block" onClick={handleLogoRemove}>
                           Remover
                         </Button>
                       )}
@@ -10059,31 +14280,37 @@ function SettingsView({
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>CNPJ</Label>
+                  <Label>CNPJ/CPF</Label>
                   <Input 
                     value={company.cnpj} 
-                    onChange={(e) => setCompany({...company, cnpj: e.target.value})}
+                    onChange={(e) => setCompany({...company, cnpj: formatCpfCnpj(e.target.value)})}
                   />
                 </div>
                 <div className="space-y-2">
                   <Label>Inscrição Estadual</Label>
                   <Input 
                     value={company.ie || 'ISENTO'} 
-                    onChange={(e) => setCompany({...company, ie: e.target.value} as any)}
+                    onChange={(e) => setCompany({...company, ie: formatStateRegistration(e.target.value)} as any)}
                   />
                 </div>
                 <div className="space-y-2">
                   <Label>E-mail de Contato</Label>
                   <Input 
                     value={company.email} 
-                    onChange={(e) => setCompany({...company, email: e.target.value})}
+                    onChange={(e) => setCompany({...company, email: normalizeEmail(e.target.value)})}
+                    onBlur={(e) => {
+                      if (!isValidOptionalEmail(e.target.value)) {
+                        toast.error('Informe um e-mail válido, como nome@provedor.com, ou deixe vazio.');
+                        setCompany(prev => ({ ...prev, email: '' }));
+                      }
+                    }}
                   />
                 </div>
                 <div className="space-y-2">
                   <Label>Telefone</Label>
                   <Input 
                     value={company.phone} 
-                    onChange={(e) => setCompany({...company, phone: e.target.value})}
+                    onChange={(e) => setCompany({...company, phone: formatPhone(e.target.value)})}
                   />
                 </div>
               </div>
@@ -10174,14 +14401,224 @@ function SettingsView({
                       <p className="text-sm font-medium">Enviar WhatsApp na Abertura</p>
                       <p className="text-xs text-muted-foreground">Notifica o cliente assim que a OS é criada.</p>
                     </div>
-                    <Button variant="outline" size="sm">Ativado</Button>
+                    <Select
+                      value={company.notifyWhatsappOnOpen !== false ? 'ATIVADO' : 'DESATIVADO'}
+                      onValueChange={(value) =>
+                        setCompany((prev) => ({ ...prev, notifyWhatsappOnOpen: value === 'ATIVADO' }))
+                      }
+                    >
+                      <SelectTrigger className="w-36 h-9 text-xs font-bold">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="ATIVADO">ATIVADO</SelectItem>
+                        <SelectItem value="DESATIVADO">DESATIVADO</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
                   <div className="flex items-center justify-between p-3 rounded-lg bg-secondary/20">
                     <div>
                       <p className="text-sm font-medium">Notificar Orçamento Pronto</p>
                       <p className="text-xs text-muted-foreground">Envia link do orçamento quando o status mudar.</p>
                     </div>
-                    <Button variant="outline" size="sm">Ativado</Button>
+                    <Select
+                      value={company.notifyBudgetReady !== false ? 'ATIVADO' : 'DESATIVADO'}
+                      onValueChange={(value) =>
+                        setCompany((prev) => ({ ...prev, notifyBudgetReady: value === 'ATIVADO' }))
+                      }
+                    >
+                      <SelectTrigger className="w-36 h-9 text-xs font-bold">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="ATIVADO">ATIVADO</SelectItem>
+                        <SelectItem value="DESATIVADO">DESATIVADO</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex items-center justify-between p-3 rounded-lg bg-secondary/20">
+                    <div>
+                      <p className="text-sm font-medium">Modo Fiscal Estrito (Produtos)</p>
+                      <p className="text-xs text-muted-foreground">Quando ativo, exige NCM válido e selecionado da lista oficial para salvar produtos.</p>
+                    </div>
+                    <Select
+                      value={company.fiscalStrictModeEnabled !== false ? 'ATIVADO' : 'DESATIVADO'}
+                      onValueChange={(value) =>
+                        setCompany((prev) => ({ ...prev, fiscalStrictModeEnabled: value === 'ATIVADO' }))
+                      }
+                    >
+                      <SelectTrigger className="w-36 h-9 text-xs font-bold">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="ATIVADO">ATIVADO</SelectItem>
+                        <SelectItem value="DESATIVADO">DESATIVADO</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4 pt-2">
+                <h3 className="text-sm font-bold">Cadastro Fiscal da Empresa</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>UF de Emissão Fiscal</Label>
+                    <Select
+                      value={company.fiscalUf || ''}
+                      onValueChange={(value) => setCompany((prev) => ({ ...prev, fiscalUf: value }))}
+                    >
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Selecione a UF" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {BRAZIL_UF_OPTIONS.map((uf) => (
+                          <SelectItem key={`uf-${uf}`} value={uf}>{uf}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Código de Atividade (CNAE)</Label>
+                    <Input
+                      placeholder="Ex: 4751201"
+                      value={company.fiscalActivityCode || ''}
+                      onChange={(e) =>
+                        setCompany((prev) => ({ ...prev, fiscalActivityCode: onlyDigits(e.target.value).slice(0, 7) }))
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2 md:col-span-2">
+                    <Label>Buscar Ramo / Atividade</Label>
+                    <Input
+                      placeholder="Digite CNAE, ramo ou atividade para busca inteligente"
+                      value={company.fiscalActivitySearchTerm || ''}
+                      onChange={(e) =>
+                        setCompany((prev) => ({ ...prev, fiscalActivitySearchTerm: e.target.value }))
+                      }
+                    />
+                    <p className="text-[10px] text-muted-foreground">
+                      A selecao abaixo conecta o cadastro de produtos com sugestoes de NCM, CFOP e CST.
+                    </p>
+                  </div>
+                  <div className="space-y-2 md:col-span-2">
+                    <Label>Ramo de Atividade</Label>
+                    <Input
+                      placeholder="Selecione uma sugestao de atividade"
+                      value={company.fiscalActivitySector || ''}
+                      onChange={(e) => setCompany((prev) => ({ ...prev, fiscalActivitySector: e.target.value }))}
+                    />
+                  </div>
+                  <div className="md:col-span-2 rounded-lg border bg-secondary/20 p-3 space-y-2">
+                    <p className="text-xs font-semibold">Sugestoes de atividade fiscal</p>
+                    <div className="grid gap-2">
+                      {fiscalActivityMatches.map((item) => (
+                        <button
+                          key={`activity-${item.code}`}
+                          type="button"
+                          className="w-full rounded-md border bg-background px-3 py-2 text-left text-xs hover:bg-secondary/30"
+                          onClick={() => applyFiscalActivitySuggestion(item)}
+                        >
+                          <span className="font-semibold">{item.code}</span> - {item.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4 pt-2">
+                <h3 className="text-sm font-bold">Assistente Contador (IA)</h3>
+                <div className="grid gap-4">
+                  <div className="flex items-center justify-between p-3 rounded-lg bg-secondary/20">
+                    <div>
+                      <p className="text-sm font-medium">Ativar Assistente Contador</p>
+                      <p className="text-xs text-muted-foreground">Ajuda no fiscal de produtos e nos setores de Estoque, Vendas e Financeiro.</p>
+                    </div>
+                    <Select
+                      value={company.accountantAssistantEnabled ? 'ATIVADO' : 'DESATIVADO'}
+                      onValueChange={(value) =>
+                        setCompany((prev) => ({ ...prev, accountantAssistantEnabled: value === 'ATIVADO' }))
+                      }
+                    >
+                      <SelectTrigger className="w-36 h-9 text-xs font-bold">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="ATIVADO">ATIVADO</SelectItem>
+                        <SelectItem value="DESATIVADO">DESATIVADO</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="rounded-lg border p-3 space-y-2">
+                    <p className="text-xs font-semibold">Servicos que a IA deve acompanhar</p>
+                    <div className="grid gap-2">
+                      {ACCOUNTANT_ASSISTANT_SERVICE_OPTIONS.map((service) => {
+                        const checked = (company.accountantServices || []).includes(service.id);
+                        return (
+                          <button
+                            key={`service-${service.id}`}
+                            type="button"
+                            className={cn(
+                              'w-full rounded-md border px-3 py-2 text-left text-xs transition-colors',
+                              checked ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'bg-background hover:bg-secondary/30'
+                            )}
+                            onClick={() => toggleAccountantService(service.id)}
+                          >
+                            {checked ? 'Selecionado - ' : ''}{service.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="space-y-2">
+                      <Label>Enviar Notificacoes do Assistente</Label>
+                      <Select
+                        value={company.accountantNotificationEnabled !== false ? 'ATIVADO' : 'DESATIVADO'}
+                        onValueChange={(value) =>
+                          setCompany((prev) => ({ ...prev, accountantNotificationEnabled: value === 'ATIVADO' }))
+                        }
+                      >
+                        <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="ATIVADO">ATIVADO</SelectItem>
+                          <SelectItem value="DESATIVADO">DESATIVADO</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Ativar Lembretes IA</Label>
+                      <Select
+                        value={company.accountantReminderEnabled !== false ? 'ATIVADO' : 'DESATIVADO'}
+                        onValueChange={(value) =>
+                          setCompany((prev) => ({ ...prev, accountantReminderEnabled: value === 'ATIVADO' }))
+                        }
+                      >
+                        <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="ATIVADO">ATIVADO</SelectItem>
+                          <SelectItem value="DESATIVADO">DESATIVADO</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Lembrete (dias)</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={90}
+                        value={company.accountantReminderFrequencyDays || 7}
+                        onChange={(e) =>
+                          setCompany((prev) => ({
+                            ...prev,
+                            accountantReminderFrequencyDays: Math.max(1, Math.min(90, Number(e.target.value) || 7)),
+                          }))
+                        }
+                      />
+                    </div>
                   </div>
                 </div>
               </div>
@@ -10837,6 +15274,8 @@ function SettingsView({
                                         { id: 'vendas', label: 'PDV / Vendas' },
                                         { id: 'whatsapp', label: 'WhatsApp' },
                                         { id: 'financeiro', label: 'Financeiro' },
+                                        { id: 'assistente-contador', label: 'Assistente Contador' },
+                                        { id: 'migracao', label: 'Assistente de Migração' },
                                         { id: 'equipe', label: 'Equipe / Usuários' },
                                         { id: 'calendario', label: 'Calendário' },
                                         { id: 'config', label: 'Configurações' },
@@ -11612,7 +16051,7 @@ function SupplierView({
               <Plus className="w-4 h-4" /> Novo Fornecedor
             </Button>
           } />
-          <DialogContent className="max-w-2xl">
+          <DialogContent className="max-w-3xl">
             <DialogHeader>
               <DialogTitle>{editingSupplier ? 'Editar' : 'Cadastrar'} Fornecedor</DialogTitle>
               <DialogDescription>Preencha os dados cadastrais do seu fornecedor.</DialogDescription>
@@ -11630,40 +16069,42 @@ function SupplierView({
                 toast.success('Fornecedor cadastrado!');
               }
               setIsDialogOpen(false);
-            }} className="grid gap-6 py-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>Razão Social / Nome</Label>
-                  <Input name="name" defaultValue={editingSupplier?.name} placeholder="Nome da empresa" required />
+            }} className="grid gap-4 py-4">
+              <div className="grid gap-4 max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>Razão Social / Nome</Label>
+                    <Input name="name" defaultValue={editingSupplier?.name} placeholder="Nome da empresa" required />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>CNPJ / CPF</Label>
+                    <Input name="document" defaultValue={editingSupplier?.document} placeholder="00.000.000/0001-00" />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>E-mail</Label>
+                    <Input name="email" type="email" defaultValue={editingSupplier?.email} placeholder="email@fornecedor.com" />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Telefone</Label>
+                    <Input name="phone" defaultValue={editingSupplier?.phone} placeholder="(00) 0000-0000" />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>Pessoa de Contato</Label>
+                    <Input name="contactName" defaultValue={editingSupplier?.contactName} placeholder="Nome do representante" />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Categoria</Label>
+                    <Input name="category" defaultValue={editingSupplier?.category} placeholder="Ex: Peças, Ferramentas..." />
+                  </div>
                 </div>
                 <div className="space-y-2">
-                  <Label>CNPJ / CPF</Label>
-                  <Input name="document" defaultValue={editingSupplier?.document} placeholder="00.000.000/0001-00" />
+                  <Label>Endereço</Label>
+                  <Input name="address" defaultValue={editingSupplier?.address} placeholder="Rua, número, bairro, cidade..." />
                 </div>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>E-mail</Label>
-                  <Input name="email" type="email" defaultValue={editingSupplier?.email} placeholder="email@fornecedor.com" />
-                </div>
-                <div className="space-y-2">
-                  <Label>Telefone</Label>
-                  <Input name="phone" defaultValue={editingSupplier?.phone} placeholder="(00) 0000-0000" />
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>Pessoa de Contato</Label>
-                  <Input name="contactName" defaultValue={editingSupplier?.contactName} placeholder="Nome do representante" />
-                </div>
-                <div className="space-y-2">
-                  <Label>Categoria</Label>
-                  <Input name="category" defaultValue={editingSupplier?.category} placeholder="Ex: Peças, Ferramentas..." />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <Label>Endereço</Label>
-                <Input name="address" defaultValue={editingSupplier?.address} placeholder="Rua, número, bairro, cidade..." />
               </div>
               <DialogFooter>
                 <Button type="button" variant="ghost" onClick={() => setIsDialogOpen(false)}>Cancelar</Button>
@@ -11701,7 +16142,7 @@ function SupplierView({
               {filtered.length > 0 ? filtered.map(s => (
                 <tr key={s.id} className="hover:bg-secondary/5 transition-colors">
                   <td className="px-6 py-4">
-                    <div className="font-bold">{s.name}</div>
+                    <div className="font-bold flex items-center flex-wrap gap-0.5">{s.name}{s.importedFromBackup && <BackupBadge />}</div>
                     <div className="text-[10px] text-muted-foreground">{s.document}</div>
                   </td>
                   <td className="px-6 py-4">
@@ -11862,12 +16303,160 @@ function OSConferenceView({
   );
 }
 
-function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate, data: ServiceOrder, onClose: () => void }) {
+function DynamicPrintView({
+  template,
+  data,
+  company,
+  customer,
+  onClose,
+}: {
+  template: PrintTemplate;
+  data: ServiceOrder;
+  company: Company;
+  customer?: Customer | null;
+  onClose: () => void;
+}) {
   const [isPrinting, setIsPrinting] = useState(false);
+  const previewHostRef = useRef<HTMLDivElement | null>(null);
+  const [previewScale, setPreviewScale] = useState(1);
+  const stageRef = useRef<any>(null);
+  const [printImage, setPrintImage] = useState('');
+  const [isClient, setIsClient] = useState(false);
+  const MM_TO_PT = 2.83465;
+  const BASE_SCALE = 3.78;
+  const mmStrokeToCanvasPx = (strokeMm: number) => Math.max(0.25, strokeMm * BASE_SCALE);
+  const lineDashByStyle = (style?: TemplateElement['lineStyle']) => {
+    if (style === 'dashed') return [12, 8];
+    if (style === 'dotted') return [2, 8];
+    return undefined;
+  };
+
+  const resolvedTemplate = useMemo(() => {
+    const density = Math.min(2.5, Math.max(0.5, template.density || 1));
+    return {
+      ...template,
+      orientation: template.orientation || 'vertical',
+      labelRows: Math.max(1, template.labelRows || 1),
+      labelColumns: Math.max(1, template.labelColumns || 1),
+      gapX: Math.max(0, template.gapX || 0),
+      gapY: Math.max(0, template.gapY || 0),
+      density,
+      shape: template.shape || 'rectangle',
+      cornerRadius: Math.max(1, template.cornerRadius || 4),
+      showBorder: template.showBorder ?? false,
+      borderStyle: template.borderStyle || 'solid',
+      borderThickness: Math.max(0.1, template.borderThickness || 0.5),
+    };
+  }, [template]);
+
+  const orientation = resolvedTemplate.orientation || 'vertical';
+  const density = Math.min(2.5, Math.max(0.5, resolvedTemplate.density || 1));
+  const totalWidthMm = orientation === 'horizontal' ? resolvedTemplate.height : resolvedTemplate.width;
+  const labelHeightMm = orientation === 'horizontal' ? resolvedTemplate.width : resolvedTemplate.height;
+  const maxGapX = resolvedTemplate.labelColumns > 1
+    ? Math.max(0, (totalWidthMm - (resolvedTemplate.labelColumns * 5)) / (resolvedTemplate.labelColumns - 1))
+    : 0;
+  const effectiveGapX = resolvedTemplate.labelColumns > 1
+    ? Math.min((resolvedTemplate.gapX || 0) / density, maxGapX)
+    : 0;
+  const effectiveGapY = (resolvedTemplate.gapY || 0) / density;
+  const labelWidthMm = Math.max(
+    5,
+    (totalWidthMm - (effectiveGapX * (resolvedTemplate.labelColumns - 1))) / resolvedTemplate.labelColumns
+  );
+  const sheetWidthMm = totalWidthMm;
+  const sheetHeightMm = (labelHeightMm * resolvedTemplate.labelRows) + (effectiveGapY * (resolvedTemplate.labelRows - 1));
+  const stageWidthPx = sheetWidthMm * BASE_SCALE;
+  const stageHeightPx = sheetHeightMm * BASE_SCALE;
+  const printCells = Array.from({ length: resolvedTemplate.labelRows * resolvedTemplate.labelColumns }, (_, index) => {
+    const row = Math.floor(index / resolvedTemplate.labelColumns);
+    const col = index % resolvedTemplate.labelColumns;
+    return {
+      id: `${row}-${col}`,
+      top: (row * labelHeightMm) + (row * effectiveGapY),
+      left: (col * labelWidthMm) + (col * effectiveGapX),
+    };
+  });
+
+  const getPrintableImage = () => {
+    const stage = stageRef.current;
+    if (!stage) return '';
+    return stage.toDataURL({ pixelRatio: 4, mimeType: 'image/png' });
+  };
+
+  const labelBorder = resolvedTemplate.showBorder
+    ? `${resolvedTemplate.borderThickness}mm ${resolvedTemplate.borderStyle === 'double' ? 'double' : resolvedTemplate.borderStyle} #111`
+    : 'none';
+
+  const labelShapeStyle: React.CSSProperties = {
+    border: labelBorder,
+    borderRadius: resolvedTemplate.shape === 'rounded' ? `${resolvedTemplate.cornerRadius}mm` : resolvedTemplate.shape === 'ellipse' ? '50%' : undefined,
+    clipPath: resolvedTemplate.shape === 'ellipse' ? 'ellipse(50% 50% at 50% 50%)' : undefined,
+    overflow: 'hidden',
+  };
+
+  const pageOrientation = sheetWidthMm > sheetHeightMm ? 'landscape' : 'portrait';
+  const printGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: `repeat(${resolvedTemplate.labelColumns}, ${labelWidthMm}mm)`,
+    columnGap: `${effectiveGapX}mm`,
+    rowGap: `${effectiveGapY}mm`,
+    width: 'fit-content',
+    margin: '0 auto',
+    justifyContent: 'center',
+    alignContent: 'start',
+  };
+
+  const getFittedFontSizePt = (content: string, baseFontSize: number, widthMm: number, heightMm: number) => {
+    const safeContent = (content || ' ').trim() || ' ';
+    const lines = safeContent.split('\n');
+    const longestLine = lines.reduce((longest, line) => Math.max(longest, line.length), 1);
+    const widthBasedPt = (Math.max(5, widthMm) * MM_TO_PT) / (Math.max(1, longestLine) * 0.52);
+    const heightBasedPt = (Math.max(4, heightMm) * MM_TO_PT * 0.84) / Math.max(1, lines.length);
+    return Math.max(4, Math.min(baseFontSize, widthBasedPt, heightBasedPt));
+  };
 
   useEffect(() => {
-    // If it's a direct print call, we might want to trigger it immediately after rendering
+    const updateScale = () => {
+      const hostWidth = previewHostRef.current?.clientWidth || 0;
+      const hostHeight = previewHostRef.current?.clientHeight || 0;
+      if (!hostWidth || !hostHeight) return;
+
+      const sheetWidthPx = sheetWidthMm * (96 / 25.4);
+      const sheetHeightPx = sheetHeightMm * (96 / 25.4);
+      const scaleX = (hostWidth - 24) / sheetWidthPx;
+      const scaleY = (hostHeight - 24) / sheetHeightPx;
+      setPreviewScale(Math.min(1, Math.max(0.3, Math.min(scaleX, scaleY))));
+    };
+
+    updateScale();
+    const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(updateScale) : null;
+    if (previewHostRef.current && observer) {
+      observer.observe(previewHostRef.current);
+    }
+    window.addEventListener('resize', updateScale);
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', updateScale);
+    };
+  }, [sheetHeightMm, sheetWidthMm]);
+
+  useEffect(() => {
+    setIsClient(true);
   }, []);
+
+  useEffect(() => {
+    if (!isClient) return;
+    const timer = window.setTimeout(() => {
+      const image = getPrintableImage();
+      if (image) {
+        setPrintImage(image);
+      }
+    }, 80);
+
+    return () => window.clearTimeout(timer);
+  }, [isClient, sheetHeightMm, sheetWidthMm, data, customer, resolvedTemplate]);
 
   const replaceVariables = (content: string) => {
     let result = content;
@@ -11881,8 +16470,9 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
       '{{problem}}': data.defect,
       '{{os_date}}': format(new Date(data.createdAt), 'dd/MM/yyyy'),
       '{{status}}': data.status,
-      '{{company_name}}': 'TechManager Assistência',
-      '{{company_phone}}': '(11) 98765-4321',
+      '{{customer_phone}}': customer?.phone || (customer as any)?.phone2 || '',
+      '{{company_name}}': company.name || company.razaoSocial || 'TechManager Assistência',
+      '{{company_phone}}': company.phone || '',
     };
 
     Object.entries(variables).forEach(([key, value]) => {
@@ -11891,85 +16481,316 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
     return result;
   };
 
+  const escapeHtml = (value: string) => value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  const renderPrintElementHtml = (cellId: string, el: TemplateElement) => {
+    const displayContent = el.type === 'variable' ? replaceVariables(el.content) : el.content;
+    const fittedFontSize = getFittedFontSizePt(
+      displayContent,
+      el.fontSize || 12,
+      el.width || 45,
+      el.height || 8
+    );
+    const fontSizeMm = fittedFontSize / MM_TO_PT;
+
+    if (el.type === 'line') {
+      return `
+        <div
+          style="
+            position:absolute;
+            left:${el.x}mm;
+            top:${el.y}mm;
+            width:${el.width || 45}mm;
+            height:0;
+            border-top:${Math.max(0.2, el.strokeWidth || 0.6)}mm ${el.lineStyle || 'solid'} #111;
+          "
+          data-element-id="${escapeHtml(`${cellId}-${el.id}`)}"
+        ></div>
+      `;
+    }
+
+    if (el.type === 'qr' || el.type === 'barcode') {
+      return `
+        <div
+          style="
+            position:absolute;
+            left:${el.x}mm;
+            top:${el.y}mm;
+            width:${el.width || 45}mm;
+            height:${el.height || 8}mm;
+            border:1px solid #111;
+            display:flex;
+            flex-direction:column;
+            justify-content:center;
+            align-items:center;
+            background:#eee;
+            font-size:8pt;
+            text-transform:uppercase;
+            overflow:hidden;
+          "
+          data-element-id="${escapeHtml(`${cellId}-${el.id}`)}"
+        >
+          <div style="font-weight:700; letter-spacing:0.04em;">${escapeHtml(el.type)}</div>
+        </div>
+      `;
+    }
+
+    return `
+      <div
+        style="
+          position:absolute;
+          left:${el.x}mm;
+          top:${el.y}mm;
+          width:${el.width ? `${el.width}mm` : 'auto'};
+          height:${el.height ? `${el.height}mm` : 'auto'};
+          display:flex;
+          align-items:${(el.wrapMode || 'wrap') === 'single-line' ? 'center' : 'flex-start'};
+          line-height:1;
+          font-size:${fontSizeMm}mm;
+          line-height:${fontSizeMm}mm;
+          font-weight:${el.fontWeight === 'bold' ? 700 : 400};
+          text-align:${el.textAlign || 'left'};
+          font-family: Arial, sans-serif;
+          white-space:${(el.wrapMode || 'wrap') === 'single-line' ? 'nowrap' : 'pre-wrap'};
+          overflow-wrap:${(el.wrapMode || 'wrap') === 'single-line' ? 'normal' : 'anywhere'};
+          word-break:${(el.wrapMode || 'wrap') === 'single-line' ? 'normal' : 'break-word'};
+          overflow:hidden;
+          text-overflow:${(el.wrapMode || 'wrap') === 'single-line' ? 'ellipsis' : 'clip'};
+        "
+        data-element-id="${escapeHtml(`${cellId}-${el.id}`)}"
+      >${escapeHtml(displayContent).replace(/\n/g, '<br />')}</div>
+    `;
+  };
+
+  const buildPrintDocumentHtml = () => {
+    const image = printImage || getPrintableImage();
+    if (!image) return '';
+
+    return `
+      <!DOCTYPE html>
+      <html lang="pt-BR">
+        <head>
+          <meta charset="UTF-8" />
+          <title>Impressao de Etiqueta</title>
+          <style>
+            @page {
+              size: ${sheetWidthMm}mm ${sheetHeightMm}mm;
+              margin: 0mm;
+            }
+            * {
+              box-sizing: border-box;
+              margin: 0;
+              padding: 0;
+            }
+            html {
+              width: ${sheetWidthMm}mm;
+              height: ${sheetHeightMm}mm;
+              max-height: ${sheetHeightMm}mm;
+              overflow: hidden;
+            }
+            body {
+              width: ${sheetWidthMm}mm;
+              height: ${sheetHeightMm}mm;
+              max-height: ${sheetHeightMm}mm;
+              overflow: hidden;
+              margin: 0;
+              padding: 0;
+              background: #fff;
+              font-family: Arial, sans-serif;
+              color: #111;
+              page-break-after: avoid;
+              break-after: avoid;
+            }
+            .print-image {
+              display: block;
+              width: ${sheetWidthMm}mm;
+              height: ${sheetHeightMm}mm;
+              object-fit: fill;
+            }
+          </style>
+        </head>
+        <body>
+          <img class="print-image" src="${image}" alt="Etiqueta" />
+        </body>
+      </html>
+    `;
+  };
+
   const handlePrint = () => {
     setIsPrinting(true);
-    setTimeout(() => {
-      window.print();
-      setIsPrinting(false);
-    }, 500);
+    const printHtml = buildPrintDocumentHtml();
+    const started = printHtml ? printHtmlUsingHiddenFrame(printHtml) : false;
+    if (!started) {
+      toast.error('Nao foi possivel iniciar a impressao nativa do navegador.');
+    }
+
+    // UI feedback timeout to avoid indefinite loading state.
+    setTimeout(() => setIsPrinting(false), 1200);
   };
 
   return (
     <Dialog open={!!template} onOpenChange={() => onClose()}>
-      <DialogContent className="max-w-fit p-0 border-none bg-transparent shadow-none">
-        <div className="flex flex-col items-center gap-4">
-          <div 
-            id="printable-area"
-            className="bg-white border shadow-xl relative overflow-hidden print:shadow-none print:border-none"
-            style={{ 
-              width: `${template.width}mm`, 
-              height: `${template.height}mm`,
-              padding: 0,
-              margin: 0,
-              position: 'relative'
-            }}
-          >
-            {template.elements.map((el) => {
-              const style: React.CSSProperties = {
-                position: 'absolute',
-                left: `${el.x}mm`,
-                top: `${el.y}mm`,
-                fontSize: `${el.fontSize || 12}pt`,
-                fontWeight: el.fontWeight as any,
-                width: el.width ? `${el.width}mm` : 'auto',
-                height: el.height ? `${el.height}mm` : 'auto',
-                display: 'flex',
-                alignItems: 'center',
-                lineHeight: 1,
-                whiteSpace: 'nowrap'
-              };
-
-              if (el.type === 'line') {
-                return (
-                  <div 
-                    key={el.id} 
-                    style={{ 
-                      ...style, 
-                      backgroundColor: 'black',
-                      height: `${el.height || 1}mm`
-                    }} 
-                  />
-                );
-              }
-
-              if (el.type === 'qr' || el.type === 'barcode') {
-                 // Simplified placeholder for print
-                return (
-                  <div 
-                    key={el.id} 
-                    style={{ 
-                      ...style, 
-                      border: '1px solid black', 
-                      display: 'flex', 
-                      flexDirection: 'column',
-                      justifyContent: 'center', 
-                      alignItems: 'center',
-                      background: '#eee'
-                    }}
-                  >
-                    <QrCode className="w-8 h-8" />
-                    <span className="text-[8px] uppercase">{el.type}</span>
-                  </div>
-                );
-              }
-
-              return (
-                <div key={el.id} style={style}>
-                  {replaceVariables(el.content)}
+      <DialogContent className="w-[98vw] max-w-[1200px] max-h-[98vh] p-0 border-none bg-transparent shadow-none overflow-hidden">
+        <div className="flex flex-col gap-4 p-4">
+          <div ref={previewHostRef} className="max-h-[calc(98vh-100px)] overflow-auto rounded-lg bg-slate-100/60 p-3">
+            <div
+              className="mx-auto"
+              style={{
+                width: `${sheetWidthMm * previewScale}mm`,
+                height: `${sheetHeightMm * previewScale}mm`,
+                minWidth: `${sheetWidthMm * previewScale}mm`,
+              }}
+            >
+              {printImage ? (
+                <img
+                  src={printImage}
+                  alt="Preview da etiqueta"
+                  style={{
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'fill',
+                    display: 'block',
+                  }}
+                />
+              ) : (
+                <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+                  Gerando preview...
                 </div>
-              );
-            })}
+              )}
+            </div>
           </div>
+          {isClient && (
+            <div className="sr-only">
+              <Stage ref={stageRef} width={stageWidthPx} height={stageHeightPx}>
+                <Layer>
+                  {printCells.map((cell) => {
+                    const offsetX = cell.left * BASE_SCALE;
+                    const offsetY = cell.top * BASE_SCALE;
+                    return (
+                      <KonvaGroup key={cell.id} x={offsetX} y={offsetY}>
+                        {resolvedTemplate.showBorder && (
+                          <KonvaRect
+                            x={0}
+                            y={0}
+                            width={labelWidthMm * BASE_SCALE}
+                            height={labelHeightMm * BASE_SCALE}
+                            cornerRadius={resolvedTemplate.shape === 'rounded' ? resolvedTemplate.cornerRadius * BASE_SCALE : 0}
+                            stroke="#111"
+                            strokeWidth={mmStrokeToCanvasPx(resolvedTemplate.borderThickness || 0.5)}
+                            dash={lineDashByStyle(resolvedTemplate.borderStyle)}
+                          />
+                        )}
+                        {resolvedTemplate.shape === 'ellipse' && (
+                          <KonvaEllipse
+                            x={(labelWidthMm * BASE_SCALE) / 2}
+                            y={(labelHeightMm * BASE_SCALE) / 2}
+                            radiusX={(labelWidthMm * BASE_SCALE) / 2}
+                            radiusY={(labelHeightMm * BASE_SCALE) / 2}
+                            stroke="#111"
+                            strokeWidth={mmStrokeToCanvasPx(resolvedTemplate.borderThickness || 0.5)}
+                          />
+                        )}
+                        {resolvedTemplate.elements.map((el) => {
+                          const displayContent = el.type === 'variable' ? replaceVariables(el.content) : el.content;
+                          const fittedFontSize = getFittedFontSizePt(
+                            displayContent,
+                            el.fontSize || 12,
+                            el.width || 45,
+                            el.height || 8
+                          );
+                          const fontSizePx = fittedFontSize * (96 / 72);
+
+                          if (el.type === 'line') {
+                            const lineStroke = mmStrokeToCanvasPx(el.strokeWidth || 0.6);
+                            const widthPx = (el.width || 45) * BASE_SCALE;
+                            if (el.lineStyle === 'double') {
+                              return (
+                                <KonvaGroup key={`${cell.id}-${el.id}`} x={el.x * BASE_SCALE} y={el.y * BASE_SCALE}>
+                                  <KonvaLine
+                                    points={[0, -lineStroke, widthPx, -lineStroke]}
+                                    stroke="#111"
+                                    strokeWidth={lineStroke}
+                                  />
+                                  <KonvaLine
+                                    points={[0, lineStroke, widthPx, lineStroke]}
+                                    stroke="#111"
+                                    strokeWidth={lineStroke}
+                                  />
+                                </KonvaGroup>
+                              );
+                            }
+
+                            return (
+                              <KonvaLine
+                                key={`${cell.id}-${el.id}`}
+                                points={[
+                                  el.x * BASE_SCALE,
+                                  el.y * BASE_SCALE,
+                                  (el.x + (el.width || 45)) * BASE_SCALE,
+                                  el.y * BASE_SCALE,
+                                ]}
+                                stroke="#111"
+                                strokeWidth={lineStroke}
+                                dash={lineDashByStyle(el.lineStyle)}
+                              />
+                            );
+                          }
+
+                          if (el.type === 'qr' || el.type === 'barcode') {
+                            const widthPx = (el.width || 12) * BASE_SCALE;
+                            const heightPx = (el.height || 12) * BASE_SCALE;
+                            return (
+                              <KonvaGroup key={`${cell.id}-${el.id}`} x={el.x * BASE_SCALE} y={el.y * BASE_SCALE}>
+                                <KonvaRect
+                                  width={widthPx}
+                                  height={heightPx}
+                                  fill="#f3f4f6"
+                                  stroke="#111"
+                                  strokeWidth={1}
+                                />
+                                <KonvaText
+                                  text={el.type.toUpperCase()}
+                                  width={widthPx}
+                                  height={heightPx}
+                                  align="center"
+                                  verticalAlign="middle"
+                                  fontSize={10}
+                                  fontFamily="Arial"
+                                />
+                              </KonvaGroup>
+                            );
+                          }
+
+                          return (
+                            <KonvaText
+                              key={`${cell.id}-${el.id}`}
+                              text={displayContent}
+                              x={el.x * BASE_SCALE}
+                              y={el.y * BASE_SCALE}
+                              width={(el.width || 45) * BASE_SCALE}
+                              height={(el.height || 8) * BASE_SCALE}
+                              align={el.textAlign || 'left'}
+                              verticalAlign={(el.wrapMode || 'wrap') === 'single-line' ? 'middle' : 'top'}
+                              wrap={(el.wrapMode || 'wrap') === 'single-line' ? 'none' : 'char'}
+                              ellipsis={(el.wrapMode || 'wrap') === 'single-line'}
+                              fontSize={fontSizePx}
+                              fontStyle={el.fontWeight === 'bold' ? 'bold' : 'normal'}
+                              fontFamily="Arial"
+                            />
+                          );
+                        })}
+                      </KonvaGroup>
+                    );
+                  })}
+                </Layer>
+              </Stage>
+            </div>
+          )}
           <div className="flex gap-2 print:hidden bg-white/10 p-2 rounded-lg backdrop-blur-md">
             <Button variant="outline" className="bg-white" onClick={onClose}>Fechar</Button>
             <Button className="gap-2" onClick={handlePrint}>
@@ -11978,28 +16799,6 @@ function DynamicPrintView({ template, data, onClose }: { template: PrintTemplate
           </div>
         </div>
 
-        {/* CSS for print to force exact dimensions */}
-        <style dangerouslySetInnerHTML={{ __html: `
-          @media print {
-            body * {
-              visibility: hidden;
-            }
-            #printable-area, #printable-area * {
-              visibility: visible;
-            }
-            #printable-area {
-              position: absolute;
-              left: 0;
-              top: 0;
-              margin: 0 !important;
-              padding: 0 !important;
-            }
-            @page {
-              size: ${template.width}mm ${template.height}mm;
-              margin: 0;
-            }
-          }
-        `}} />
       </DialogContent>
     </Dialog>
   );
@@ -12013,10 +16812,22 @@ function PrintCustomizationView({ templates, setTemplates }: { templates: PrintT
       id: Math.random().toString(36).substr(2, 9),
       name: `Novo Layout ${type}`,
       type,
-      width: type === 'Etiqueta' ? 40 : 80,
+      width: type === 'Etiqueta' ? 80 : 80,
       height: type === 'Etiqueta' ? 25 : 200,
       elements: [],
-      companyId: '1'
+      orientation: 'vertical',
+      labelRows: 1,
+      labelColumns: type === 'Etiqueta' ? 2 : 1,
+      gapX: 0,
+      gapY: 0,
+      density: 1,
+      shape: 'rectangle',
+      cornerRadius: 4,
+      showBorder: false,
+      borderStyle: 'solid',
+      borderThickness: 0.5,
+      companyId: '1',
+      isDefault: false,
     };
     setEditingTemplate(newTemplate);
   };
@@ -12026,90 +16837,192 @@ function PrintCustomizationView({ templates, setTemplates }: { templates: PrintT
     if (exists) {
       setTemplates(templates.map(t => t.id === template.id ? template : t));
     } else {
-      setTemplates([...templates, template]);
+      // If it's the first of its type, auto-set as default
+      const sameType = templates.filter(t => t.type === template.type);
+      setTemplates([...templates, { ...template, isDefault: sameType.length === 0 }]);
     }
     setEditingTemplate(null);
   };
 
   const handleDelete = (id: string) => {
     if (confirm('Tem certeza que deseja excluir este layout?')) {
-      setTemplates(templates.filter(t => t.id !== id));
+      const removed = templates.find(t => t.id === id);
+      let updated = templates.filter(t => t.id !== id);
+      // If deleted was default, promote the first remaining of that type to default
+      if (removed?.isDefault) {
+        const firstOfType = updated.find(t => t.type === removed.type);
+        if (firstOfType) {
+          updated = updated.map(t => t.id === firstOfType.id ? { ...t, isDefault: true } : t);
+        }
+      }
+      setTemplates(updated);
       toast.success('Layout excluído com sucesso!');
     }
   };
 
+  const handleSetDefault = (id: string, type: PrintTemplate['type']) => {
+    // Only one default per type
+    setTemplates(templates.map(t => t.type === type ? { ...t, isDefault: t.id === id } : t));
+    toast.success('Layout definido como padrão para impressão!');
+  };
+
   if (editingTemplate) {
     return (
-      <PrintDesigner 
-        template={editingTemplate} 
-        onSave={handleSave} 
-        onCancel={() => setEditingTemplate(null)} 
+      <PrintDesigner
+        template={editingTemplate}
+        onSave={handleSave}
+        onCancel={() => setEditingTemplate(null)}
       />
     );
   }
 
+  const labelTemplates = templates.filter(t => t.type === 'Etiqueta');
+  const cupomTemplates = templates.filter(t => t.type === 'Cupom');
+
+  const renderSection = (
+    title: string,
+    description: string,
+    icon: React.ReactNode,
+    sectionTemplates: PrintTemplate[],
+    type: PrintTemplate['type'],
+    accentColor: string,
+  ) => (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className={cn('p-2 rounded-lg', accentColor)}>
+            {icon}
+          </div>
+          <div>
+            <h2 className="text-lg font-bold">{title}</h2>
+            <p className="text-xs text-muted-foreground">{description}</p>
+          </div>
+        </div>
+        <Button variant="outline" size="sm" className="gap-2" onClick={() => handleCreate(type)}>
+          <Plus className="w-4 h-4" /> Novo
+        </Button>
+      </div>
+
+      {sectionTemplates.length === 0 ? (
+        <div className="py-10 bg-white rounded-xl border-2 border-dashed flex flex-col items-center justify-center text-center space-y-3">
+          <div className="w-12 h-12 bg-secondary rounded-full flex items-center justify-center">
+            <PrinterIcon className="w-6 h-6 text-muted-foreground" />
+          </div>
+          <div>
+            <p className="font-semibold">Nenhum layout de {title.toLowerCase()}</p>
+            <p className="text-xs text-muted-foreground">Clique em "Novo" para criar o primeiro layout.</p>
+          </div>
+        </div>
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {sectionTemplates.map(t => (
+            <Card
+              key={t.id}
+              className={cn(
+                'group transition-all overflow-hidden border shadow-sm relative',
+                t.isDefault ? 'border-primary ring-2 ring-primary/20' : 'border-secondary/60 hover:border-primary/30'
+              )}
+            >
+              {t.isDefault && (
+                <div className="absolute top-0 left-0 right-0 h-1 bg-primary rounded-t-lg" />
+              )}
+              <CardHeader className="pb-2 pt-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Badge variant={t.isDefault ? 'default' : 'secondary'} className="text-[10px]">
+                      {t.type}
+                    </Badge>
+                    {t.isDefault && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-600 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-full">
+                        <Star className="w-2.5 h-2.5 fill-amber-500 text-amber-500" /> Padrão
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setEditingTemplate(t)} title="Editar">
+                      <Edit className="w-3.5 h-3.5" />
+                    </Button>
+                    <Button variant="ghost" size="icon" className="h-7 w-7 text-rose-500" onClick={() => handleDelete(t.id)} title="Excluir">
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </Button>
+                  </div>
+                </div>
+                <CardTitle className="text-base mt-1">{t.name}</CardTitle>
+                <CardDescription className="text-xs">{t.width}mm × {t.height}mm · {t.elements.length} elementos</CardDescription>
+              </CardHeader>
+              <CardContent className="pt-0 space-y-3">
+                <div className="h-24 bg-secondary/20 rounded-lg flex items-center justify-center border-2 border-dashed border-secondary">
+                  <Layout className="w-6 h-6 text-muted-foreground/40" />
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="flex-1 text-primary text-xs h-8"
+                    onClick={() => setEditingTemplate(t)}
+                  >
+                    <Edit className="w-3 h-3 mr-1" /> Editar
+                  </Button>
+                  {!t.isDefault && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="flex-1 text-xs h-8 text-amber-600 border-amber-200 hover:bg-amber-50"
+                      onClick={() => handleSetDefault(t.id, t.type)}
+                    >
+                      <Star className="w-3 h-3 mr-1" /> Definir Padrão
+                    </Button>
+                  )}
+                  {t.isDefault && (
+                    <div className="flex-1 flex items-center justify-center text-[11px] text-primary font-semibold gap-1">
+                      <Star className="w-3 h-3 fill-primary" /> Padrão ativo
+                    </div>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Personalização de Impressão</h1>
-          <p className="text-muted-foreground">Desenvolva layouts personalizados para etiquetas de entrada e cupons térmicos.</p>
-        </div>
-        <div className="flex gap-2">
-          <Button variant="outline" className="gap-2" onClick={() => handleCreate('Etiqueta')}>
-            <Plus className="w-4 h-4" /> Nova Etiqueta
-          </Button>
-          <Button variant="outline" className="gap-2" onClick={() => handleCreate('Cupom')}>
-            <Plus className="w-4 h-4" /> Novo Cupom Térmico
-          </Button>
+          <p className="text-muted-foreground">Crie layouts personalizados. Defina um padrão por tipo — ele será usado automaticamente ao imprimir.</p>
         </div>
       </div>
 
-      <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-        {templates.map(t => (
-          <Card key={t.id} className="group hover:ring-2 ring-primary/20 transition-all overflow-hidden border-none shadow-sm">
-            <CardHeader className="pb-2">
-              <div className="flex items-center justify-between">
-                <Badge variant={t.type === 'Etiqueta' ? 'default' : 'secondary'}>{t.type}</Badge>
-                <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setEditingTemplate(t)}>
-                    <Edit className="w-4 h-4" />
-                  </Button>
-                  <Button variant="ghost" size="icon" className="h-8 w-8 text-rose-500" onClick={() => handleDelete(t.id)}>
-                    <Trash2 className="w-4 h-4" />
-                  </Button>
-                </div>
-              </div>
-              <CardTitle className="text-lg mt-2">{t.name}</CardTitle>
-              <CardDescription>{t.width}mm x {t.height}mm • {t.elements.length} elementos</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="h-32 bg-secondary/20 rounded-lg flex items-center justify-center border-2 border-dashed border-secondary">
-                <Layout className="w-8 h-8 text-muted-foreground/50" />
-              </div>
-              <Button variant="ghost" className="w-full mt-4 text-primary text-xs" onClick={() => setEditingTemplate(t)}>
-                Editar no Designer
-              </Button>
-            </CardContent>
-          </Card>
-        ))}
-
-        {templates.length === 0 && (
-          <div className="lg:col-span-3 py-20 bg-white rounded-xl border-2 border-dashed flex flex-col items-center justify-center text-center space-y-4">
-            <div className="w-16 h-16 bg-secondary rounded-full flex items-center justify-center">
-              <PrinterIcon className="w-8 h-8 text-muted-foreground" />
-            </div>
-            <div>
-              <p className="font-bold text-lg">Nenhum layout personalizado</p>
-              <p className="text-sm text-muted-foreground max-w-xs mx-auto">Comece criando um novo layout de etiqueta ou cupom térmico para sua assistência.</p>
-            </div>
-            <div className="flex gap-2">
-              <Button size="sm" onClick={() => handleCreate('Etiqueta')}>Criar Etiqueta</Button>
-              <Button size="sm" variant="outline" onClick={() => handleCreate('Cupom')}>Criar Cupom</Button>
-            </div>
-          </div>
-        )}
+      <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 flex gap-3 text-sm text-amber-800">
+        <Star className="w-4 h-4 shrink-0 mt-0.5 fill-amber-500 text-amber-500" />
+        <p>O layout marcado como <strong>Padrão</strong> é selecionado automaticamente ao imprimir etiquetas de entrada e cupons nas Ordens de Serviço. Somente um padrão por tipo é permitido.</p>
       </div>
+
+      {renderSection(
+        'Etiquetas',
+        'Etiquetas de entrada de equipamento (60×40, 80×25 etc.)',
+        <Tags className="w-4 h-4 text-blue-600" />,
+        labelTemplates,
+        'Etiqueta',
+        'bg-blue-100',
+      )}
+
+      <div className="border-t" />
+
+      {renderSection(
+        'Cupom Térmico',
+        'Comprovantes e recibos em papel térmico (80mm)',
+        <Receipt className="w-4 h-4 text-purple-600" />,
+        cupomTemplates,
+        'Cupom',
+        'bg-purple-100',
+      )}
     </div>
   );
 }
+
+
+
