@@ -12,5 +12,6 @@ export const STATUS_COLUMNS: OSStatus[] = [
   'Pronta',
   'Entregue',
   'Finalizada',
-  'Cancelada'
+  'Cancelada',
+  'Reprovado'
 ];
