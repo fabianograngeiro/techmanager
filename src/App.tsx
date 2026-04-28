@@ -102,9 +102,20 @@ import {
   PlusCircle,
   ArrowRight,
   ChevronLeft,
+  ChevronUp,
+  ChevronDown,
   Star
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import {
+  Stage,
+  Layer,
+  Text as KonvaText,
+  Rect as KonvaRect,
+  Line as KonvaLine,
+  Group as KonvaGroup,
+  Ellipse as KonvaEllipse,
+} from 'react-konva';
 import { 
   Card, 
   CardContent, 
@@ -194,10 +205,13 @@ import {
   SupportAttachment,
   SupportMessage,
   SupportSession,
+  Customer,
   TechnicalLevel,
   TechnicalSector,
   HolidayApiItem,
   HolidayCalendarCache,
+  EquipmentDeadlineRule,
+  OsStatusConfig,
 } from './types';
 import {
   buildMockAgentResponse,
@@ -237,6 +251,200 @@ const safeRandomUUID = (): string => {
 
   return `tm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 };
+
+const PIX_KEY_TYPE_OPTIONS = [
+  { value: 'CPF', label: 'CPF' },
+  { value: 'CNPJ', label: 'CNPJ' },
+  { value: 'EMAIL', label: 'E-mail' },
+  { value: 'TELEFONE', label: 'Telefone' },
+  { value: 'ALEATORIA', label: 'Chave Aleatória' },
+] as const;
+
+const BUSINESS_WEEKDAY_OPTIONS = [
+  { value: 1, label: 'Seg' },
+  { value: 2, label: 'Ter' },
+  { value: 3, label: 'Qua' },
+  { value: 4, label: 'Qui' },
+  { value: 5, label: 'Sex' },
+] as const;
+
+const BUSINESS_DAY_ROWS = [
+  { day: 1, label: 'Segunda', startKey: 'businessHoursStart', endKey: 'businessHoursEnd', enabledKey: 'businessHoursEnabled' },
+  { day: 2, label: 'Terça', startKey: 'businessHoursStart', endKey: 'businessHoursEnd', enabledKey: 'businessHoursEnabled' },
+  { day: 3, label: 'Quarta', startKey: 'businessHoursStart', endKey: 'businessHoursEnd', enabledKey: 'businessHoursEnabled' },
+  { day: 4, label: 'Quinta', startKey: 'businessHoursStart', endKey: 'businessHoursEnd', enabledKey: 'businessHoursEnabled' },
+  { day: 5, label: 'Sexta', startKey: 'businessHoursStart', endKey: 'businessHoursEnd', enabledKey: 'businessHoursEnabled' },
+  { day: 6, label: 'Sábado', startKey: 'businessHoursSaturdayStart', endKey: 'businessHoursSaturdayEnd', enabledKey: 'businessHoursSaturdayEnabled' },
+  { day: 0, label: 'Domingo', startKey: 'businessHoursSundayStart', endKey: 'businessHoursSundayEnd', enabledKey: 'businessHoursSundayEnabled' },
+] as const;
+
+const normalizePixKey = (key: string, keyType?: Company['pixKeyType']) => {
+  const trimmed = String(key || '').trim();
+  if (!trimmed) return '';
+  if (keyType === 'CPF' || keyType === 'CNPJ') return onlyDigits(trimmed);
+  if (keyType === 'EMAIL') return trimmed.toLowerCase();
+  if (keyType === 'TELEFONE') {
+    const digits = onlyDigits(trimmed);
+    if (!digits) return '';
+    return digits.startsWith('55') ? `+${digits}` : `+55${digits}`;
+  }
+  return trimmed;
+};
+
+const isValidPixKey = (key: string, keyType?: Company['pixKeyType']) => {
+  if (!key) return false;
+  if (keyType === 'CPF') return /^\d{11}$/.test(key);
+  if (keyType === 'CNPJ') return /^\d{14}$/.test(key);
+  if (keyType === 'EMAIL') return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(key);
+  if (keyType === 'TELEFONE') return /^\+55\d{10,11}$/.test(key);
+  return key.length >= 8;
+};
+
+const normalizePixMerchantName = (name: string) =>
+  String(name || 'TECHMANAGER')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Za-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase()
+    .slice(0, 25) || 'TECHMANAGER';
+
+const normalizePixCity = (address: string) =>
+  (() => {
+    const parts = String(address || 'SAO PAULO')
+      .split(',')
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const last = parts[parts.length - 1] || '';
+    const maybeState = /^[A-Za-z]{2}$/.test(last);
+    const rawCity = maybeState ? (parts[parts.length - 2] || last) : (last || parts[0] || 'SAO PAULO');
+    const normalized = rawCity
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^A-Za-z0-9 ]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toUpperCase()
+      .slice(0, 15);
+    return normalized || 'SAO PAULO';
+  })();
+
+const emvField = (id: string, value: string) => `${id}${String(value.length).padStart(2, '0')}${value}`;
+
+const computeCrc16 = (payload: string) => {
+  let crc = 0xffff;
+  const bytes = new TextEncoder().encode(payload);
+  for (let i = 0; i < bytes.length; i += 1) {
+    crc ^= bytes[i] << 8;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 0x8000) !== 0 ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xffff;
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, '0');
+};
+
+const buildPixPayload = ({
+  key,
+  keyType,
+  amount,
+  merchantName,
+  merchantCity,
+  txid,
+}: {
+  key: string;
+  keyType?: Company['pixKeyType'];
+  amount: number;
+  merchantName: string;
+  merchantCity: string;
+  txid?: string;
+}) => {
+  const normalizedKey = normalizePixKey(key, keyType);
+  if (!normalizedKey || !isValidPixKey(normalizedKey, keyType)) return '';
+
+  const amountNumber = Math.max(0, Number(amount || 0));
+  const amountValue = amountNumber.toFixed(2);
+  const accountInfo = emvField('00', 'BR.GOV.BCB.PIX') + emvField('01', normalizedKey);
+  const sanitizedTxid = String(txid || '***')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 25);
+  const additionalData = emvField('05', sanitizedTxid || '***');
+  const payloadFields = [
+    emvField('00', '01'),
+    emvField('26', accountInfo),
+    emvField('52', '0000'),
+    emvField('53', '986'),
+    emvField('58', 'BR'),
+    emvField('59', normalizePixMerchantName(merchantName)),
+    emvField('60', normalizePixCity(merchantCity)),
+    emvField('62', additionalData),
+    '6304',
+  ];
+
+  // Campo 54 (valor) é opcional no BR Code; enviamos somente quando > 0 para evitar rejeições.
+  if (amountNumber > 0) {
+    payloadFields.splice(4, 0, emvField('54', amountValue));
+  }
+
+  const payloadWithoutCrc = payloadFields.join('');
+
+  return `${payloadWithoutCrc}${computeCrc16(payloadWithoutCrc)}`;
+};
+
+const getOrderTotalValue = (os: ServiceOrder) => {
+  const itemsTotal = Array.isArray(os.items) && os.items.length > 0
+    ? os.items.reduce((acc, item) => acc + (Number(item.totalPrice) || 0), 0)
+    : 0;
+  return itemsTotal > 0 ? itemsTotal : Number(os.value || 0);
+};
+
+const formatOrderDeadlineLabel = (deadline?: string) => {
+  if (!deadline) return '-';
+  const deadlineDate = startOfDay(new Date(deadline));
+  if (Number.isNaN(deadlineDate.getTime())) return '-';
+  const today = startOfDay(new Date());
+  const diff = differenceInDays(deadlineDate, today);
+  if (diff === -1) return 'ONTEM';
+  if (diff === 0) return 'HOJE';
+  if (diff === 1) return 'AMANHÃ';
+  return format(deadlineDate, 'dd/MM/yyyy');
+};
+
+const formatOrderDeadlineWeekday = (deadline?: string) => {
+  if (!deadline) return '-';
+  const deadlineDate = startOfDay(new Date(deadline));
+  if (Number.isNaN(deadlineDate.getTime())) return '-';
+  const weekday = format(deadlineDate, 'EEEE', { locale: ptBR });
+  return weekday.charAt(0).toUpperCase() + weekday.slice(1);
+};
+
+const buildQrCodeImageUrl = (payload: string, size = 180) =>
+  `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&data=${encodeURIComponent(payload)}`;
+
+const formatPixKeyPreview = (key: string, keyType?: Company['pixKeyType']) => {
+  const normalized = normalizePixKey(key, keyType);
+  if (!normalized) return '--';
+  if (keyType === 'TELEFONE') {
+    const phoneDigits = onlyDigits(normalized);
+    if (!phoneDigits) return normalized;
+    return phoneDigits.startsWith('55') && phoneDigits.length > 11
+      ? phoneDigits.slice(2)
+      : phoneDigits;
+  }
+  if (keyType === 'CPF' || keyType === 'CNPJ') {
+    return onlyDigits(normalized) || normalized;
+  }
+  return normalized;
+};
+
+const buildQrCodeCandidates = (payload: string, size = 180) => [
+  buildQrCodeImageUrl(payload, size),
+  `https://quickchart.io/qr?size=${size}&text=${encodeURIComponent(payload)}`,
+];
+const OS_PRINT_INNER_WIDTH_MM = 198;
+const OS_PRINT_INNER_HEIGHT_MM = 285;
 
 const printHtmlUsingHiddenFrame = (html: string): boolean => {
   if (typeof window === 'undefined' || typeof document === 'undefined') {
@@ -297,23 +505,231 @@ const printHtmlUsingHiddenFrame = (html: string): boolean => {
   return true;
 };
 
+// Componente para renderizar conteúdo A4 da OS para impressão/PDF
+const OSPrintContentForRef = React.forwardRef<
+  HTMLDivElement,
+  { os: ServiceOrder; company: Company; customer?: Customer }
+>(({ os, company, customer }, ref) => {
+  const customerCityState = customer?.addressCity || customer?.addressState
+    ? `${customer?.addressCity || ''}${customer?.addressState ? ` - ${customer?.addressState}` : ''}`.trim()
+    : '--';
+  const customerAddress = customer?.addressStreet
+    ? `${customer?.addressStreet}${customer?.addressNumber ? `, ${customer?.addressNumber}` : ''}${customer?.addressNeighborhood ? ` - ${customer?.addressNeighborhood}` : ''}`
+    : customer?.address || '--';
+  const customerZip = customer?.addressZip || '--';
+  const customerDocument = customer?.document || '--';
+  const customerEmail = customer?.email || '--';
+  const customerPhone = customer?.phone || '--';
+  const customerContact = customer?.phone2 || '--';
+  const orderTotalValue = getOrderTotalValue(os);
+  const pixPayload = buildPixPayload({
+    key: company.pixKey || '',
+    keyType: company.pixKeyType,
+    amount: orderTotalValue,
+    merchantName: company.name || company.razaoSocial || 'TechManager',
+    merchantCity: company.address || 'Sao Paulo',
+    txid: os.number.replace(/[^A-Za-z0-9]/g, '').slice(0, 25) || '***',
+  });
+  const pixQrCodeCandidates = useMemo(
+    () => (pixPayload ? buildQrCodeCandidates(pixPayload, 180) : []),
+    [pixPayload]
+  );
+  const [pixQrCandidateIndex, setPixQrCandidateIndex] = useState(0);
+
+  useEffect(() => {
+    setPixQrCandidateIndex(0);
+  }, [pixPayload]);
+
+  return (
+    <div ref={ref} id="os-print-area" className="bg-white text-black shadow-sm" style={{ width: '210mm', height: '297mm', boxSizing: 'border-box', overflow: 'hidden' }}>
+      <div
+        className="bg-white text-black font-sans flex flex-col os-print-page-inner"
+        style={{ width: `${OS_PRINT_INNER_WIDTH_MM}mm`, minHeight: `${OS_PRINT_INNER_HEIGHT_MM}mm`, margin: '6mm auto' }}
+      >
+      {/* Header */}
+      <div className="flex flex-row justify-between items-start gap-3 border-b-2 border-black pb-3 mb-3">
+        <div className="flex gap-4 items-center">
+          <div className="w-16 h-16 bg-black text-white flex items-center justify-center text-xl font-bold shrink-0 overflow-hidden">
+            {company.logo ? (
+              <img src={company.logo} alt={company.name || 'Logo'} className="w-full h-full object-contain bg-white" />
+            ) : (
+              'TM'
+            )}
+          </div>
+          <div>
+            <h1 className="text-2xl font-black uppercase tracking-tight">{company.name}</h1>
+            <p className="text-xs uppercase font-bold text-black">{company.address}</p>
+            <p className="text-xs font-bold text-black">{company.cnpj} • {company.phone}</p>
+            <p className="text-[10px] font-bold text-black">{company.email || '--'}</p>
+          </div>
+        </div>
+        <div className="text-right shrink-0 w-auto">
+          <div className="bg-black text-white px-4 py-2 mb-2 block w-auto">
+            <p className="text-[10px] font-bold uppercase tracking-widest whitespace-nowrap">Ordem de Serviço</p>
+            <p className="text-xl font-black">{os.number}</p>
+          </div>
+          <p className="text-[10px] font-bold text-black italic">Data de Entrada: {format(new Date(os.createdAt), 'dd/MM/yyyy HH:mm')}</p>
+        </div>
+      </div>
+
+      {/* Customer + Equipment + PIX */}
+      <div className="grid grid-cols-12 gap-4 mb-4">
+        <div className="col-span-5 space-y-3">
+          <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-black pb-1">Dados do Cliente</h3>
+          <div>
+            <p className="text-sm font-black">{os.customerName}</p>
+            <p className="text-xs text-black">{customerDocument !== '--' ? customerDocument : 'Cliente registrado por nome'}</p>
+            <p className="text-xs text-black">{customerPhone !== '--' ? customerPhone : customerContact}</p>
+            <p className="text-[10px] text-black/70">{customerCityState}</p>
+          </div>
+        </div>
+        <div className="col-span-4 space-y-3">
+          <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-black pb-1">Equipamento</h3>
+          <div>
+            <p className="text-sm font-black">{os.equipment}</p>
+            <p className="text-xs text-black">{os.brand} {os.model}</p>
+            <p className="text-xs text-black font-mono">S/N: {os.serialNumber}</p>
+          </div>
+        </div>
+        <div className="col-span-3 space-y-3">
+          <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-black pb-1">PIX</h3>
+          <div className="border rounded-xl p-2">
+            {pixPayload ? (
+              <>
+                <img
+                  src={pixQrCodeCandidates[pixQrCandidateIndex] || ''}
+                  alt="QRCode PIX"
+                  className="w-[78px] h-[78px] border ml-auto my-1"
+                  onError={() => {
+                    setPixQrCandidateIndex((prev) => (prev + 1 < pixQrCodeCandidates.length ? prev + 1 : prev));
+                  }}
+                />
+                <p className="text-[9px] uppercase font-bold text-right">Tipo: {company.pixKeyType || 'PIX'}</p>
+                <p className="text-[9px] font-mono text-right break-all">Chave: {formatPixKeyPreview(company.pixKey || '', company.pixKeyType)}</p>
+              </>
+            ) : (
+              <p className="text-[10px] text-right text-black/70">Configure a chave PIX em Dados da Empresa</p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Defect & Diagnosis */}
+      <div className="space-y-3 mb-4">
+        <div className="p-3 border rounded-xl">
+          <h3 className="text-xs font-black uppercase tracking-widest mb-2">Defeito Informado</h3>
+          <p className="text-sm italic text-black">"{os.defect}"</p>
+        </div>
+        {os.diagnosis && (
+          <div className="p-3 border border-black/10 rounded-xl">
+            <h3 className="text-xs font-black uppercase tracking-widest mb-2">Diagnóstico Técnico</h3>
+            <p className="text-sm">{os.diagnosis}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Status & Priority */}
+      <div className="grid grid-cols-4 gap-3 mb-4">
+        <div className="border rounded-xl p-2 text-center">
+          <p className="text-[9px] uppercase font-bold text-black mb-1 leading-none">Status</p>
+          <p className="text-sm font-black">{os.status}</p>
+        </div>
+        <div className="border rounded-xl p-2 text-center">
+          <p className="text-[9px] uppercase font-bold text-black mb-1 leading-none">Prioridade</p>
+          <p className="text-sm font-black">{os.priority}</p>
+        </div>
+        <div className="border rounded-xl p-2 text-center">
+          <p className="text-[9px] uppercase font-bold text-black mb-1 leading-none">Prazo Diag.</p>
+          <p className="text-sm font-black">
+            {os.diagnosisDeadline ? format(new Date(os.diagnosisDeadline), 'dd/MM/yyyy') : '--/--/----'}
+          </p>
+        </div>
+        <div className="border rounded-xl p-2 text-center">
+          <p className="text-[9px] uppercase font-bold text-black mb-1 leading-none">Prazo Entrega</p>
+          <p className="text-sm font-black">
+            {os.completionDeadline ? format(new Date(os.completionDeadline), 'dd/MM/yyyy') : '--/--/----'}
+          </p>
+        </div>
+      </div>
+
+      {/* Items / Parts / Services */}
+      <div className="mb-4 border rounded-xl overflow-x-auto">
+        <table className="w-full text-sm min-w-full">
+          <thead className="bg-gray-100 border-b">
+            <tr>
+              <th className="px-4 py-2 text-left text-[10px] uppercase font-black">Descrição</th>
+              <th className="px-4 py-2 text-center text-[10px] uppercase font-black">Tipo</th>
+              <th className="px-4 py-2 text-center text-[10px] uppercase font-black">Qtd</th>
+              <th className="px-4 py-2 text-right text-[10px] uppercase font-black">Unitário</th>
+              <th className="px-4 py-2 text-right text-[10px] uppercase font-black">Total</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {os.items && os.items.length > 0 ? os.items.map((item, idx) => (
+              <tr key={idx}>
+                <td className="px-4 py-3 font-medium">
+                  {item.description}
+                  {item.type === 'Serviço' && item.executionTimeValue && item.executionTimeUnit && (
+                    <div className="text-[9px] text-black/70">Prazo: {item.executionTimeValue} {item.executionTimeUnit}</div>
+                  )}
+                </td>
+                <td className="px-4 py-3 text-center text-xs">{item.type}</td>
+                <td className="px-4 py-3 text-center">{item.quantity}</td>
+                <td className="px-4 py-3 text-right">R$ {item.unitPrice.toFixed(2)}</td>
+                <td className="px-4 py-3 text-right font-bold">R$ {item.totalPrice.toFixed(2)}</td>
+              </tr>
+            )) : (
+              <tr>
+                <td colSpan={5} className="px-4 py-8 text-center text-black italic">
+                  Nenhum item ou serviço registrado até o momento.
+                </td>
+              </tr>
+            )}
+          </tbody>
+          <tfoot className="bg-gray-50 font-black">
+            <tr>
+              <td colSpan={4} className="px-4 py-3 text-right uppercase tracking-widest text-xs">Valor Total da OS:</td>
+              <td className="px-4 py-3 text-right text-lg">R$ {orderTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      {/* Terms & Signatures */}
+      <div className="grid grid-cols-2 gap-8 mt-5">
+        <div className="space-y-2">
+          <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-black pb-1">Termos e Condições</h3>
+          <p className="text-[9px] text-black leading-relaxed">
+            1. O prazo para diagnóstico é de até 48h úteis.<br />
+            2. Equipamentos não retirados em até 90 dias após a notificação serão considerados abandonados.<br />
+            3. A garantia de peças é de 90 dias conforme CDC, exceto para danos causados por mau uso, umidade ou intervenção de terceiros.
+          </p>
+        </div>
+        <div className="flex flex-col justify-end gap-12">
+          <div className="border-t border-black pt-2 text-center">
+            <p className="text-[9px] uppercase font-bold">Assinatura do Cliente</p>
+          </div>
+          <div className="border-t border-black pt-2 text-center">
+            <p className="text-[9px] uppercase font-bold">{company.name}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Footer Notes */}
+      <div className="mt-auto text-center border-t pt-3">
+        <p className="text-[10px] text-black">Este documento é uma representação digital da Ordem de Serviço {os.number}. Gerado em {format(new Date(), 'dd/MM/yyyy HH:mm')}.</p>
+      </div>
+      </div>
+    </div>
+  );
+});
+
 const SUPPORT_SESSIONS_STORAGE_KEY = 'techmanager_support_sessions';
 const SUPPORT_RETENTION_DAYS = 15;
 const AUTH_USERS_STORAGE_KEY = 'techmanager_auth_users';
 const AUTH_SESSION_USER_ID_STORAGE_KEY = 'techmanager_auth_session_user_id';
 const APP_COMPANIES_STORAGE_KEY = 'techmanager_app_companies';
 const ACCOUNTANT_ASSISTANT_REMINDER_KEY = 'techmanager_accountant_assistant_last_reminder';
-const HOLIDAY_CACHE_STORAGE_KEY = 'techmanager_holiday_cache_v1';
-const HOLIDAY_OPENING_PROMPT_STORAGE_KEY = 'techmanager_holiday_opening_prompt';
-const WEEKDAY_CONFIG: Array<{ day: number; label: string }> = [
-  { day: 1, label: 'Seg' },
-  { day: 2, label: 'Ter' },
-  { day: 3, label: 'Qua' },
-  { day: 4, label: 'Qui' },
-  { day: 5, label: 'Sex' },
-  { day: 6, label: 'Sáb' },
-  { day: 0, label: 'Dom' },
-];
 const WINDOWS_1252_SPECIAL_BYTES: Record<number, number> = {
   0x20ac: 0x80,
   0x201a: 0x82,
@@ -375,34 +791,6 @@ const normalizeTextEncoding = <T,>(value: T): T => {
   return value;
 };
 
-const toIsoDate = (value: Date | string) => {
-  if (typeof value === 'string') return value.slice(0, 10);
-  return format(value, 'yyyy-MM-dd');
-};
-
-const normalizeHolidayDate = (value: string) => {
-  if (!value) return '';
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return '';
-  return format(parsed, 'yyyy-MM-dd');
-};
-
-const getWeekdaySchedule = (company: Company, day: number) => {
-  const weekly = company.businessHoursWeeklySchedule || {};
-  const fallbackOpen = company.businessHoursWeekdays?.length
-    ? company.businessHoursWeekdays.includes(day)
-    : day >= 1 && day <= 6;
-  return weekly[String(day)] || {
-    open: fallbackOpen,
-    start: company.businessHoursStart || '08:30',
-    breakEnabled: true,
-    breakStart: company.businessHoursBreakStart || '12:00',
-    breakEnd: company.businessHoursBreakEnd || '13:30',
-    end: company.businessHoursEnd || '18:00',
-  };
-};
-
 const AI_PROVIDER_MODEL_OPTIONS: Record<AIProvider, AIModelOption[]> = {
   openai: [
     { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
@@ -458,6 +846,24 @@ const EMPTY_COMPANY: Company = {
   osCopiesPerPage: 1,
   notifyWhatsappOnOpen: true,
   notifyBudgetReady: true,
+  pixKeyType: 'CPF',
+  pixKey: '',
+  businessHoursEnabled: true,
+  businessHoursWeekdays: [1, 2, 3, 4, 5],
+  businessHoursStart: '08:30',
+  businessHoursEnd: '18:00',
+  businessHoursBreakStart: '12:00',
+  businessHoursBreakEnd: '13:30',
+  businessHoursBreakWeekdays: [1, 2, 3, 4, 5],
+  businessHoursSaturdayEnabled: true,
+  businessHoursSaturdayStart: '08:30',
+  businessHoursSaturdayEnd: '12:30',
+  businessHoursSundayEnabled: false,
+  businessHoursSundayStart: '00:00',
+  businessHoursSundayEnd: '00:00',
+  businessHoursHolidayClosed: true,
+  holidayWorkOverrides: {},
+  waitingPartOptions: [],
   aiAssistantMode: 'saas-managed',
   aiSaasCatalogId: '',
   aiProvider: 'openai',
@@ -1348,25 +1754,42 @@ const ROLE_FRIENDLY_NAMES: Record<string, string> = {
   'USUARIO': 'Técnico'
 };
 
-const SidebarItem = ({ icon: Icon, label, active, onClick }: any) => (
+const SidebarItem = ({ icon: Icon, label, active, collapsed, onClick }: any) => (
   <button
     onClick={onClick}
     className={cn(
-      "flex items-center w-full gap-3 px-4 py-2.5 text-sm font-medium transition-all rounded-lg group relative overflow-hidden",
+      "flex items-center w-full gap-3 px-4 py-2.5 text-sm font-medium transition-all rounded-lg group relative",
+      collapsed && "justify-center px-0 py-1.5 min-h-[44px] gap-0",
       active 
         ? "bg-primary text-primary-foreground shadow-lg shadow-primary/20" 
         : "text-muted-foreground hover:bg-secondary hover:text-foreground"
     )}
+    title={collapsed ? label : undefined}
   >
-    <Icon className={cn("w-5 h-5 transition-transform duration-300", active ? "text-primary-foreground" : "group-hover:scale-110 group-hover:text-primary")} />
-    <span>{label}</span>
+    <Icon className={cn(
+      "transition-transform duration-300",
+      collapsed ? "w-6 h-6" : "w-5 h-5",
+      active
+        ? "text-primary-foreground"
+        : "text-foreground/80 group-hover:scale-110 group-hover:text-primary"
+    )} />
+    {!collapsed && <span className="text-left leading-tight">{label}</span>}
+    {collapsed && (
+      <span
+        className="pointer-events-none absolute left-full ml-2 rounded-md border bg-background px-2 py-1 text-xs font-semibold text-foreground shadow-lg opacity-0 translate-x-1 transition-all duration-200 group-hover:opacity-100 group-hover:translate-x-0"
+      >
+        {label}
+      </span>
+    )}
     {active && (
       <motion.div 
         layoutId="active-nav"
         className="absolute right-0 w-1 h-6 bg-primary-foreground rounded-l-full"
       />
     )}
-    {!active && <ChevronRight className="w-4 h-4 ml-auto opacity-0 group-hover:opacity-100 transition-opacity" />}
+    {!collapsed && !active && (
+      <ChevronRight className="w-4 h-4 ml-auto opacity-0 group-hover:opacity-100 transition-opacity" />
+    )}
   </button>
 );
 
@@ -1674,103 +2097,6 @@ export default function App() {
 
   const [companyLogo, setCompanyLogo] = useState<string | null>(null);
   const [company, setCompany] = useState<Company>(EMPTY_COMPANY);
-  const [holidayCache, setHolidayCache] = useState<HolidayCalendarCache>({});
-  const [holidayPromptDate, setHolidayPromptDate] = useState<string | null>(null);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(HOLIDAY_CACHE_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as HolidayCalendarCache;
-      if (!parsed || typeof parsed !== 'object') return;
-      setHolidayCache(parsed);
-    } catch (error) {
-      console.warn('Falha ao carregar cache de feriados:', error);
-    }
-  }, []);
-
-  const allHolidays = useMemo<HolidayApiItem[]>(() => {
-    const merged = Object.values(holidayCache).flatMap((yearCache) => yearCache?.holidays || []);
-    const unique = new Map<string, HolidayApiItem>();
-    merged.forEach((item) => {
-      const date = normalizeHolidayDate(item.date);
-      if (!date) return;
-      unique.set(date, { ...item, date });
-    });
-    return Array.from(unique.values()).sort((a, b) => a.date.localeCompare(b.date));
-  }, [holidayCache]);
-
-  useEffect(() => {
-    const ensureHolidayYear = async (year: number) => {
-      if (!Number.isFinite(year)) return;
-
-      setHolidayCache((prev) => {
-        const existing = prev[String(year)];
-        if (existing?.holidays?.length) return prev;
-        return prev;
-      });
-
-      const currentCache = holidayCache[String(year)];
-      if (currentCache?.holidays?.length) return;
-
-      try {
-        const response = await axios.get(`https://brasilapi.com.br/api/feriados/v1/${year}`);
-        const holidays = Array.isArray(response.data)
-          ? response.data
-              .map((item: any) => ({
-                date: normalizeHolidayDate(String(item?.date || '')),
-                name: String(item?.name || 'Feriado'),
-                type: String(item?.type || 'nacional'),
-              }))
-              .filter((item: HolidayApiItem) => !!item.date)
-          : [];
-
-        setHolidayCache((prev) => {
-          if (prev[String(year)]?.holidays?.length) return prev;
-          const next = {
-            ...prev,
-            [String(year)]: {
-              fetchedAt: new Date().toISOString(),
-              holidays,
-            },
-          };
-          try {
-            localStorage.setItem(HOLIDAY_CACHE_STORAGE_KEY, JSON.stringify(next));
-          } catch (error) {
-            console.warn('Falha ao salvar cache de feriados:', error);
-          }
-          return next;
-        });
-      } catch (error) {
-        console.warn(`Falha ao buscar feriados para ${year}:`, error);
-      }
-    };
-
-    const nowYear = new Date().getFullYear();
-    ensureHolidayYear(nowYear);
-    ensureHolidayYear(nowYear + 1);
-  }, [holidayCache]);
-
-  useEffect(() => {
-    if (!company.id) return;
-    if (allHolidays.length === 0) return;
-
-    const today = startOfDay(new Date());
-    const todayKey = toIsoDate(today);
-    const reminderKey = `${HOLIDAY_OPENING_PROMPT_STORAGE_KEY}_${company.id}_${todayKey}`;
-    if (localStorage.getItem(reminderKey)) return;
-
-    const upcoming = allHolidays.find((holiday) => {
-      const holidayDate = startOfDay(new Date(`${holiday.date}T12:00:00`));
-      const diff = differenceInDays(holidayDate, today);
-      return diff > 0 && diff <= 5;
-    });
-
-    if (!upcoming) return;
-    if (company.holidayWorkOverrides?.[upcoming.date]) return;
-
-    setHolidayPromptDate(upcoming.date);
-  }, [allHolidays, company.id, company.holidayWorkOverrides]);
 
   useEffect(() => {
     if (!company.accountantAssistantEnabled) return;
@@ -1820,7 +2146,6 @@ export default function App() {
   const [salesHistory, setSalesHistory] = useState<any[]>([]);
 
   const [financeTransactions, setFinanceTransactions] = useState<any[]>([]);
-  const [returnTickets, setReturnTickets] = useState<any[]>([]);
 
   const [teamUsers, setTeamUsers] = useState<User[]>([]);
 
@@ -1862,67 +2187,135 @@ export default function App() {
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
 
   const [printTemplates, setPrintTemplates] = useState<PrintTemplate[]>([]);
+  const [holidayCalendar, setHolidayCalendar] = useState<HolidayCalendarCache>({});
+  const isHydratingAppStateRef = useRef(true);
 
   useEffect(() => {
     let cancelled = false;
 
     const loadAppState = async () => {
       const applyResolvedState = async (serverState: any = {}) => {
-        const normalizedState = normalizeTextEncoding(serverState);
+        const normalizedState = serverState || {};
         const resolveArray = <T,>(serverValue: unknown): T[] => {
           if (Array.isArray(serverValue)) return serverValue as T[];
           return [];
         };
 
-        const resolvedUsers = resolveArray<AuthUser>(normalizedState?.users);
-        const resolvedCompanies = resolveArray<ManagedCompany>(normalizedState?.companies);
-        const resolvedOrders = resolveArray<ServiceOrder>(normalizedState?.orders);
-        const resolvedTasks = resolveArray<any>(normalizedState?.tasks);
-        const resolvedProducts = resolveArray<any>(normalizedState?.products);
-        const resolvedSales = resolveArray<any>(normalizedState?.sales);
-        const resolvedFinance = resolveArray<any>(normalizedState?.finance);
-        const resolvedReturns = resolveArray<any>(normalizedState?.returns);
-        const resolvedTeam = resolveArray<User>(normalizedState?.team);
-        const resolvedRma = resolveArray<any>(normalizedState?.rma);
-        const resolvedEquipmentTypes = resolveArray<EquipmentType>(normalizedState?.equipmentTypes);
-        const resolvedCustomers = sanitizeCustomers(resolveArray<any>(normalizedState?.customers));
-        const resolvedSuppliers = resolveArray<Supplier>(normalizedState?.suppliers);
-        const resolvedPrintTemplates = resolveArray<PrintTemplate>(normalizedState?.printTemplates);
-        const resolvedCompany = hasCompanyContent(normalizedState?.companySettings)
-          ? { ...EMPTY_COMPANY, ...normalizedState.companySettings }
-          : companyFromManagedCompany(resolvedCompanies[0]);
-
         if (cancelled) return;
 
-        setAuthUsers(resolvedUsers);
-        setManagedCompanies(resolvedCompanies);
-        setAllOrders(resolvedOrders);
-        setTasks(resolvedTasks);
-        setAllProducts(resolvedProducts);
-        setSalesHistory(resolvedSales);
-        setFinanceTransactions(resolvedFinance);
-        setReturnTickets(resolvedReturns);
-        setTeamUsers(resolvedTeam);
-        setRmaHistory(resolvedRma);
-        setEquipmentTypes(resolvedEquipmentTypes);
-        setGlobalCustomers(resolvedCustomers);
-        setSuppliers(resolvedSuppliers);
-        setPrintTemplates(resolvedPrintTemplates);
-        setCompany(resolvedCompany);
-        setActiveCompany(resolvedCompany);
-        setCompanyLogo(resolvedCompany.logo || null);
-        setIsAppStateLoaded(true);
+        if ('users' in normalizedState) {
+          setAuthUsers(resolveArray<AuthUser>(normalizedState.users));
+        }
+        if ('companies' in normalizedState) {
+          setManagedCompanies(resolveArray<ManagedCompany>(normalizedState.companies));
+        }
+        if ('orders' in normalizedState) {
+          setAllOrders(resolveArray<ServiceOrder>(normalizedState.orders));
+        }
+        if ('tasks' in normalizedState) {
+          setTasks(resolveArray<any>(normalizedState.tasks));
+        }
+        if ('products' in normalizedState) {
+          setAllProducts(resolveArray<any>(normalizedState.products));
+        }
+        if ('sales' in normalizedState) {
+          setSalesHistory(resolveArray<any>(normalizedState.sales));
+        }
+        if ('finance' in normalizedState) {
+          setFinanceTransactions(resolveArray<any>(normalizedState.finance));
+        }
+        if ('team' in normalizedState) {
+          setTeamUsers(resolveArray<User>(normalizedState.team));
+        }
+        if ('rma' in normalizedState) {
+          setRmaHistory(resolveArray<any>(normalizedState.rma));
+        }
+        if ('equipmentTypes' in normalizedState) {
+          setEquipmentTypes(resolveArray<EquipmentType>(normalizedState.equipmentTypes));
+        }
+        if ('customers' in normalizedState) {
+          setGlobalCustomers(sanitizeCustomers(resolveArray<any>(normalizedState.customers)));
+        }
+        if ('suppliers' in normalizedState) {
+          setSuppliers(resolveArray<Supplier>(normalizedState.suppliers));
+        }
+        if ('printTemplates' in normalizedState) {
+          const resolvedPrintTemplates = resolveArray<PrintTemplate>(normalizedState.printTemplates);
+          const adjustedPrintTemplates = resolvedPrintTemplates.map((template) =>
+            template.id === '1tl03tdak' ? { ...template, gapX: 4 } : template
+          );
+          setPrintTemplates(adjustedPrintTemplates);
+        }
+        if ('holidayCalendar' in normalizedState) {
+          const resolvedHolidayCalendar =
+            normalizedState.holidayCalendar &&
+            typeof normalizedState.holidayCalendar === 'object' &&
+            !Array.isArray(normalizedState.holidayCalendar)
+              ? (normalizedState.holidayCalendar as HolidayCalendarCache)
+              : {};
+          setHolidayCalendar(resolvedHolidayCalendar);
+        }
+        if ('companySettings' in normalizedState || 'companies' in normalizedState) {
+          const resolvedCompanies =
+            'companies' in normalizedState
+              ? resolveArray<ManagedCompany>(normalizedState.companies)
+              : managedCompanies;
+          const resolvedCompany = hasCompanyContent(normalizedState?.companySettings)
+            ? { ...EMPTY_COMPANY, ...normalizedState.companySettings }
+            : companyFromManagedCompany(resolvedCompanies[0]);
+          setCompany(resolvedCompany);
+          setActiveCompany(resolvedCompany);
+          setCompanyLogo(resolvedCompany.logo || null);
+        }
 
         // Backend is the single source of truth for business data.
       };
 
       try {
-        const response = await axios.get('/api/app-state');
-        await applyResolvedState(response.data || {});
+        isHydratingAppStateRef.current = true;
+        const baseKeys = [
+          'users',
+          'companies',
+          'team',
+          'equipmentTypes',
+          'customers',
+          'suppliers',
+          'printTemplates',
+          'holidayCalendar',
+          'companySettings',
+        ];
+        const heavyKeys = ['orders', 'tasks', 'products', 'sales', 'finance', 'rma'];
+
+        const baseResponse = await axios.get('/api/app-state', {
+          params: { keys: baseKeys.join(',') },
+        });
+        await applyResolvedState(baseResponse.data || {});
+
+        if (cancelled) return;
+
+        setIsAppStateLoaded(true);
         setIsBackendStateHydrated(true);
+
+        for (const key of heavyKeys) {
+          if (cancelled) break;
+          try {
+            const response = await axios.get('/api/app-state', {
+              params: { keys: key },
+            });
+            await applyResolvedState(response.data || {});
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+          } catch (error) {
+            console.error(`Erro ao carregar bloco '${key}' do estado do banco:`, error);
+          }
+        }
+
+        if (!cancelled) {
+          isHydratingAppStateRef.current = false;
+        }
       } catch (error) {
         console.error('Erro ao carregar estado do banco:', error);
         if (!cancelled) {
+          isHydratingAppStateRef.current = false;
           setIsAppStateLoaded(true);
         }
       }
@@ -1938,6 +2331,7 @@ export default function App() {
   useEffect(() => {
     if (!isAppStateLoaded) return;
     if (!isBackendStateHydrated) return;
+    if (isHydratingAppStateRef.current) return;
 
     setActiveCompany(company);
     setCompanyLogo(company.logo || null);
@@ -1950,13 +2344,13 @@ export default function App() {
       products: allProducts,
       sales: salesHistory,
       finance: financeTransactions,
-      returns: returnTickets,
       team: teamUsers,
       rma: rmaHistory,
       equipmentTypes,
       customers: globalCustomers,
       suppliers,
       printTemplates,
+      holidayCalendar,
       companySettings: company,
     }).catch((error) => {
       console.error('Erro ao persistir estado do app no banco:', error);
@@ -1971,13 +2365,13 @@ export default function App() {
     allProducts,
     salesHistory,
     financeTransactions,
-    returnTickets,
     teamUsers,
     rmaHistory,
     equipmentTypes,
     globalCustomers,
     suppliers,
     printTemplates,
+    holidayCalendar,
     company,
   ]);
 
@@ -2080,7 +2474,6 @@ export default function App() {
     { id: 'fornecedores', label: 'Fornecedores', icon: Truck },
     { id: 'estoque', label: 'Estoque', icon: Package },
     { id: 'vendas', label: 'PDV / Vendas', icon: ShoppingCart },
-    { id: 'trocas-devolucoes', label: 'Trocas e Devoluções', icon: RefreshCw },
     { id: 'whatsapp', label: 'WhatsApp', icon: MessageSquare },
     { id: 'financeiro', label: 'Financeiro', icon: DollarSign },
     { id: 'equipe', label: 'Equipe / Usuários', icon: Users },
@@ -2110,6 +2503,137 @@ export default function App() {
     item.id === 'migracao'
   ));
 
+  const [holidayPromptOpen, setHolidayPromptOpen] = useState(false);
+  const [holidayPromptHoliday, setHolidayPromptHoliday] = useState<HolidayApiItem | null>(null);
+  const [holidayPromptOpenOnHoliday, setHolidayPromptOpenOnHoliday] = useState(company.businessHoursHolidayClosed === false);
+  const [holidayPromptStart, setHolidayPromptStart] = useState(company.businessHoursStart || '08:30');
+  const [holidayPromptBreakEnabled, setHolidayPromptBreakEnabled] = useState(true);
+  const [holidayPromptBreakStart, setHolidayPromptBreakStart] = useState(company.businessHoursBreakStart || '12:00');
+  const [holidayPromptEnd, setHolidayPromptEnd] = useState(company.businessHoursEnd || '18:00');
+
+  const holidayCalendarRef = useRef<HolidayCalendarCache>(holidayCalendar);
+  const holidayFetchInFlightYearsRef = useRef<Set<number>>(new Set());
+
+  useEffect(() => {
+    holidayCalendarRef.current = holidayCalendar;
+  }, [holidayCalendar]);
+
+  const ensureHolidayYearCache = async (year: number): Promise<HolidayApiItem[]> => {
+    const yearKey = String(year);
+    const cached = holidayCalendarRef.current[yearKey];
+    if (cached?.holidays?.length) return cached.holidays;
+
+    if (holidayFetchInFlightYearsRef.current.has(year)) {
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 100));
+        const refreshed = holidayCalendarRef.current[yearKey];
+        if (refreshed?.holidays?.length) return refreshed.holidays;
+      }
+      return [];
+    }
+
+    holidayFetchInFlightYearsRef.current.add(year);
+    try {
+      const response = await axios.get(`https://brasilapi.com.br/api/feriados/v1/${year}`);
+      const payload = Array.isArray(response.data) ? response.data : [];
+      const holidays: HolidayApiItem[] = payload
+        .map((item: any) => ({
+          date: String(item?.date || '').slice(0, 10),
+          name: String(item?.name || 'Feriado'),
+          type: String(item?.type || 'national'),
+        }))
+        .filter((item) => /^\d{4}-\d{2}-\d{2}$/.test(item.date));
+
+      setHolidayCalendar((prev) => {
+        const next = {
+          ...prev,
+          [yearKey]: {
+            fetchedAt: new Date().toISOString(),
+            holidays,
+          },
+        };
+        holidayCalendarRef.current = next;
+        return next;
+      });
+      return holidays;
+    } catch (error) {
+      console.error(`Erro ao carregar feriados de ${year}:`, error);
+      return [];
+    } finally {
+      holidayFetchInFlightYearsRef.current.delete(year);
+    }
+  };
+
+  useEffect(() => {
+    if (!isAppStateLoaded || !isBackendStateHydrated) return;
+    const run = async () => {
+      const now = new Date();
+      await ensureHolidayYearCache(now.getFullYear());
+      await ensureHolidayYearCache(now.getFullYear() + 1);
+    };
+    run();
+  }, [isAppStateLoaded, isBackendStateHydrated]);
+
+  useEffect(() => {
+    if (!isAppStateLoaded || !isBackendStateHydrated) return;
+    const run = async () => {
+      const today = startOfDay(new Date());
+      const seenKey = `techmanager_holiday_prompt_seen_${format(today, 'yyyy-MM-dd')}`;
+      if (localStorage.getItem(seenKey)) return;
+
+      await ensureHolidayYearCache(today.getFullYear());
+      await ensureHolidayYearCache(today.getFullYear() + 1);
+
+      const allCached = Object.values(holidayCalendarRef.current)
+        .flatMap((yearCache) => yearCache?.holidays || [])
+        .filter((item) => item?.date)
+        .sort((a, b) => a.date.localeCompare(b.date));
+
+      const nextHoliday = allCached.find((item) => {
+        const date = startOfDay(new Date(item.date));
+        return !Number.isNaN(date.getTime()) && differenceInDays(date, today) >= 0;
+      });
+      if (!nextHoliday) return;
+
+      const daysLeft = differenceInDays(startOfDay(new Date(nextHoliday.date)), today);
+      if (daysLeft > 5) return;
+
+      const override = company.holidayWorkOverrides?.[nextHoliday.date];
+      const openByDefault = company.businessHoursHolidayClosed === false;
+      setHolidayPromptHoliday(nextHoliday);
+      setHolidayPromptOpenOnHoliday(override ? override.open : openByDefault);
+      setHolidayPromptStart(override?.start || company.businessHoursStart || '08:30');
+      setHolidayPromptBreakEnabled(override?.breakEnabled ?? true);
+      setHolidayPromptBreakStart(override?.breakStart || company.businessHoursBreakStart || '12:00');
+      setHolidayPromptEnd(override?.end || company.businessHoursEnd || '18:00');
+      setHolidayPromptOpen(true);
+      localStorage.setItem(seenKey, '1');
+    };
+    run();
+  }, [isAppStateLoaded, isBackendStateHydrated, company.businessHoursHolidayClosed, company.businessHoursStart, company.businessHoursBreakStart, company.businessHoursEnd, company.holidayWorkOverrides]);
+
+  const confirmHolidayPrompt = () => {
+    if (!holidayPromptHoliday) {
+      setHolidayPromptOpen(false);
+      return;
+    }
+    setCompany((prev) => ({
+      ...prev,
+      holidayWorkOverrides: {
+        ...(prev.holidayWorkOverrides || {}),
+        [holidayPromptHoliday.date]: {
+          open: holidayPromptOpenOnHoliday,
+          start: holidayPromptStart,
+          breakEnabled: holidayPromptBreakEnabled,
+          breakStart: holidayPromptBreakStart,
+          end: holidayPromptEnd,
+        },
+      },
+    }));
+    toast.success('Configuração de feriado salva.');
+    setHolidayPromptOpen(false);
+  };
+
   const renderContent = () => {
     if (viewingOSId) {
       return (
@@ -2120,17 +2644,11 @@ export default function App() {
           setAllOrders={setAllOrders}
           customSubStatuses={customSubStatuses}
           allProducts={allProducts}
-          setAllProducts={setAllProducts}
-          setFinanceTransactions={setFinanceTransactions}
-          setReturnTickets={setReturnTickets}
-          setRmaHistory={setRmaHistory}
-          returnTickets={returnTickets}
           teamUsers={teamUsers}
           globalCustomers={globalCustomers}
           user={user}
           company={company}
           printTemplates={printTemplates}
-          holidays={allHolidays}
         />
       );
     }
@@ -2192,12 +2710,14 @@ export default function App() {
             teamUsers={teamUsers} 
             user={user as User} 
             equipmentTypes={equipmentTypes} 
+            setEquipmentTypes={setEquipmentTypes}
             globalCustomers={globalCustomers}
             setGlobalCustomers={setGlobalCustomers}
             setAllOrders={setAllOrders} 
             printTemplates={printTemplates} 
             company={company}
-            holidays={allHolidays}
+            holidayCalendar={holidayCalendar}
+            setHolidayCalendar={setHolidayCalendar}
           />
         );
       case 'conferencia-os':
@@ -2245,7 +2765,7 @@ export default function App() {
             tasks={tasks}
             onViewOS={(id) => setViewingOSId(id)}
             onNavigate={setActiveTab}
-            holidays={allHolidays}
+            holidayCalendar={holidayCalendar}
           />
         );
       case 'vendas':
@@ -2257,20 +2777,10 @@ export default function App() {
             allProducts={allProducts}
             setAllProducts={setAllProducts}
             setFinanceTransactions={setFinanceTransactions}
-            setReturnTickets={setReturnTickets}
             rmaHistory={rmaHistory}
             setRmaHistory={setRmaHistory}
             globalCustomers={globalCustomers}
             setGlobalCustomers={setGlobalCustomers}
-          />
-        );
-      case 'trocas-devolucoes':
-        return (
-          <ExchangesAndReturnsView
-            tickets={returnTickets}
-            setTickets={setReturnTickets}
-            salesHistory={salesHistory}
-            financeTransactions={financeTransactions}
           />
         );
       case 'equipe':
@@ -2369,13 +2879,67 @@ export default function App() {
     return <LoginView onLogin={handleLoginSuccess} authUsers={authUsers} />;
   }
 
-  const holidayPromptItem = holidayPromptDate
-    ? allHolidays.find((item) => item.date === holidayPromptDate) || null
-    : null;
-
   return (
     <div className={cn("theme-auto flex min-h-screen bg-background text-foreground font-sans selection:bg-primary/10 transition-colors duration-300", darkMode && "dark")}>
       <Toaster position="top-right" richColors />
+      <Dialog open={holidayPromptOpen} onOpenChange={setHolidayPromptOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Planejamento de Feriado</DialogTitle>
+            <DialogDescription>
+              {holidayPromptHoliday
+                ? `Faltam até 5 dias para ${holidayPromptHoliday.name} (${format(new Date(holidayPromptHoliday.date), 'dd/MM/yyyy')}).`
+                : 'Configure o horário para o próximo feriado.'}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="flex items-center justify-between rounded-lg border px-3 py-2">
+              <Label>Vai abrir no feriado?</Label>
+              <Button
+                type="button"
+                size="sm"
+                variant={holidayPromptOpenOnHoliday ? 'default' : 'outline'}
+                onClick={() => setHolidayPromptOpenOnHoliday((prev) => !prev)}
+              >
+                {holidayPromptOpenOnHoliday ? 'SIM' : 'NÃO'}
+              </Button>
+            </div>
+            {holidayPromptOpenOnHoliday && (
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <Label>Início</Label>
+                    <Input type="time" value={holidayPromptStart} onChange={(e) => setHolidayPromptStart(e.target.value)} />
+                  </div>
+                  <div className="space-y-1">
+                    <Label>Fim</Label>
+                    <Input type="time" value={holidayPromptEnd} onChange={(e) => setHolidayPromptEnd(e.target.value)} />
+                  </div>
+                </div>
+                <div className="flex items-center justify-between rounded-lg border px-3 py-2">
+                  <Label>Usar intervalo?</Label>
+                  <input
+                    type="checkbox"
+                    checked={holidayPromptBreakEnabled}
+                    onChange={(e) => setHolidayPromptBreakEnabled(e.target.checked)}
+                    className="h-4 w-4 accent-primary"
+                  />
+                </div>
+                {holidayPromptBreakEnabled && (
+                  <div className="space-y-1">
+                    <Label>Início do intervalo</Label>
+                    <Input type="time" value={holidayPromptBreakStart} onChange={(e) => setHolidayPromptBreakStart(e.target.value)} />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setHolidayPromptOpen(false)}>Agora não</Button>
+            <Button onClick={confirmHolidayPrompt}>Confirmar</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       
       {/* Backdrop for Mobile */}
       <AnimatePresence>
@@ -2393,8 +2957,8 @@ export default function App() {
       {/* Sidebar */}
       <aside 
         className={cn(
-          "fixed inset-y-0 left-0 z-50 flex flex-col transition-all duration-300 bg-white border-r shadow-sm lg:relative",
-          isSidebarOpen ? "w-64 translate-x-0" : "w-20 -translate-x-full lg:translate-x-0 lg:w-20",
+          "fixed inset-y-0 left-0 z-50 flex flex-col transition-all duration-300 bg-background border-r shadow-sm lg:relative",
+          isSidebarOpen ? "w-72 translate-x-0" : "w-20 -translate-x-full lg:translate-x-0 lg:w-20",
           !isSidebarOpen && !isMobile && "lg:w-20"
         )}
       >
@@ -2412,13 +2976,17 @@ export default function App() {
           )}
         </div>
 
-        <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+        <nav className={cn(
+          "flex-1 px-3 py-4 overflow-y-auto",
+          isSidebarOpen ? "space-y-1" : "space-y-0.5"
+        )}>
           {menuItems.map((item) => (
             <SidebarItem
               key={item.id}
               icon={item.icon}
-              label={isSidebarOpen ? item.label : ""}
+              label={item.label}
               active={activeTab === item.id}
+              collapsed={!isSidebarOpen}
               onClick={() => {
                 setActiveTab(item.id);
                 if (isMobile) setIsSidebarOpen(false);
@@ -2430,7 +2998,8 @@ export default function App() {
         <div className="p-4 border-t">
           <SidebarItem
             icon={LogOut}
-            label={isSidebarOpen ? "Sair" : ""}
+            label="Sair"
+            collapsed={!isSidebarOpen}
             onClick={() => {
               handleLogout();
             }}
@@ -2502,161 +3071,6 @@ export default function App() {
             </motion.div>
           </AnimatePresence>
         </div>
-
-        <Dialog
-          open={!!holidayPromptItem}
-          onOpenChange={(open) => {
-            if (open) return;
-            if (holidayPromptItem) {
-              const todayKey = toIsoDate(new Date());
-              localStorage.setItem(
-                `${HOLIDAY_OPENING_PROMPT_STORAGE_KEY}_${company.id}_${todayKey}`,
-                holidayPromptItem.date
-              );
-            }
-            setHolidayPromptDate(null);
-          }}
-        >
-          <DialogContent className="sm:max-w-[540px]">
-            <DialogHeader>
-              <DialogTitle>Próximo Feriado em Breve</DialogTitle>
-              <DialogDescription>
-                Faltam até 5 dias para {holidayPromptItem?.name || 'o próximo feriado'} ({holidayPromptItem ? format(new Date(`${holidayPromptItem.date}T12:00:00`), "dd/MM/yyyy (EEEE)", { locale: ptBR }) : ''}).
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4">
-              <div className="rounded-lg border bg-secondary/20 p-3 text-xs text-muted-foreground">
-                Confirme se a empresa irá abrir neste feriado e, se necessário, ajuste o horário.
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>A empresa abre no feriado?</Label>
-                  <Select
-                    value={(company.holidayWorkOverrides?.[holidayPromptItem?.date || '']?.open ?? false) ? 'sim' : 'nao'}
-                    onValueChange={(value) => {
-                      if (!holidayPromptItem) return;
-                      const current = company.holidayWorkOverrides?.[holidayPromptItem.date];
-                      setCompany((prev) => ({
-                        ...prev,
-                        holidayWorkOverrides: {
-                          ...(prev.holidayWorkOverrides || {}),
-                          [holidayPromptItem.date]: {
-                            open: value === 'sim',
-                            start: current?.start || prev.businessHoursStart || '08:30',
-                            breakEnabled: current?.breakEnabled ?? true,
-                            breakStart: current?.breakStart || prev.businessHoursBreakStart || '12:00',
-                            end: current?.end || prev.businessHoursEnd || '18:00',
-                          },
-                        },
-                      }));
-                    }}
-                  >
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="sim">Sim</SelectItem>
-                      <SelectItem value="nao">Não</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-2">
-                  <Label>Início</Label>
-                  <Input
-                    type="time"
-                    value={company.holidayWorkOverrides?.[holidayPromptItem?.date || '']?.start || company.businessHoursStart || '08:30'}
-                    onChange={(e) => {
-                      if (!holidayPromptItem) return;
-                      setCompany((prev) => {
-                        const current = prev.holidayWorkOverrides?.[holidayPromptItem.date];
-                        return {
-                          ...prev,
-                          holidayWorkOverrides: {
-                            ...(prev.holidayWorkOverrides || {}),
-                            [holidayPromptItem.date]: {
-                              open: current?.open ?? false,
-                              start: e.target.value,
-                              breakEnabled: current?.breakEnabled ?? true,
-                              breakStart: current?.breakStart || prev.businessHoursBreakStart || '12:00',
-                              end: current?.end || prev.businessHoursEnd || '18:00',
-                            },
-                          },
-                        };
-                      });
-                    }}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Início Intervalo</Label>
-                  <Input
-                    type="time"
-                    value={company.holidayWorkOverrides?.[holidayPromptItem?.date || '']?.breakStart || company.businessHoursBreakStart || '12:00'}
-                    onChange={(e) => {
-                      if (!holidayPromptItem) return;
-                      setCompany((prev) => {
-                        const current = prev.holidayWorkOverrides?.[holidayPromptItem.date];
-                        return {
-                          ...prev,
-                          holidayWorkOverrides: {
-                            ...(prev.holidayWorkOverrides || {}),
-                            [holidayPromptItem.date]: {
-                              open: current?.open ?? false,
-                              start: current?.start || prev.businessHoursStart || '08:30',
-                              breakEnabled: current?.breakEnabled ?? true,
-                              breakStart: e.target.value,
-                              end: current?.end || prev.businessHoursEnd || '18:00',
-                            },
-                          },
-                        };
-                      });
-                    }}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Término</Label>
-                  <Input
-                    type="time"
-                    value={company.holidayWorkOverrides?.[holidayPromptItem?.date || '']?.end || company.businessHoursEnd || '18:00'}
-                    onChange={(e) => {
-                      if (!holidayPromptItem) return;
-                      setCompany((prev) => {
-                        const current = prev.holidayWorkOverrides?.[holidayPromptItem.date];
-                        return {
-                          ...prev,
-                          holidayWorkOverrides: {
-                            ...(prev.holidayWorkOverrides || {}),
-                            [holidayPromptItem.date]: {
-                              open: current?.open ?? false,
-                              start: current?.start || prev.businessHoursStart || '08:30',
-                              breakEnabled: current?.breakEnabled ?? true,
-                              breakStart: current?.breakStart || prev.businessHoursBreakStart || '12:00',
-                              end: e.target.value,
-                            },
-                          },
-                        };
-                      });
-                    }}
-                  />
-                </div>
-              </div>
-            </div>
-            <DialogFooter>
-              <Button
-                onClick={() => {
-                  if (holidayPromptItem) {
-                    const todayKey = toIsoDate(new Date());
-                    localStorage.setItem(
-                      `${HOLIDAY_OPENING_PROMPT_STORAGE_KEY}_${company.id}_${todayKey}`,
-                      holidayPromptItem.date
-                    );
-                  }
-                  setHolidayPromptDate(null);
-                  toast.success('Configuração de feriado atualizada.');
-                }}
-              >
-                Confirmar
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
       </main>
     </div>
   );
@@ -2960,7 +3374,7 @@ function SuperAdminUsersView({
           privilege: u.role === 'ADMIN-USER' ? 'Completo' : 'Profissional',
           allowedTabs:
             u.role === 'ADMIN-USER'
-              ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'trocas-devolucoes', 'config', 'suporte-tecnico', 'assistente-contador', 'migracao']
+              ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico', 'assistente-contador', 'migracao']
               : ['dashboard', 'os', 'tarefas', 'suporte-tecnico', 'assistente-contador', 'migracao'],
         }))
     );
@@ -3026,7 +3440,7 @@ function SuperAdminUsersView({
                 role === 'ADMIN-SAAS'
                   ? ['superadmin-dashboard', 'superadmin-companies', 'superadmin-users', 'superadmin-settings']
                   : role === 'ADMIN-USER'
-                  ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'trocas-devolucoes', 'config', 'suporte-tecnico', 'assistente-contador', 'migracao']
+                  ? ['dashboard', 'os', 'conferencia-os', 'kanban', 'tarefas', 'clientes', 'estoque', 'financeiro', 'calendario', 'vendas', 'config', 'suporte-tecnico', 'assistente-contador', 'migracao']
                   : ['dashboard', 'os', 'tarefas', 'suporte-tecnico', 'assistente-contador', 'migracao'],
             } as AuthUser,
           ];
@@ -3280,17 +3694,11 @@ function ServiceOrderDetailsView({
   setAllOrders,
   customSubStatuses,
   allProducts,
-  setAllProducts,
-  setFinanceTransactions,
-  setReturnTickets,
-  setRmaHistory,
-  returnTickets,
   teamUsers,
   globalCustomers,
   user,
   company,
-  printTemplates,
-  holidays
+  printTemplates
 }: { 
   osId: string, 
   onBack: () => void, 
@@ -3298,35 +3706,33 @@ function ServiceOrderDetailsView({
   setAllOrders: React.Dispatch<React.SetStateAction<ServiceOrder[]>>,
   customSubStatuses: Record<string, string[]>,
   allProducts: any[],
-  setAllProducts: React.Dispatch<React.SetStateAction<any[]>>,
-  setFinanceTransactions: React.Dispatch<React.SetStateAction<any[]>>,
-  setReturnTickets: React.Dispatch<React.SetStateAction<any[]>>,
-  setRmaHistory: React.Dispatch<React.SetStateAction<any[]>>,
-  returnTickets: any[],
   teamUsers: User[],
   globalCustomers: any[],
   user: User | null,
   company: Company,
-  printTemplates: PrintTemplate[],
-  holidays: HolidayApiItem[]
+  printTemplates: PrintTemplate[]
 }) {
   const os = allOrders.find(o => o.id === osId);
   const [status, setStatus] = useState<OSStatus | string>(os?.status || '');
   const [subStatus, setSubStatus] = useState(os?.subStatus || '');
   const [showPaymentDialog, setShowPaymentDialog] = useState(false);
-  const [showOsReturnDialog, setShowOsReturnDialog] = useState(false);
-  const [isPrintViewOpen, setIsPrintViewOpen] = useState(false);
-  const [printAction, setPrintAction] = useState<'print' | 'pdf' | null>(null);
-  const [isPrintOptionsOpen, setIsPrintOptionsOpen] = useState(false);
-  const [selectedTemplateForPrint, setSelectedTemplateForPrint] = useState<PrintTemplate | null>(null);
-  const [osReturnReason, setOsReturnReason] = useState('');
-  const [osReturnDraft, setOsReturnDraft] = useState<Record<string, {
-    quantity: number;
-    refund: boolean;
-    destination: 'revenda' | 'avaria';
-  }>>({});
+  const [showCancelDialog, setShowCancelDialog] = useState(false);
+  const [cancelReason, setCancelReason] = useState('');
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const osPrintAreaRef = useRef<HTMLDivElement | null>(null);
+  const [templateToPrint, setTemplateToPrint] = useState<PrintTemplate | null>(null);
 
   const isOwner = user?.role === 'ADMIN-USER' || user?.role === 'ADMIN-SAAS';
+  const waitingPartOptions = company.waitingPartOptions || [];
+  const [selectedWaitingPartOptionId, setSelectedWaitingPartOptionId] = useState('');
+  const orderedStatusColumns = useMemo(() => {
+    if (company.osStatuses && company.osStatuses.length > 0) {
+      return [...company.osStatuses]
+        .sort((a, b) => a.order - b.order)
+        .map((item) => item.name as OSStatus);
+    }
+    return STATUS_COLUMNS;
+  }, [company.osStatuses]);
 
   // Reset sub-status if main status changes and it's not applicable
   useEffect(() => {
@@ -3335,235 +3741,218 @@ function ServiceOrderDetailsView({
     }
   }, [status]);
   useEffect(() => {
-    if (!isWaitingPartsStatus) {
+    const normalizedStatus = String(status || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    if (normalizedStatus !== 'aguardando peca') {
       setSelectedWaitingPartOptionId('');
     }
-  }, [isWaitingPartsStatus]);
+  }, [status]);
   const [isUpdating, setIsUpdating] = useState(false);
   const [activeTab, setActiveTab] = useState('geral');
   const [arrivalDate, setArrivalDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [completionDate, setCompletionDate] = useState(os?.completionDeadline ? format(new Date(os.completionDeadline), 'yyyy-MM-dd') : format(addDays(new Date(), 3), 'yyyy-MM-dd'));
-  const [selectedWaitingPartOptionId, setSelectedWaitingPartOptionId] = useState('');
-  const waitingPartOptions = company.waitingPartOptions || [];
-  const isWaitingPartsStatus = String(status || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() === 'aguardando peca';
-  const holidayDateSet = useMemo(
-    () => new Set((holidays || []).map((item) => normalizeHolidayDate(item.date)).filter(Boolean)),
-    [holidays]
-  );
   const [selectedProductId, setSelectedProductId] = useState<string>('');
-
-  const osItems = os?.items || [];
-  const osProductItems = osItems.filter((item) => item.type === 'Produto');
-  const osServiceItems = osItems.filter((item) => item.type === 'Serviço');
-  const osProductTotal = osProductItems.reduce((acc, item) => acc + Number(item.totalPrice || 0), 0);
-  const osServiceTotal = osServiceItems.reduce((acc, item) => acc + Number(item.totalPrice || 0), 0);
-  const osGrandTotal = osItems.length > 0 ? osProductTotal + osServiceTotal : Number(os?.value || 0);
-  const osReturnHistory = (returnTickets || [])
-    .filter((ticket) => ticket.osId === os?.id)
-    .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-  const osRefundedTotal = osReturnHistory.reduce((acc, ticket) => acc + Number(ticket.refundTotal || 0), 0);
+  const isWaitingPartsStatus = String(status || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase() === 'aguardando peca';
 
   const products = allProducts;
 
-  const openOsReturnDialog = () => {
-    if (!os) return;
-    const nextDraft: Record<string, { quantity: number; refund: boolean; destination: 'revenda' | 'avaria' }> = {};
-    osItems.forEach((item) => {
-      const returnedQty = Number((os as any).returnedOsItems?.[item.id] || 0);
-      const availableQty = Math.max(0, Number(item.quantity || 0) - returnedQty);
-      nextDraft[item.id] = {
-        quantity: availableQty > 0 ? 0 : 0,
-        refund: true,
-        destination: item.type === 'Produto' ? 'avaria' : 'revenda',
-      };
-    });
-    setOsReturnDraft(nextDraft);
-    setOsReturnReason('');
-    setShowOsReturnDialog(true);
-  };
-
-  const processOsItemizedReturn = () => {
-    if (!os) return;
-    const currentOs = os;
-    const selectedItems = osItems
-      .map((item) => {
-        const draft = osReturnDraft[item.id];
-        const alreadyReturned = Number((currentOs as any).returnedOsItems?.[item.id] || 0);
-        const maxQty = Math.max(0, Number(item.quantity || 0) - alreadyReturned);
-        const qty = Math.min(maxQty, Math.max(0, Number(draft?.quantity || 0)));
-        if (!draft || qty <= 0) return null;
-
-        const unitPrice = Number(item.unitPrice || 0);
-        return {
-          osItemId: item.id,
-          name: item.description,
-          sku: '',
-          quantity: qty,
-          unitPrice,
-          refund: draft.refund,
-          refundValue: draft.refund ? qty * unitPrice : 0,
-          destination: draft.destination,
-          itemType: item.type,
-        };
-      })
-      .filter(Boolean) as any[];
-
-    if (selectedItems.length === 0) {
-      toast.error('Selecione ao menos um item da O.S para devolver/estornar.');
-      return;
-    }
-
-    const refundTotal = selectedItems.reduce((acc, item) => acc + Number(item.refundValue || 0), 0);
-    const now = new Date();
-    const financialEntryId = refundTotal > 0 ? safeRandomUUID() : null;
-    const returnTicketId = `DEV-OS-${format(now, 'yyyyMMdd')}-${safeRandomUUID().slice(0, 6)}`;
-
-    setAllProducts((prev) =>
-      prev.map((product) => {
-        const normalizedProductName = normalizeValue(String(product.name || ''));
-        const matches = selectedItems.filter((item) => {
-          if (item.itemType !== 'Produto') return false;
-          const normalizedItemName = normalizeValue(String(item.name || ''));
-          return (
-            normalizedItemName === normalizedProductName ||
-            normalizedItemName.includes(normalizedProductName) ||
-            normalizedProductName.includes(normalizedItemName)
-          );
-        });
-        if (matches.length === 0) return product;
-
-        const revendaQty = matches.filter((item) => item.destination === 'revenda').reduce((acc, item) => acc + Number(item.quantity || 0), 0);
-        const avariaQty = matches.filter((item) => item.destination === 'avaria').reduce((acc, item) => acc + Number(item.quantity || 0), 0);
-
-        return {
-          ...product,
-          stock: Number(product.stock || 0) + revendaQty,
-          stockDefective: Number(product.stockDefective || 0) + avariaQty,
-        };
-      })
-    );
-
-    const avariaItems = selectedItems.filter((item) => item.itemType === 'Produto' && item.destination === 'avaria');
-    if (avariaItems.length > 0) {
-      setRmaHistory((prev) => [
-        ...avariaItems.map((item) => ({
-          id: safeRandomUUID(),
-          product: item.name,
-          sku: item.sku,
-          reason: osReturnReason || 'Devolução de O.S com avaria',
-          supplier: 'A definir',
-          status: 'Avaria',
-          date: format(now, 'dd/MM/yyyy'),
-          linkedOsId: currentOs.id,
-        })),
-        ...prev,
-      ]);
-    }
-
-    if (refundTotal > 0 && financialEntryId) {
-      setFinanceTransactions((prev) => [
-        {
-          id: financialEntryId,
-          desc: `Estorno de O.S ${currentOs.number}`,
-          val: -refundTotal,
-          type: 'OUT',
-          date: format(now, 'dd/MM/yyyy'),
-          status: 'Pago',
-          category: 'Saída por Devolução',
-          costCenter: 'Assistência Técnica',
-          linkedOsId: currentOs.id,
-          linkedSaleDate: currentOs.createdAt,
-          observation: `Referente à O.S ${currentOs.number} (${currentOs.customerName})`,
-        },
-        ...prev,
-      ]);
-    }
-
-    setReturnTickets((prev) => [
-      {
-        id: returnTicketId,
-        sourceType: 'OS',
-        saleId: null,
-        osId: currentOs.id,
-        osNumber: currentOs.number,
-        saleDate: currentOs.createdAt,
-        customer: currentOs.customerName,
-        createdAt: now.toISOString(),
-        items: selectedItems,
-        refundTotal,
-        financialEntryId,
-        financialCategory: 'Devoluções/Estornos',
-        costCenter: 'Assistência Técnica',
-        fiscalEntryNoteStatus: company.fiscalEnabled && selectedItems.some((item) => item.itemType === 'Produto') ? 'Pendente' : 'Não se aplica',
-        reason: osReturnReason || 'Sem observações adicionais',
-      },
-      ...prev,
-    ]);
-
-    setAllOrders((prev) =>
-      prev.map((current) => {
-        if (current.id !== currentOs.id) return current;
-
-        const returnedOsItems = { ...((current as any).returnedOsItems || {}) };
-        selectedItems.forEach((item) => {
-          returnedOsItems[item.osItemId] = Number(returnedOsItems[item.osItemId] || 0) + Number(item.quantity || 0);
-        });
-
-        const totalQty = (current.items || []).reduce((acc, item) => acc + Number(item.quantity || 0), 0);
-        const returnedQty = (current.items || []).reduce((acc, item) => acc + Math.min(Number(item.quantity || 0), Number(returnedOsItems[item.id] || 0)), 0);
-
-        return {
-          ...current,
-          returnedOsItems,
-          refundTotal: Number((current as any).refundTotal || 0) + refundTotal,
-          returnTicketIds: [...(((current as any).returnTicketIds || []) as string[]), returnTicketId],
-          returnStatus: returnedQty >= totalQty ? 'Devolvida' : 'Devolução Parcial',
-          updatedAt: now.toISOString(),
-        } as any;
-      })
-    );
-
-    toast.success('Devolução da O.S processada com ticket e estorno financeiro vinculados.');
-    setShowOsReturnDialog(false);
-  };
-
-  const openPrintView = (action: 'print' | 'pdf') => {
-    setPrintAction(action);
-    setIsPrintViewOpen(true);
-  };
-
   const handlePrint = () => {
-    setIsPrintOptionsOpen(true);
-  };
-
-  const handlePDF = () => {
-    openPrintView('pdf');
-  };
-
-  const entryLabelTemplate = useMemo(() => {
-    const labelTemplates = printTemplates.filter((template) => template.type === 'Etiqueta');
-    return (
-      labelTemplates.find((template) => template.isDefault) ||
-      labelTemplates.find((template) => /entrada|o\.?s|ordem/i.test(template.name || '')) ||
-      labelTemplates[0] ||
-      null
-    );
-  }, [printTemplates]);
-
-  const receiptTemplate = useMemo(() => {
-    const cupomTemplates = printTemplates.filter((template) => template.type === 'Cupom');
-    return cupomTemplates.find((template) => template.isDefault) || cupomTemplates[0] || null;
-  }, [printTemplates]);
-
-  const openTemplatePrintPreview = (template: PrintTemplate | null, missingMessage: string) => {
-    if (!template) {
-      toast.error(missingMessage);
+    const target = osPrintAreaRef.current;
+    if (!target) {
+      toast.error('Nao foi possivel localizar o layout de impressao.');
       return;
     }
 
-    setSelectedTemplateForPrint(template);
-    setIsPrintOptionsOpen(false);
+    const styles = Array.from(document.querySelectorAll('style, link[rel="stylesheet"]'))
+      .map((node) => node.outerHTML)
+      .join('\n');
+
+    const printHtml = `
+      <!doctype html>
+      <html>
+        <head>
+          <title>${os.number}</title>
+          ${styles}
+          <style>
+            @page { size: A4; margin: 0; }
+            html, body {
+              width: 210mm;
+              height: 297mm;
+              margin: 0;
+              padding: 0;
+              background: #ffffff;
+            }
+            body {
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+              display: flex;
+              justify-content: center;
+              align-items: flex-start;
+            }
+            #os-print-area {
+              width: 210mm !important;
+              height: 297mm !important;
+              margin: 0 !important;
+              padding: 0 !important;
+              box-sizing: border-box !important;
+              background: #ffffff !important;
+              color: #000000 !important;
+              overflow: hidden !important;
+            }
+            .os-print-page-inner {
+              width: 198mm !important;
+              min-height: 285mm !important;
+              margin: 6mm auto !important;
+              box-sizing: border-box !important;
+            }
+          </style>
+        </head>
+        <body>${target.outerHTML}</body>
+      </html>
+    `;
+
+    const started = printHtmlUsingHiddenFrame(printHtml);
+    if (!started) {
+      toast.error('Nao foi possivel iniciar a impressao nativa do navegador.');
+    }
   };
+
+  const resolveTemplateByType = (templates: PrintTemplate[], type: PrintTemplate['type']) => {
+    const filtered = templates.filter((template) => template.type === type);
+    return filtered.find((template) => template.isDefault) || filtered[0] || null;
+  };
+
+  const loadTemplatesFromBackend = async () => {
+    try {
+      const response = await axios.get('/api/app-state', { params: { keys: 'printTemplates' } });
+      const payload = response?.data;
+      return Array.isArray(payload?.printTemplates) ? payload.printTemplates as PrintTemplate[] : [];
+    } catch (error) {
+      console.error('Erro ao carregar templates do backend:', error);
+      return [];
+    }
+  };
+
+  const handleEntryLabelPrint = async () => {
+    const backendTemplates = await loadTemplatesFromBackend();
+    const templatesSource = backendTemplates.length ? backendTemplates : printTemplates;
+    const template = resolveTemplateByType(templatesSource, 'Etiqueta');
+    if (!template) {
+      toast.error('Nenhum layout de etiqueta salvo em Personalizar Impressao.');
+      return;
+    }
+    setTemplateToPrint(template);
+  };
+
+  const handleCupomPrint = async () => {
+    const backendTemplates = await loadTemplatesFromBackend();
+    const templatesSource = backendTemplates.length ? backendTemplates : printTemplates;
+    const template = resolveTemplateByType(templatesSource, 'Cupom');
+    if (!template) {
+      toast.error('Nenhum layout de cupom salvo em Personalizar Impressao.');
+      return;
+    }
+    setTemplateToPrint(template);
+  };
+
+  const handlePDF = async () => {
+    const target = osPrintAreaRef.current;
+    if (!target) {
+      toast.error('Nao foi possivel localizar o layout de impressao.');
+      return;
+    }
+
+    try {
+      setIsGeneratingPdf(true);
+
+      // Use html2canvas cloning step to strip unsupported oklch colors
+      const pdfCloneId = `pdf-clone-${os.id}`;
+      target.setAttribute('data-pdf-clone-id', pdfCloneId);
+
+      const canvas = await html2canvas(target, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        allowTaint: true,
+        onclone: (clonedDoc) => {
+          const clonedTarget = clonedDoc.querySelector(`[data-pdf-clone-id="${pdfCloneId}"]`) as HTMLElement | null;
+          if (!clonedTarget) {
+            return;
+          }
+
+          // Drop stylesheets that use oklch and inline computed styles instead.
+          clonedDoc.querySelectorAll('style, link[rel="stylesheet"]').forEach((node) => node.remove());
+
+          const originalElements = [target, ...Array.from(target.querySelectorAll('*'))];
+          const clonedElements = [clonedTarget, ...Array.from(clonedTarget.querySelectorAll('*'))];
+          const safeFallbacks: Record<string, string> = {
+            color: '#000000',
+            backgroundColor: '#ffffff',
+            borderColor: '#e5e7eb',
+            fill: '#000000',
+            stroke: '#000000',
+          };
+
+          originalElements.forEach((originalEl, index) => {
+            const clonedEl = clonedElements[index] as HTMLElement | undefined;
+            if (!clonedEl) {
+              return;
+            }
+
+            const computed = window.getComputedStyle(originalEl as Element);
+            for (let i = 0; i < computed.length; i += 1) {
+              const prop = computed[i];
+              let val = computed.getPropertyValue(prop);
+              const priority = computed.getPropertyPriority(prop);
+
+              if (val && val.includes('oklch')) {
+                const fallback = safeFallbacks[prop];
+                if (fallback) {
+                  val = fallback;
+                } else {
+                  continue;
+                }
+              }
+
+              if (val) {
+                clonedEl.style.setProperty(prop, val, priority);
+              }
+            }
+          });
+        },
+      });
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const imgHeight = (canvas.height * pageWidth) / canvas.width;
+      const totalPages = Math.max(1, Math.ceil((imgHeight - 1) / pageHeight));
+
+      pdf.addImage(imgData, 'PNG', 0, 0, pageWidth, imgHeight);
+
+      for (let page = 1; page < totalPages; page += 1) {
+        const position = -pageHeight * page;
+        pdf.addPage();
+        pdf.addImage(imgData, 'PNG', 0, position, pageWidth, imgHeight);
+      }
+
+      pdf.save(`os-${os.number}.pdf`);
+      toast.success('PDF baixado com sucesso!');
+    } catch (error) {
+      console.error('Erro ao gerar PDF:', error);
+      toast.error('Falha ao gerar o PDF.');
+    } finally {
+      target.removeAttribute('data-pdf-clone-id');
+      setIsGeneratingPdf(false);
+    }
+  };
+
+
 
   const handleEdit = () => {
     setIsUpdating(true);
@@ -3581,6 +3970,27 @@ function ServiceOrderDetailsView({
     setAllOrders(prev => prev.map(o => o.id === osId ? { ...o, status: 'Finalizada' as OSStatus, updatedAt: new Date().toISOString() } : o));
     setStatus('Finalizada');
     toast.success('Conferência realizada! OS Finalizada com sucesso.');
+  };
+
+  const handleConfirmCancel = () => {
+    if (!cancelReason.trim()) {
+      toast.error('Informe o motivo do cancelamento.');
+      return;
+    }
+    const now = new Date().toISOString();
+    setAllOrders(prev => prev.map(o => o.id === osId ? {
+      ...o,
+      status: 'Cancelada' as OSStatus,
+      subStatus: '',
+      cancellationReason: cancelReason.trim(),
+      cancellationDate: now,
+      updatedAt: now,
+    } : o));
+    setStatus('Cancelada');
+    setShowCancelDialog(false);
+    setCancelReason('');
+    setIsUpdating(false);
+    toast.success('OS cancelada com sucesso.');
   };
 
   if (!os) {
@@ -3676,7 +4086,13 @@ function ServiceOrderDetailsView({
             <Settings className="w-4 h-4" /> Atualizar OS
           </Button>
           <Button variant="outline" size="sm" className="gap-2" onClick={handlePrint}>
-            <Printer className="w-4 h-4" /> Imprimir
+            <Printer className="w-4 h-4" /> Imprimir A4
+          </Button>
+          <Button variant="outline" size="sm" className="gap-2" onClick={handleEntryLabelPrint}>
+            <Tag className="w-4 h-4" /> Imprimir Etiqueta Entrada
+          </Button>
+          <Button variant="outline" size="sm" className="gap-2" onClick={handleCupomPrint}>
+            <Receipt className="w-4 h-4" /> Cupom Nao Fiscal (Status Atual)
           </Button>
           <Button variant="outline" size="sm" className="gap-2" onClick={handlePDF}>
             <FileText className="w-4 h-4" /> PDF
@@ -3771,12 +4187,12 @@ function ServiceOrderDetailsView({
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                         <div className="space-y-2">
                           <Label>Alterar Status Atual</Label>
-                          <Select value={status} onValueChange={setStatus}>
+                          <Select value={status} onValueChange={(value) => setStatus(value || '')}>
                             <SelectTrigger>
                               <SelectValue placeholder="Selecione o novo status" />
                             </SelectTrigger>
                             <SelectContent>
-                              {STATUS_COLUMNS.map(statusOption => (
+                              {orderedStatusColumns.map(statusOption => (
                                 <SelectItem key={statusOption} value={statusOption}>{statusOption}</SelectItem>
                               ))}
                             </SelectContent>
@@ -3837,12 +4253,7 @@ function ServiceOrderDetailsView({
                                 setSelectedWaitingPartOptionId(value);
                                 const selected = waitingPartOptions.find((item) => item.id === value);
                                 if (!selected) return;
-                                let nextDate = addDays(new Date(), Math.max(0, Number(selected.deadlineDays || 0)));
-                                let guard = 0;
-                                while (company.businessHoursHolidayClosed !== false && holidayDateSet.has(toIsoDate(nextDate)) && guard < 30) {
-                                  nextDate = addDays(nextDate, 1);
-                                  guard += 1;
-                                }
+                                const nextDate = addDays(new Date(), Math.max(0, Number(selected.deadlineDays || 0)));
                                 setCompletionDate(format(nextDate, 'yyyy-MM-dd'));
                               }}
                             >
@@ -3872,10 +4283,15 @@ function ServiceOrderDetailsView({
                         />
                       </div>
                       <Button onClick={() => {
-                        if (isWaitingPartsStatus && waitingPartOptions.length > 0 && !selectedWaitingPartOptionId) {
-                          toast.error('Selecione a instituição/tipo de compra para aplicar o prazo.');
+                        if (status === 'Cancelada') {
+                          setShowCancelDialog(true);
                           return;
                         }
+                        if (isWaitingPartsStatus && waitingPartOptions.length > 0 && !selectedWaitingPartOptionId) {
+                          toast.error('Selecione a instituição/tipo de compra para aplicar o prazo de aguardando peça.');
+                          return;
+                        }
+                        const now = new Date().toISOString();
                         const selectedWaiting = waitingPartOptions.find((item) => item.id === selectedWaitingPartOptionId);
                         const resolvedSubStatus = isWaitingPartsStatus && selectedWaiting
                           ? `${selectedWaiting.institutionName}${selectedWaiting.purchaseType ? ` - ${selectedWaiting.purchaseType}` : ''}`
@@ -3888,7 +4304,9 @@ function ServiceOrderDetailsView({
                           status: status as OSStatus,
                           subStatus: resolvedSubStatus,
                           completionDeadline: resolvedCompletionDeadline ?? o.completionDeadline,
-                          updatedAt: new Date().toISOString()
+                          cancellationReason: undefined,
+                          cancellationDate: undefined,
+                          updatedAt: now,
                         } : o));
                         toast.success('Status e Sub-status atualizados com sucesso!');
                         setIsUpdating(false);
@@ -4111,27 +4529,20 @@ function ServiceOrderDetailsView({
               <CardTitle className="text-lg font-bold">Resumo Financeiro</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid grid-cols-2 gap-2 text-[10px]">
-                <div className="rounded-md bg-white/10 px-2 py-1.5">Serviços: <strong>{osServiceItems.length}</strong></div>
-                <div className="rounded-md bg-white/10 px-2 py-1.5">Produtos: <strong>{osProductItems.length}</strong></div>
-              </div>
               <div className="flex items-center justify-between text-sm">
-                <span>Mão de Obra / Serviços</span>
-                <span className="font-bold">R$ {osServiceTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+                <span>Mão de Obra</span>
+                <span className="font-bold">R$ {os.value.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
               </div>
               <div className="flex items-center justify-between text-sm">
                 <span>Peças</span>
-                <span className="font-bold">R$ {osProductTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+                <span className="font-bold">R$ 0,00</span>
               </div>
               <div className="pt-2 border-t border-primary-foreground/20 flex items-center justify-between">
                 <span className="text-base font-bold">Total</span>
-                <span className="text-xl font-black">R$ {osGrandTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+                <span className="text-xl font-black">R$ {os.value.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
               </div>
               <Button variant="secondary" className="w-full gap-2 font-bold" onClick={() => setShowPaymentDialog(true)} disabled={os.status === 'Entregue' || os.status === 'Finalizada'}>
                 <CreditCard className="w-4 h-4" /> Registrar Pagamento
-              </Button>
-              <Button variant="outline" className="w-full gap-2 font-bold border-white/40 text-white hover:bg-white/10" onClick={openOsReturnDialog}>
-                <RefreshCw className="w-4 h-4" /> Troca / Devolução da O.S
               </Button>
             </CardContent>
           </Card>
@@ -4174,172 +4585,35 @@ function ServiceOrderDetailsView({
             </DialogContent>
           </Dialog>
 
-          <Dialog open={showOsReturnDialog} onOpenChange={setShowOsReturnDialog}>
-            <DialogContent className="max-w-3xl">
+          <Dialog open={showCancelDialog} onOpenChange={(open) => {
+            setShowCancelDialog(open);
+            if (!open) {
+              setCancelReason('');
+              if (os.status !== 'Cancelada' && status === 'Cancelada') {
+                setStatus(os.status);
+              }
+            }
+          }}>
+            <DialogContent className="max-w-md">
               <DialogHeader>
-                <DialogTitle>Troca e Devolução da O.S {os.number}</DialogTitle>
-                <DialogDescription>
-                  Selecione itens da ordem de serviço para estorno parcial/total, com separação de Produtos e Serviços.
-                </DialogDescription>
+                <DialogTitle>Cancelar Ordem de Serviço</DialogTitle>
+                <DialogDescription>Informe o motivo do cancelamento para análise no dashboard.</DialogDescription>
               </DialogHeader>
-
-              <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
-                {osItems.length === 0 && (
-                  <div className="rounded-md border p-4 text-sm text-muted-foreground">
-                    Esta O.S não possui itens detalhados. Cadastre os itens para permitir devolução item a item.
-                  </div>
-                )}
-
-                {osItems.map((item) => {
-                  const returnedQty = Number((os as any).returnedOsItems?.[item.id] || 0);
-                  const availableQty = Math.max(0, Number(item.quantity || 0) - returnedQty);
-                  const draft = osReturnDraft[item.id] || { quantity: 0, refund: true, destination: item.type === 'Produto' ? 'avaria' : 'revenda' };
-
-                  return (
-                    <div key={item.id} className="rounded-lg border p-3 space-y-3">
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <p className="font-semibold">{item.description}</p>
-                          <p className="text-[11px] text-muted-foreground">Tipo: {item.type} | Unit: R$ {Number(item.unitPrice || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
-                        </div>
-                        <Badge variant={availableQty > 0 ? 'default' : 'secondary'}>
-                          Disponível para devolução: {availableQty}
-                        </Badge>
-                      </div>
-
-                      <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                        <div className="space-y-1">
-                          <Label className="text-xs">Qtd devolver</Label>
-                          <Input
-                            type="number"
-                            min={0}
-                            max={availableQty}
-                            disabled={availableQty <= 0}
-                            value={draft.quantity}
-                            onChange={(e) => {
-                              const nextValue = Math.min(availableQty, Math.max(0, Number(e.target.value || 0)));
-                              setOsReturnDraft((prev) => ({
-                                ...prev,
-                                [item.id]: { ...(prev[item.id] || draft), quantity: nextValue },
-                              }));
-                            }}
-                          />
-                        </div>
-
-                        {item.type === 'Produto' ? (
-                          <div className="space-y-1">
-                            <Label className="text-xs">Destino estoque</Label>
-                            <select
-                              aria-label={`Destino de estoque para ${item.description}`}
-                              title={`Destino de estoque para ${item.description}`}
-                              className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-                              value={draft.destination}
-                              onChange={(e) => {
-                                const destination = (e.target.value as 'revenda' | 'avaria');
-                                setOsReturnDraft((prev) => ({
-                                  ...prev,
-                                  [item.id]: { ...(prev[item.id] || draft), destination },
-                                }));
-                              }}
-                            >
-                              <option value="revenda">Retorna para revenda</option>
-                              <option value="avaria">Avaria / troca fornecedor</option>
-                            </select>
-                          </div>
-                        ) : (
-                          <div className="space-y-1">
-                            <Label className="text-xs">Destino</Label>
-                            <div className="h-10 rounded-md border px-3 text-sm flex items-center text-muted-foreground">
-                              Serviço (sem estoque)
-                            </div>
-                          </div>
-                        )}
-
-                        <div className="space-y-1 md:col-span-2">
-                          <Label className="text-xs">Estorno financeiro</Label>
-                          <label className="h-10 rounded-md border px-3 flex items-center justify-between text-xs">
-                            <span>Estornar item no financeiro</span>
-                            <input
-                              type="checkbox"
-                              checked={!!draft.refund}
-                              onChange={(e) => {
-                                setOsReturnDraft((prev) => ({
-                                  ...prev,
-                                  [item.id]: { ...(prev[item.id] || draft), refund: e.target.checked },
-                                }));
-                              }}
-                            />
-                          </label>
-                          <p className="text-[10px] text-muted-foreground">
-                            Potencial estorno: R$ {(Number(draft.quantity || 0) * Number(item.unitPrice || 0)).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-
-                <div className="space-y-2">
-                  <Label>Motivo / Observações</Label>
-                  <Input
-                    value={osReturnReason}
-                    onChange={(e) => setOsReturnReason(e.target.value)}
-                    placeholder="Ex: Devolução parcial por falha na peça, serviço mantido."
-                  />
-                </div>
+              <div className="space-y-2 py-2">
+                <Label>Motivo do Cancelamento</Label>
+                <textarea
+                  className="flex min-h-[90px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="Descreva o motivo do cancelamento..."
+                  value={cancelReason}
+                  onChange={(e) => setCancelReason(e.target.value)}
+                />
               </div>
-
               <DialogFooter>
-                <Button variant="outline" onClick={() => setShowOsReturnDialog(false)}>Cancelar</Button>
-                <Button className="bg-rose-600 hover:bg-rose-700" onClick={processOsItemizedReturn}>
-                  Processar Estorno da O.S
-                </Button>
+                <Button variant="ghost" onClick={() => setShowCancelDialog(false)}>Voltar</Button>
+                <Button variant="destructive" onClick={handleConfirmCancel}>Confirmar Cancelamento</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
-
-          <Card className="border-none shadow-sm">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-bold">Histórico de Estornos da O.S</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="rounded-md bg-secondary/20 p-2 text-xs">
-                <div className="flex items-center justify-between">
-                  <span>Total estornado</span>
-                  <strong>R$ {osRefundedTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</strong>
-                </div>
-                <div className="mt-1 flex items-center justify-between text-muted-foreground">
-                  <span>Status de devolução</span>
-                  <span>{(os as any).returnStatus || 'Sem devolução'}</span>
-                </div>
-              </div>
-
-              {osReturnHistory.length > 0 ? (
-                <div className="space-y-2">
-                  {osReturnHistory.slice(0, 5).map((ticket) => {
-                    const hasProducts = (ticket.items || []).some((item: any) => item.itemType === 'Produto');
-                    const hasServices = (ticket.items || []).some((item: any) => item.itemType === 'Serviço');
-                    const scopeLabel = hasProducts && hasServices ? 'Produtos + Serviços' : hasServices ? 'Serviços' : 'Produtos';
-
-                    return (
-                      <div key={ticket.id} className="rounded-md border p-2 text-xs">
-                        <div className="flex items-center justify-between">
-                          <span className="font-semibold">{ticket.id}</span>
-                          <span className="font-bold text-rose-600">R$ {Number(ticket.refundTotal || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
-                        </div>
-                        <div className="mt-1 flex items-center justify-between text-muted-foreground">
-                          <span>{scopeLabel}</span>
-                          <span>{ticket.createdAt ? format(new Date(ticket.createdAt), 'dd/MM/yyyy') : '-'}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <p className="text-xs italic text-muted-foreground">Nenhum estorno registrado para esta O.S.</p>
-              )}
-            </CardContent>
-          </Card>
 
           {/* Ações Rápidas */}
           <Card className="border-none shadow-sm">
@@ -4358,111 +4632,20 @@ function ServiceOrderDetailsView({
         </div>
       </div>
 
-      <Dialog open={isPrintOptionsOpen} onOpenChange={setIsPrintOptionsOpen}>
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Visualizador de Impressão</DialogTitle>
-            <DialogDescription>
-              Escolha uma opção para visualizar antes de imprimir a O.S. {os.number}.
-            </DialogDescription>
-          </DialogHeader>
+      <div className="hidden">
+        <OSPrintContentForRef ref={osPrintAreaRef} os={os} company={company} customer={customerRecord} />
+      </div>
 
-          <div className="grid gap-3 py-2">
-            <button
-              type="button"
-              className="flex items-center justify-between rounded-xl border bg-card p-4 text-left transition-colors hover:bg-secondary/30"
-              onClick={() => {
-                setIsPrintOptionsOpen(false);
-                openPrintView('print');
-              }}
-            >
-              <div className="flex items-center gap-3">
-                <div className="rounded-lg bg-primary/10 p-2 text-primary">
-                  <FileText className="w-5 h-5" />
-                </div>
-                <div>
-                  <p className="text-sm font-black uppercase">Padrão A4</p>
-                  <p className="text-xs text-muted-foreground">
-                    {company.a4PrinterName ? `Impressora: ${company.a4PrinterName}` : 'Visualização A4 padrão do sistema'}
-                  </p>
-                </div>
-              </div>
-              <ChevronRight className="w-4 h-4 text-muted-foreground" />
-            </button>
-
-            <button
-              type="button"
-              className={cn(
-                "flex items-center justify-between rounded-xl border bg-card p-4 text-left transition-colors",
-                entryLabelTemplate ? "hover:bg-secondary/30" : "cursor-not-allowed opacity-55"
-              )}
-              disabled={!entryLabelTemplate}
-              onClick={() => openTemplatePrintPreview(entryLabelTemplate, 'Nenhum layout de etiqueta salvo em Personalizar Impressão.')}
-            >
-              <div className="flex items-center gap-3">
-                <div className="rounded-lg bg-blue-500/10 p-2 text-blue-600">
-                  <Tags className="w-5 h-5" />
-                </div>
-                <div>
-                  <p className="text-sm font-black uppercase">Reimprimir Etiqueta de Entrada</p>
-                  <p className="text-xs text-muted-foreground">
-                    {entryLabelTemplate ? entryLabelTemplate.name : 'Nenhuma etiqueta salva'}
-                  </p>
-                </div>
-              </div>
-              <ChevronRight className="w-4 h-4 text-muted-foreground" />
-            </button>
-
-            <button
-              type="button"
-              className={cn(
-                "flex items-center justify-between rounded-xl border bg-card p-4 text-left transition-colors",
-                receiptTemplate ? "hover:bg-secondary/30" : "cursor-not-allowed opacity-55"
-              )}
-              disabled={!receiptTemplate}
-              onClick={() => openTemplatePrintPreview(receiptTemplate, 'Nenhum layout de cupom salvo em Personalizar Impressão.')}
-            >
-              <div className="flex items-center gap-3">
-                <div className="rounded-lg bg-emerald-500/10 p-2 text-emerald-600">
-                  <Receipt className="w-5 h-5" />
-                </div>
-                <div>
-                  <p className="text-sm font-black uppercase">Cupom Não Fiscal</p>
-                  <p className="text-xs text-muted-foreground">
-                    {receiptTemplate ? receiptTemplate.name : 'Nenhum cupom salvo'}
-                  </p>
-                </div>
-              </div>
-              <ChevronRight className="w-4 h-4 text-muted-foreground" />
-            </button>
-          </div>
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setIsPrintOptionsOpen(false)}>Fechar</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {isPrintViewOpen && (
-        <OSPrintView
-          os={os}
-          onClose={() => {
-            setIsPrintViewOpen(false);
-            setPrintAction(null);
-          }}
-          company={company}
-          autoAction={printAction}
-        />
-      )}
-
-      {selectedTemplateForPrint && (
+      {templateToPrint && (
         <DynamicPrintView
-          template={selectedTemplateForPrint}
+          template={templateToPrint}
           data={os}
           company={company}
-          onClose={() => setSelectedTemplateForPrint(null)}
+          onClose={() => setTemplateToPrint(null)}
         />
       )}
+
+
     </div>
   );
 }
@@ -4494,7 +4677,7 @@ function TechnicianDashboardView({
     o.status === 'Aberta'
   );
 
-  const openOrders = myOrders.filter(o => o.status !== 'Finalizada' && o.status !== 'Cancelada' && o.status !== 'Entregue');
+  const openOrders = myOrders.filter(o => o.status !== 'Finalizada' && o.status !== 'Cancelada' && o.status !== 'Entregue' && o.status !== 'Reprovado');
   const monthDone = myOrders.filter(o => o.status === 'Finalizada' || o.status === 'Entregue').length;
   const waitingParts = myOrders.filter(o => o.status === 'Aguardando peça').length;
   const urgentOrders = myOrders.filter(o => o.priority === 'Urgente').length;
@@ -4949,6 +5132,41 @@ function DashboardView({
     .sort((a, b) => a.sortValue - b.sortValue)
     .slice(0, 5);
 
+  const canceledOrders = allOrders.filter((order) => order.status === 'Cancelada');
+  const rejectedOrders = allOrders.filter((order) => order.status === 'Reprovado');
+  const canceledThisMonth = canceledOrders.filter((order) => {
+    const parsed = parseRecordDate(order.cancellationDate || order.updatedAt || order.createdAt);
+    if (!parsed) return false;
+    const now = new Date();
+    return parsed.getMonth() === now.getMonth() && parsed.getFullYear() === now.getFullYear();
+  }).length;
+  const rejectedThisMonth = rejectedOrders.filter((order) => {
+    const parsed = parseRecordDate(order.rejectionDate || order.updatedAt || order.createdAt);
+    if (!parsed) return false;
+    const now = new Date();
+    return parsed.getMonth() === now.getMonth() && parsed.getFullYear() === now.getFullYear();
+  }).length;
+
+  const cancelReasonSummary = Object.entries(
+    canceledOrders.reduce((acc, order) => {
+      const reason = (order.cancellationReason || 'Sem motivo informado').trim();
+      acc[reason] = (acc[reason] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>)
+  )
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
+  const rejectionReasonSummary = Object.entries(
+    rejectedOrders.reduce((acc, order) => {
+      const reason = (order.rejectionReason || 'Sem motivo informado').trim();
+      acc[reason] = (acc[reason] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>)
+  )
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
   useEffect(() => {
     if (reminders.length > 0 && !hasPlayedAlert) {
       const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
@@ -5054,6 +5272,50 @@ function DashboardView({
         <StatCard title="Entregue p/ Conferência" value={allOrders.filter(o => o.status === 'Entregue').length.toString()} icon={ShieldCheck} color="bg-amber-500" description="OS entregues que aguardam conferência administrativa." />
         <StatCard title="Vendas Hoje" value={todaySalesCount.toString()} icon={ShoppingCart} trend={todaySalesCount > 0 ? todaySalesCount : 0} color="bg-indigo-500" description="Quantidade de vendas registradas hoje no banco de dados." />
         <StatCard title="Estoque Baixo" value={lowStockCount.toString()} icon={Package} color="bg-rose-500" description="Produtos com quantidade abaixo do limite mínimo." />
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <Card className="border-none shadow-sm">
+          <CardHeader>
+            <CardTitle>Motivos de Cancelamento</CardTitle>
+            <CardDescription>{canceledOrders.length} canceladas no total • {canceledThisMonth} neste mês</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {cancelReasonSummary.length > 0 ? (
+              <div className="space-y-2">
+                {cancelReasonSummary.map(([reason, count]) => (
+                  <div key={reason} className="flex items-center justify-between text-sm">
+                    <span className="truncate">{reason}</span>
+                    <Badge variant="outline" className="text-[10px]">{count}</Badge>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">Nenhuma OS cancelada registrada.</p>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="border-none shadow-sm">
+          <CardHeader>
+            <CardTitle>Motivos de Reprovação de Orçamento</CardTitle>
+            <CardDescription>{rejectedOrders.length} reprovados no total • {rejectedThisMonth} neste mês</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {rejectionReasonSummary.length > 0 ? (
+              <div className="space-y-2">
+                {rejectionReasonSummary.map(([reason, count]) => (
+                  <div key={reason} className="flex items-center justify-between text-sm">
+                    <span className="truncate">{reason}</span>
+                    <Badge variant="outline" className="text-[10px] bg-red-50 text-red-600">{count}</Badge>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">Nenhum orçamento reprovado registrado.</p>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       <div className="grid gap-4 lg:grid-cols-7">
@@ -5299,6 +5561,24 @@ function OSPrintView({
   const printPreviewAreaRef = useRef<HTMLDivElement | null>(null);
   const [printPreviewScale, setPrintPreviewScale] = useState(1);
   const [printPreviewAreaSize, setPrintPreviewAreaSize] = useState({ width: 0, height: 0 });
+  const orderTotalValue = getOrderTotalValue(os);
+  const pixPayload = buildPixPayload({
+    key: company.pixKey || '',
+    keyType: company.pixKeyType,
+    amount: orderTotalValue,
+    merchantName: company.name || company.razaoSocial || 'TechManager',
+    merchantCity: company.address || 'Sao Paulo',
+    txid: os.number.replace(/[^A-Za-z0-9]/g, '').slice(0, 25) || '***',
+  });
+  const pixQrCodeCandidates = useMemo(
+    () => (pixPayload ? buildQrCodeCandidates(pixPayload, 180) : []),
+    [pixPayload]
+  );
+  const [pixQrCandidateIndex, setPixQrCandidateIndex] = useState(0);
+
+  useEffect(() => {
+    setPixQrCandidateIndex(0);
+  }, [pixPayload]);
 
   const handlePrint = () => {
     const target = document.getElementById('os-print-area');
@@ -5321,7 +5601,7 @@ function OSPrintView({
             @page { size: A4; margin: 0; }
             html, body {
               width: 210mm;
-              min-height: 297mm;
+              height: 297mm;
               margin: 0;
               padding: 0;
               background: #ffffff;
@@ -5329,16 +5609,25 @@ function OSPrintView({
             body {
               -webkit-print-color-adjust: exact;
               print-color-adjust: exact;
+              display: flex;
+              justify-content: center;
+              align-items: flex-start;
             }
             #os-print-area {
               width: 210mm !important;
-              min-height: 297mm !important;
-              margin: 0 auto !important;
-              padding: 12mm !important;
+              height: 297mm !important;
+              margin: 0 !important;
+              padding: 0 !important;
               box-sizing: border-box !important;
               background: #ffffff !important;
               color: #000000 !important;
-              overflow: visible !important;
+              overflow: hidden !important;
+            }
+            .os-print-page-inner {
+              width: 198mm !important;
+              min-height: 285mm !important;
+              margin: 6mm auto !important;
+              box-sizing: border-box !important;
             }
           </style>
         </head>
@@ -5442,11 +5731,14 @@ function OSPrintView({
   }, [company.osCopiesPerPage, os.id, os.items?.length, os.diagnosis, os.defect]);
 
   const OSContent = () => (
-    <div className="bg-white text-black font-sans">
+    <div
+      className="bg-white text-black font-sans flex flex-col os-print-page-inner"
+      style={{ width: `${OS_PRINT_INNER_WIDTH_MM}mm`, minHeight: `${OS_PRINT_INNER_HEIGHT_MM}mm`, margin: '6mm auto' }}
+    >
       {/* Header */}
-      <div className="flex flex-row justify-between items-start gap-4 border-b-2 border-black pb-6 mb-6">
+      <div className="flex flex-row justify-between items-start gap-3 border-b-2 border-black pb-3 mb-3">
         <div className="flex gap-4 items-center">
-          <div className="w-16 h-16 bg-black text-white rounded-lg flex items-center justify-center text-xl font-bold shrink-0 overflow-hidden">
+          <div className="w-16 h-16 bg-black text-white flex items-center justify-center text-xl font-bold shrink-0 overflow-hidden">
             {company.logo ? (
               <img src={company.logo} alt={company.name || 'Logo'} className="w-full h-full object-contain bg-white" />
             ) : (
@@ -5457,10 +5749,11 @@ function OSPrintView({
             <h1 className="text-2xl font-black uppercase tracking-tight">{company.name}</h1>
             <p className="text-xs uppercase font-bold text-gray-600">{company.address}</p>
             <p className="text-xs font-bold text-gray-600">{company.cnpj} • {company.phone}</p>
+            <p className="text-[10px] font-bold text-gray-600">{company.email || '--'}</p>
           </div>
         </div>
         <div className="text-right shrink-0 w-auto">
-          <div className="bg-black text-white px-4 py-2 rounded-md mb-2 block w-auto">
+          <div className="bg-black text-white px-4 py-2 mb-2 block w-auto">
             <p className="text-[10px] font-bold uppercase tracking-widest whitespace-nowrap">Ordem de Serviço</p>
             <p className="text-xl font-black">{os.number}</p>
           </div>
@@ -5468,16 +5761,16 @@ function OSPrintView({
         </div>
       </div>
 
-      {/* Customer & Equipment */}
-      <div className="grid grid-cols-2 gap-8 mb-8">
-        <div className="space-y-4">
+      {/* Customer + Equipment + PIX */}
+      <div className="grid grid-cols-12 gap-4 mb-4">
+        <div className="col-span-5 space-y-3">
           <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-gray-200 pb-1">Dados do Cliente</h3>
           <div>
             <p className="text-sm font-black">{os.customerName}</p>
             <p className="text-xs text-gray-600">Cliente registrado por nome</p>
           </div>
         </div>
-        <div className="space-y-4">
+        <div className="col-span-4 space-y-3">
           <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-gray-200 pb-1">Equipamento</h3>
           <div>
             <p className="text-sm font-black">{os.equipment}</p>
@@ -5485,16 +5778,37 @@ function OSPrintView({
             <p className="text-xs text-gray-600 font-mono">S/N: {os.serialNumber}</p>
           </div>
         </div>
+        <div className="col-span-3 space-y-3">
+          <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-gray-200 pb-1">PIX</h3>
+          <div className="border rounded-xl p-2">
+            {pixPayload ? (
+              <>
+                <img
+                  src={pixQrCodeCandidates[pixQrCandidateIndex] || ''}
+                  alt="QRCode PIX"
+                  className="w-[78px] h-[78px] border ml-auto my-1"
+                  onError={() => {
+                    setPixQrCandidateIndex((prev) => (prev + 1 < pixQrCodeCandidates.length ? prev + 1 : prev));
+                  }}
+                />
+                <p className="text-[9px] uppercase font-bold text-right">Tipo: {company.pixKeyType || 'PIX'}</p>
+                <p className="text-[9px] font-mono text-right break-all">Chave: {formatPixKeyPreview(company.pixKey || '', company.pixKeyType)}</p>
+              </>
+            ) : (
+              <p className="text-[10px] text-right text-gray-500">Configure a chave PIX em Dados da Empresa</p>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Defect & Diagnosis */}
-      <div className="space-y-6 mb-8">
-        <div className="bg-gray-50 p-4 rounded-lg border">
+      <div className="space-y-3 mb-4">
+        <div className="p-3 border rounded-xl">
           <h3 className="text-xs font-black uppercase tracking-widest mb-2">Defeito Informado</h3>
           <p className="text-sm italic text-gray-700">"{os.defect}"</p>
         </div>
         {os.diagnosis && (
-          <div className="p-4 rounded-lg border border-black/10">
+          <div className="p-3 border border-black/10 rounded-xl">
             <h3 className="text-xs font-black uppercase tracking-widest mb-2">Diagnóstico Técnico</h3>
             <p className="text-sm">{os.diagnosis}</p>
           </div>
@@ -5502,22 +5816,22 @@ function OSPrintView({
       </div>
 
       {/* Status & Priority */}
-      <div className="grid grid-cols-4 gap-4 mb-8">
-        <div className="border p-3 rounded-lg text-center">
+      <div className="grid grid-cols-4 gap-3 mb-4">
+        <div className="border rounded-xl p-2 text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Status</p>
           <p className="text-sm font-black">{os.status}</p>
         </div>
-        <div className="border p-3 rounded-lg text-center">
+        <div className="border rounded-xl p-2 text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prioridade</p>
           <p className="text-sm font-black">{os.priority}</p>
         </div>
-        <div className="border p-3 rounded-lg text-center">
+        <div className="border rounded-xl p-2 text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prazo Diag.</p>
           <p className="text-sm font-black">
             {os.diagnosisDeadline ? format(new Date(os.diagnosisDeadline), 'dd/MM/yyyy') : '--/--/----'}
           </p>
         </div>
-        <div className="border p-3 rounded-lg text-center">
+        <div className="border rounded-xl p-2 text-center">
           <p className="text-[9px] uppercase font-bold text-gray-500 mb-1 leading-none">Prazo Entrega</p>
           <p className="text-sm font-black">
             {os.completionDeadline ? format(new Date(os.completionDeadline), 'dd/MM/yyyy') : '--/--/----'}
@@ -5526,7 +5840,7 @@ function OSPrintView({
       </div>
 
       {/* Items / Parts / Services */}
-      <div className="mb-8 border rounded-xl overflow-x-auto">
+      <div className="mb-4 border rounded-xl overflow-x-auto">
         <table className="w-full text-sm min-w-full">
           <thead className="bg-gray-100 border-b">
             <tr>
@@ -5540,7 +5854,12 @@ function OSPrintView({
           <tbody className="divide-y">
             {os.items && os.items.length > 0 ? os.items.map((item, idx) => (
               <tr key={idx}>
-                <td className="px-4 py-3 font-medium">{item.description}</td>
+                <td className="px-4 py-3 font-medium">
+                  {item.description}
+                  {item.type === 'Serviço' && item.executionTimeValue && item.executionTimeUnit && (
+                    <div className="text-[9px] text-gray-500">Prazo: {item.executionTimeValue} {item.executionTimeUnit}</div>
+                  )}
+                </td>
                 <td className="px-4 py-3 text-center text-xs">{item.type}</td>
                 <td className="px-4 py-3 text-center">{item.quantity}</td>
                 <td className="px-4 py-3 text-right">R$ {item.unitPrice.toFixed(2)}</td>
@@ -5557,15 +5876,15 @@ function OSPrintView({
           <tfoot className="bg-gray-50 font-black">
             <tr>
               <td colSpan={4} className="px-4 py-3 text-right uppercase tracking-widest text-xs">Valor Total da OS:</td>
-              <td className="px-4 py-3 text-right text-lg">R$ {os.value.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</td>
+              <td className="px-4 py-3 text-right text-lg">R$ {orderTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</td>
             </tr>
           </tfoot>
         </table>
       </div>
 
       {/* Terms & Signatures */}
-      <div className="grid grid-cols-2 gap-12 mt-12">
-        <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-8 mt-5">
+        <div className="space-y-2">
           <h3 className="text-[10px] font-black uppercase tracking-widest border-b border-gray-200 pb-1">Termos e Condições</h3>
           <p className="text-[9px] text-gray-500 leading-relaxed">
             1. O prazo para diagnóstico é de até 48h úteis.<br />
@@ -5584,7 +5903,7 @@ function OSPrintView({
       </div>
 
       {/* Footer Notes */}
-      <div className="mt-12 text-center border-t pt-4">
+      <div className="mt-auto text-center border-t pt-3">
         <p className="text-[10px] text-gray-400">Este documento é uma representação digital da Ordem de Serviço {os.number}. Gerado em {format(new Date(), 'dd/MM/yyyy HH:mm')}.</p>
       </div>
     </div>
@@ -5593,7 +5912,7 @@ function OSPrintView({
   return (
     <Dialog open={!!os} onOpenChange={() => onClose()}>
       <DialogContent className="w-[98vw] max-w-[1200px] max-h-[98vh] overflow-hidden p-0 border-none bg-gray-100">
-        <div ref={printPreviewHostRef} className="h-[calc(98vh-88px)] overflow-auto p-4">
+        <div ref={printPreviewHostRef} className="h-[calc(98vh-88px)] overflow-auto p-4 flex justify-center">
           <div
             className="mx-auto"
             style={{
@@ -5601,12 +5920,12 @@ function OSPrintView({
               minHeight: `${(printPreviewAreaSize.height || 1123) * printPreviewScale}px`,
             }}
           >
-            <div style={{ transform: `scale(${printPreviewScale})`, transformOrigin: 'top left' }}>
+            <div style={{ transform: `scale(${printPreviewScale})`, transformOrigin: 'top center' }}>
               <div
                 id="os-print-area"
                 ref={printPreviewAreaRef}
-                className="mx-auto bg-white text-black shadow-sm"
-                style={{ width: '210mm', minHeight: '297mm', padding: '12mm', boxSizing: 'border-box' }}
+                className="bg-white text-black shadow-sm"
+                style={{ width: '210mm', height: '297mm', padding: 0, boxSizing: 'border-box', overflow: 'hidden' }}
               >
                 <OSContent />
 
@@ -5648,7 +5967,8 @@ const OSBadge = ({ status }: { status: string }) => {
     'Pronta': { color: 'bg-emerald-500/10 text-emerald-600 border-emerald-200', icon: CheckCircle2, label: 'PRONTA' },
     'Entregue': { color: 'bg-slate-500/10 text-slate-600 border-slate-200', icon: ShoppingCart, label: 'ENTREGUE' },
     'Finalizada': { color: 'bg-green-500/10 text-green-600 border-green-200', icon: Check, label: 'FINALIZADA' },
-    'Cancelada': { color: 'bg-rose-500/10 text-rose-600 border-rose-200', icon: XCircle, label: 'CANCELADA' }
+    'Cancelada': { color: 'bg-rose-500/10 text-rose-600 border-rose-200', icon: XCircle, label: 'CANCELADA' },
+    'Reprovado': { color: 'bg-red-500/10 text-red-700 border-red-300', icon: XCircle, label: 'REPROVADO' }
   };
 
   const config = configs[status] || { color: 'bg-gray-500/10 text-gray-600 border-gray-200', icon: Clock, label: status.toUpperCase() };
@@ -5669,12 +5989,14 @@ function OSListView({
   teamUsers,
   user,
   equipmentTypes,
+  setEquipmentTypes,
   globalCustomers,
   setGlobalCustomers,
   setAllOrders,
   printTemplates,
   company,
-  holidays
+  holidayCalendar,
+  setHolidayCalendar
 }: { 
   onViewOS: (id: string) => void, 
   allOrders: ServiceOrder[], 
@@ -5682,12 +6004,14 @@ function OSListView({
   teamUsers: User[],
   user: User | null,
   equipmentTypes: EquipmentType[],
+  setEquipmentTypes: React.Dispatch<React.SetStateAction<EquipmentType[]>>,
   globalCustomers: Array<{ id: string; name: string; doc?: string; phone?: string; email?: string }>,
   setGlobalCustomers: React.Dispatch<React.SetStateAction<any[]>>,
   setAllOrders: React.Dispatch<React.SetStateAction<ServiceOrder[]>>,
   printTemplates: PrintTemplate[],
   company: Company,
-  holidays: HolidayApiItem[]
+  holidayCalendar: HolidayCalendarCache,
+  setHolidayCalendar: React.Dispatch<React.SetStateAction<HolidayCalendarCache>>
 }) {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isNewCustomerOpen, setIsNewCustomerOpen] = useState(false);
@@ -5707,6 +6031,8 @@ function OSListView({
     city: '',
     state: 'SP'
   });
+  const [isQuickCustomerCepLookupLoading, setIsQuickCustomerCepLookupLoading] = useState(false);
+  const lastQuickCustomerCepLookupRef = useRef('');
   const [newOSTechnicianId, setNewOSTechnicianId] = useState('');
   const [showCustomerResults, setShowCustomerResults] = useState(false);
   const [showPostSavePrintDialog, setShowPostSavePrintDialog] = useState(false);
@@ -5716,14 +6042,241 @@ function OSListView({
     entry: true,
     warranty: false
   });
-  const [osSearch, setOsSearch] = useState('');
+  const [availablePrinters, setAvailablePrinters] = useState<string[]>([]);
+  const [isLoadingPrinters, setIsLoadingPrinters] = useState(false);
+  const [isDirectPrinting, setIsDirectPrinting] = useState(false);
+  const [directPrintTargets, setDirectPrintTargets] = useState({
+    label: '',
+    entry: '',
+    warranty: '',
+  });
+  const [filterField, setFilterField] = useState<'status' | 'nome' | 'data' | 'os' | 'equipamento' | 'marca' | 'modelo'>('nome');
+  const [filterQuery, setFilterQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('todos');
+  const [isCancelDialogOpen, setIsCancelDialogOpen] = useState(false);
+  const [isRejectionDialog, setIsRejectionDialog] = useState(false);
+  const [cancelReason, setCancelReason] = useState('');
+  const [cancelTargetId, setCancelTargetId] = useState<string | null>(null);
   const [selectedOSForA4Print, setSelectedOSForA4Print] = useState<ServiceOrder | null>(null);
+  const [selectedOSForA4Action, setSelectedOSForA4Action] = useState<'print' | 'pdf' | null>(null);
   const [selectedOSForTemplatePrint, setSelectedOSForTemplatePrint] = useState<ServiceOrder | null>(null);
   const [isPrintTemplateDialogOpen, setIsPrintTemplateDialogOpen] = useState(false);
   const [isTemplatePreviewOpen, setIsTemplatePreviewOpen] = useState(false);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
-  const [isQuickCustomerCepLookupLoading, setIsQuickCustomerCepLookupLoading] = useState(false);
+  const directA4PrintRef = useRef<HTMLDivElement | null>(null);
+  const holidayFetchInFlightYearsRef = useRef<Set<number>>(new Set());
+  const holidayCalendarRef = useRef<HolidayCalendarCache>(holidayCalendar);
+  const orderedStatusColumns = useMemo(() => {
+    if (company.osStatuses && company.osStatuses.length > 0) {
+      return [...company.osStatuses]
+        .sort((a, b) => a.order - b.order)
+        .map((item) => item.name as OSStatus);
+    }
+    return STATUS_COLUMNS;
+  }, [company.osStatuses]);
+
+  useEffect(() => {
+    holidayCalendarRef.current = holidayCalendar;
+  }, [holidayCalendar]);
+
+  const ensureHolidayYearCache = async (year: number): Promise<HolidayApiItem[]> => {
+    const yearKey = String(year);
+    const cached = holidayCalendarRef.current[yearKey];
+    if (cached?.holidays?.length) {
+      return cached.holidays;
+    }
+
+    if (holidayFetchInFlightYearsRef.current.has(year)) {
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 100));
+        const refreshed = holidayCalendarRef.current[yearKey];
+        if (refreshed?.holidays) return refreshed.holidays;
+      }
+      return [];
+    }
+
+    holidayFetchInFlightYearsRef.current.add(year);
+    try {
+      const response = await axios.get(`https://brasilapi.com.br/api/feriados/v1/${year}`);
+      const payload = Array.isArray(response.data) ? response.data : [];
+      const holidays: HolidayApiItem[] = payload
+        .map((item: any) => ({
+          date: String(item?.date || '').slice(0, 10),
+          name: String(item?.name || 'Feriado'),
+          type: String(item?.type || 'national'),
+        }))
+        .filter((item) => /^\d{4}-\d{2}-\d{2}$/.test(item.date));
+
+      setHolidayCalendar((prev) => {
+        const next = {
+          ...prev,
+          [yearKey]: {
+            fetchedAt: new Date().toISOString(),
+            holidays,
+          },
+        };
+        holidayCalendarRef.current = next;
+        return next;
+      });
+      return holidays;
+    } catch (error) {
+      console.error(`Erro ao carregar feriados de ${year}:`, error);
+      toast.error(`Não foi possível consultar os feriados de ${year}.`);
+      return [];
+    } finally {
+      holidayFetchInFlightYearsRef.current.delete(year);
+    }
+  };
+
+  const pushDeadlineIfHoliday = async (baseDate: Date) => {
+    let deadline = new Date(baseDate);
+    for (let guard = 0; guard < 20; guard += 1) {
+      const holidays = await ensureHolidayYearCache(deadline.getFullYear());
+      const holidaySet = new Set(holidays.map((item) => item.date));
+      const deadlineKey = format(deadline, 'yyyy-MM-dd');
+      if (!holidaySet.has(deadlineKey)) {
+        return deadline;
+      }
+      deadline = addDays(deadline, 1);
+    }
+    return deadline;
+  };
+
+  const parseTimeToMinutes = (value?: string, fallback = '08:00') => {
+    const text = String(value || fallback);
+    const [h, m] = text.split(':').map((part) => Number(part));
+    const hours = Number.isFinite(h) ? Math.min(Math.max(h, 0), 23) : 0;
+    const minutes = Number.isFinite(m) ? Math.min(Math.max(m, 0), 59) : 0;
+    return hours * 60 + minutes;
+  };
+
+  const getBusinessScheduleForDate = async (date: Date) => {
+    const day = date.getDay();
+    const isSaturday = day === 6;
+    const isSunday = day === 0;
+    const weekdayEnabled = (company.businessHoursWeekdays || []).includes(day);
+    const openWeekday = isSunday
+      ? company.businessHoursSundayEnabled === true
+      : isSaturday
+        ? company.businessHoursSaturdayEnabled !== false
+        : weekdayEnabled;
+
+    const baseStart = isSunday
+      ? (company.businessHoursSundayStart || '00:00')
+      : isSaturday
+        ? (company.businessHoursSaturdayStart || '08:30')
+        : (company.businessHoursStart || '08:30');
+    const baseEnd = isSunday
+      ? (company.businessHoursSundayEnd || '00:00')
+      : isSaturday
+        ? (company.businessHoursSaturdayEnd || '12:30')
+        : (company.businessHoursEnd || '18:00');
+
+    const breakEnabled = (company.businessHoursBreakWeekdays || []).includes(day);
+    const breakStart = company.businessHoursBreakStart || '12:00';
+    const breakEnd = company.businessHoursBreakEnd || '13:30';
+
+    let open = openWeekday;
+    let startValue = baseStart;
+    let endValue = baseEnd;
+    let breakStartValue = breakStart;
+    let breakEndValue = breakEnd;
+    let breakActive = breakEnabled;
+
+    const dateKey = format(date, 'yyyy-MM-dd');
+    const override = company.holidayWorkOverrides?.[dateKey];
+    const holidayClosed = company.businessHoursHolidayClosed !== false;
+
+    if (override) {
+      open = override.open;
+      startValue = override.start || startValue;
+      endValue = override.end || endValue;
+      breakActive = override.breakEnabled ?? breakActive;
+      breakStartValue = override.breakStart || breakStartValue;
+      breakEndValue = override.breakEnd || breakEndValue;
+    } else if (holidayClosed) {
+      const holidays = await ensureHolidayYearCache(date.getFullYear());
+      const holidaySet = new Set(holidays.map((item) => item.date));
+      if (holidaySet.has(dateKey)) {
+        open = false;
+      }
+    }
+
+    return {
+      open,
+      startMinutes: parseTimeToMinutes(startValue, '08:00'),
+      endMinutes: parseTimeToMinutes(endValue, '18:00'),
+      breakEnabled: breakActive,
+      breakStartMinutes: parseTimeToMinutes(breakStartValue, '12:00'),
+      breakEndMinutes: parseTimeToMinutes(breakEndValue, '13:30'),
+    };
+  };
+
+  const adjustDeadlineToBusinessHours = async (baseDate: Date) => {
+    if (!company.businessHoursEnabled) {
+      return pushDeadlineIfHoliday(baseDate);
+    }
+
+    const desiredMinutes = baseDate.getHours() * 60 + baseDate.getMinutes();
+    let deadline = new Date(baseDate);
+
+    for (let guard = 0; guard < 30; guard += 1) {
+      const schedule = await getBusinessScheduleForDate(deadline);
+      if (!schedule.open) {
+        const nextDay = addDays(startOfDay(deadline), 1);
+        deadline = new Date(nextDay);
+        deadline.setHours(Math.floor(desiredMinutes / 60), desiredMinutes % 60, 0, 0);
+        continue;
+      }
+
+      const minutes = deadline.getHours() * 60 + deadline.getMinutes();
+      let adjustedMinutes = minutes;
+
+      if (minutes < schedule.startMinutes) adjustedMinutes = schedule.startMinutes;
+      if (minutes > schedule.endMinutes) adjustedMinutes = schedule.endMinutes;
+      if (schedule.breakEnabled && adjustedMinutes > schedule.breakStartMinutes && adjustedMinutes < schedule.breakEndMinutes) {
+        adjustedMinutes = schedule.breakStartMinutes;
+      }
+
+      const adjusted = new Date(deadline);
+      adjusted.setHours(Math.floor(adjustedMinutes / 60), adjustedMinutes % 60, 0, 0);
+      return adjusted;
+    }
+
+    return deadline;
+  };
+
+  useEffect(() => {
+    if (!showPostSavePrintDialog) return;
+    let cancelled = false;
+
+    const loadPrinters = async () => {
+      try {
+        setIsLoadingPrinters(true);
+        const response = await axios.get('/api/system/printers');
+        const printers = Array.isArray(response.data?.printers) ? response.data.printers as string[] : [];
+        if (cancelled) return;
+        setAvailablePrinters(printers);
+        setDirectPrintTargets((prev) => ({
+          label: prev.label || printers[0] || '',
+          entry: prev.entry || printers[0] || '',
+          warranty: prev.warranty || printers[0] || '',
+        }));
+      } catch {
+        if (!cancelled) {
+          setAvailablePrinters([]);
+          toast.error('Não foi possível carregar as impressoras do sistema.');
+        }
+      } finally {
+        if (!cancelled) setIsLoadingPrinters(false);
+      }
+    };
+
+    loadPrinters();
+    return () => {
+      cancelled = true;
+    };
+  }, [showPostSavePrintDialog]);
 
   const handleTemplatePrint = (os: ServiceOrder) => {
     if (printTemplates.length === 0) {
@@ -5754,6 +6307,150 @@ function OSListView({
     setIsTemplatePreviewOpen(true);
   };
 
+  const handleA4Print = (os: ServiceOrder) => {
+    setSelectedOSForA4Action('print');
+    setSelectedOSForA4Print(os);
+  };
+
+  const handleA4Pdf = (os: ServiceOrder) => {
+    setSelectedOSForA4Action('pdf');
+    setSelectedOSForA4Print(os);
+  };
+
+  const parseOrderDate = (value?: string) => {
+    if (!value) return null;
+    const direct = new Date(value);
+    if (!Number.isNaN(direct.getTime())) return direct;
+    if (value.includes('/')) {
+      const [day, month, year] = value.split('/').map(Number);
+      if (!day || !month || !year) return null;
+      return new Date(year, month - 1, day);
+    }
+    return null;
+  };
+
+  const openCancelDialog = (osId: string) => {
+    setCancelTargetId(osId);
+    setCancelReason('');
+    setIsRejectionDialog(false);
+    setIsCancelDialogOpen(true);
+  };
+
+  const openRejectionDialog = (osId: string) => {
+    setCancelTargetId(osId);
+    setCancelReason('');
+    setIsRejectionDialog(true);
+    setIsCancelDialogOpen(true);
+  };
+
+  const confirmCancel = () => {
+    if (!cancelTargetId) return;
+    if (!cancelReason.trim()) {
+      toast.error(isRejectionDialog ? 'Informe o motivo da reprovação.' : 'Informe o motivo do cancelamento.');
+      return;
+    }
+    const now = new Date().toISOString();
+    if (isRejectionDialog) {
+      let chargedCount = 0;
+      setAllOrders((prev) => prev.map((order) =>
+        order.id === cancelTargetId
+          ? (() => {
+              const equipmentName = String(order.equipment || '').trim().toUpperCase();
+              const eqConfig = equipmentTypes.find((eq) => String(eq.name || '').trim().toUpperCase() === equipmentName);
+              const shouldChargeDiagnosis = Boolean(eqConfig?.chargeDiagnosisOnRejection && Number(eqConfig?.diagnosisChargeValue || 0) > 0);
+              const diagnosisCharge = shouldChargeDiagnosis ? Math.max(0, Number(eqConfig?.diagnosisChargeValue || 0)) : 0;
+
+              if (shouldChargeDiagnosis) chargedCount += 1;
+
+              const nextItems = shouldChargeDiagnosis
+                ? [
+                    ...(order.items || []),
+                    {
+                      id: safeRandomUUID(),
+                      description: 'TAXA DE DIAGNOSTICO (REPROVACAO DE ORCAMENTO)',
+                      quantity: 1,
+                      unitPrice: diagnosisCharge,
+                      totalPrice: diagnosisCharge,
+                      type: 'Serviço' as const,
+                    },
+                  ]
+                : order.items;
+
+              return {
+                ...order,
+                status: 'Reprovado' as OSStatus,
+                subStatus: '',
+                rejectionReason: cancelReason.trim(),
+                rejectionDate: now,
+                cancellationReason: undefined,
+                cancellationDate: undefined,
+                items: nextItems,
+                value: shouldChargeDiagnosis ? Number(order.value || 0) + diagnosisCharge : order.value,
+                updatedAt: now,
+              };
+            })()
+          : order
+      ));
+      setIsCancelDialogOpen(false);
+      setCancelTargetId(null);
+      setCancelReason('');
+      setIsRejectionDialog(false);
+      toast.success(chargedCount > 0 ? 'Orçamento reprovado e taxa de diagnóstico lançada.' : 'Orçamento reprovado registrado.');
+      return;
+    }
+    setAllOrders((prev) => prev.map((order) =>
+      order.id === cancelTargetId
+        ? {
+            ...order,
+            status: 'Cancelada',
+            subStatus: '',
+            cancellationReason: cancelReason.trim(),
+            cancellationDate: now,
+            rejectionReason: undefined,
+            rejectionDate: undefined,
+            updatedAt: now,
+          }
+        : order
+    ));
+    setIsCancelDialogOpen(false);
+    setCancelTargetId(null);
+    setCancelReason('');
+    toast.success('OS cancelada com sucesso.');
+  };
+
+  const handleStatusChange = (osId: string, nextStatus: OSStatus) => {
+    if (nextStatus === 'Cancelada') {
+      openCancelDialog(osId);
+      return;
+    }
+    if (nextStatus === 'Reprovado') {
+      openRejectionDialog(osId);
+      return;
+    }
+    const now = new Date().toISOString();
+    setAllOrders((prev) => prev.map((order) =>
+      order.id === osId
+        ? {
+            ...order,
+            status: nextStatus,
+            subStatus: '',
+            cancellationReason: undefined,
+            cancellationDate: undefined,
+            rejectionReason: undefined,
+            rejectionDate: undefined,
+            updatedAt: now,
+          }
+        : order
+    ));
+    toast.success(`Status atualizado para ${nextStatus}.`);
+  };
+
+  const handleDeleteOrder = (osId: string) => {
+    if (!confirm('Tem certeza que deseja apagar esta OS?')) return;
+    setAllOrders((prev) => prev.filter((order) => order.id !== osId));
+    toast.success('OS apagada com sucesso.');
+  };
+
   const selectedTemplate = useMemo(
     () => printTemplates.find(t => t.id === selectedTemplateId) || null,
     [printTemplates, selectedTemplateId]
@@ -5762,24 +6459,174 @@ function OSListView({
   const [newItemDesc, setNewItemDesc] = useState('');
   const [newItemPrice, setNewItemPrice] = useState('0');
   const [newItemQty, setNewItemQty] = useState('1');
-  const [newItemType, setNewItemType] = useState<'Produto' | 'Serviço'>('Serviço');
+  const [newItemType, setNewItemType] = useState<'Produto' | 'Serviço'>('Produto');
+  const [newItemExecTimeValue, setNewItemExecTimeValue] = useState('1');
+  const [newItemExecTimeUnit, setNewItemExecTimeUnit] = useState<'Horas' | 'Dias'>('Horas');
+  const [newOSEquipmentTypeId, setNewOSEquipmentTypeId] = useState('');
+  const [newOSEquipment, setNewOSEquipment] = useState('');
+  const [newOSBrand, setNewOSBrand] = useState('');
+  const [newOSModel, setNewOSModel] = useState('');
+  const [isServiceSuggestionOpen, setIsServiceSuggestionOpen] = useState(false);
+
+  const normalizeUpperText = (value: string) => String(value || '').trim().toUpperCase();
+
+  const brandSuggestions = useMemo(() => {
+    const equipmentQuery = normalizeUpperText(newOSEquipment);
+    const brandQuery = normalizeUpperText(newOSBrand);
+    const unique = new Set<string>();
+
+    const equipmentMatch = equipmentTypes.find((eq) =>
+      equipmentQuery ? normalizeUpperText(eq.name) === equipmentQuery : eq.id === newOSEquipmentTypeId
+    );
+    (equipmentMatch?.brandModels || []).forEach((entry) => {
+      const brand = normalizeUpperText(entry.brand);
+      if (!brand) return;
+      if (brandQuery && !fuzzyMatch(brand, brandQuery)) return;
+      unique.add(brand);
+    });
+
+    allOrders.forEach((order) => {
+      const orderEquipment = normalizeUpperText(order.equipment);
+      const orderBrand = normalizeUpperText(order.brand);
+      if (!orderBrand) return;
+      if (equipmentQuery && !fuzzyMatch(orderEquipment, equipmentQuery)) return;
+      if (brandQuery && !fuzzyMatch(orderBrand, brandQuery)) return;
+      unique.add(orderBrand);
+    });
+
+    return Array.from(unique).sort((a, b) => a.localeCompare(b)).slice(0, 20);
+  }, [allOrders, equipmentTypes, newOSEquipment, newOSEquipmentTypeId, newOSBrand]);
+
+  const modelSuggestions = useMemo(() => {
+    const equipmentQuery = normalizeUpperText(newOSEquipment);
+    const brandQuery = normalizeUpperText(newOSBrand);
+    const modelQuery = normalizeUpperText(newOSModel);
+    const unique = new Set<string>();
+
+    const equipmentMatch = equipmentTypes.find((eq) =>
+      equipmentQuery ? normalizeUpperText(eq.name) === equipmentQuery : eq.id === newOSEquipmentTypeId
+    );
+    (equipmentMatch?.brandModels || []).forEach((entry) => {
+      const brand = normalizeUpperText(entry.brand);
+      if (brandQuery && !fuzzyMatch(brand, brandQuery)) return;
+      (entry.models || []).forEach((model) => {
+        const modelUpper = normalizeUpperText(model);
+        if (!modelUpper) return;
+        if (modelQuery && !fuzzyMatch(modelUpper, modelQuery)) return;
+        unique.add(modelUpper);
+      });
+    });
+
+    allOrders.forEach((order) => {
+      const orderEquipment = normalizeUpperText(order.equipment);
+      const orderBrand = normalizeUpperText(order.brand);
+      const orderModel = normalizeUpperText(order.model);
+      if (!orderModel) return;
+      if (equipmentQuery && !fuzzyMatch(orderEquipment, equipmentQuery)) return;
+      if (brandQuery && !fuzzyMatch(orderBrand, brandQuery)) return;
+      if (modelQuery && !fuzzyMatch(orderModel, modelQuery)) return;
+      unique.add(orderModel);
+    });
+
+    return Array.from(unique).sort((a, b) => a.localeCompare(b)).slice(0, 20);
+  }, [allOrders, equipmentTypes, newOSEquipment, newOSEquipmentTypeId, newOSBrand, newOSModel]);
+
+  const serviceSuggestions = useMemo(() => {
+    const equipmentQuery = normalizeUpperText(newOSEquipment);
+    const brandQuery = normalizeUpperText(newOSBrand);
+    const modelQuery = normalizeUpperText(newOSModel);
+    const descriptionQuery = normalizeUpperText(newItemDesc);
+
+    if (!equipmentQuery && !brandQuery && !modelQuery) return [];
+
+    const map = new Map<string, { description: string; unitPrice: number; occurrences: number; lastUsedAt: string }>();
+
+    const equipmentMatch = equipmentTypes.find((eq) =>
+      equipmentQuery ? normalizeUpperText(eq.name) === equipmentQuery : eq.id === newOSEquipmentTypeId
+    );
+    (equipmentMatch?.services || []).forEach((service) => {
+      const description = String(service.description || '').trim();
+      if (!description) return;
+      if (descriptionQuery && !fuzzyMatch(description, descriptionQuery)) return;
+      const key = normalizeUpperText(description);
+      if (!map.has(key)) {
+        map.set(key, {
+          description,
+          unitPrice: Number(service.unitPrice) || 0,
+          occurrences: 0,
+          lastUsedAt: '',
+        });
+      }
+    });
+
+    allOrders.forEach((order) => {
+      const orderEquipment = normalizeUpperText(order.equipment);
+      const orderBrand = normalizeUpperText(order.brand);
+      const orderModel = normalizeUpperText(order.model);
+      if (equipmentQuery && !fuzzyMatch(orderEquipment, equipmentQuery)) return;
+      if (brandQuery && !fuzzyMatch(orderBrand, brandQuery)) return;
+      if (modelQuery && !fuzzyMatch(orderModel, modelQuery)) return;
+
+      (order.items || []).forEach((item) => {
+        if (item.type !== 'Serviço') return;
+        const description = String(item.description || '').trim();
+        if (!description) return;
+        if (descriptionQuery && !fuzzyMatch(description, descriptionQuery)) return;
+
+        const key = normalizeUpperText(description);
+        const current = map.get(key);
+        const itemDate = order.updatedAt || order.createdAt || '';
+        const itemUnitPrice = Number(item.unitPrice) || 0;
+
+        if (!current) {
+          map.set(key, {
+            description,
+            unitPrice: itemUnitPrice,
+            occurrences: 1,
+            lastUsedAt: itemDate,
+          });
+          return;
+        }
+
+        const currentDateMs = current.lastUsedAt ? new Date(current.lastUsedAt).getTime() : 0;
+        const itemDateMs = itemDate ? new Date(itemDate).getTime() : 0;
+        map.set(key, {
+          description: current.description,
+          unitPrice: itemDateMs >= currentDateMs ? itemUnitPrice : current.unitPrice,
+          occurrences: current.occurrences + 1,
+          lastUsedAt: itemDateMs >= currentDateMs ? itemDate : current.lastUsedAt,
+        });
+      });
+    });
+
+    return Array.from(map.values())
+      .sort((a, b) => (b.occurrences - a.occurrences) || (new Date(b.lastUsedAt).getTime() - new Date(a.lastUsedAt).getTime()))
+      .slice(0, 8);
+  }, [allOrders, equipmentTypes, newOSEquipment, newOSEquipmentTypeId, newOSBrand, newOSModel, newItemDesc]);
 
   const addItem = () => {
     if (!newItemDesc.trim()) return;
-    const price = parseFloat(newItemPrice);
-    const qty = parseInt(newItemQty);
+    const price = Number.parseFloat(newItemPrice) || 0;
+    const qty = Math.max(1, Number.parseInt(newItemQty, 10) || 1);
+    const execTimeValue = newItemType === 'Serviço'
+      ? Math.max(0, Number.parseInt(newItemExecTimeValue, 10) || 0)
+      : 0;
     const item: OSItem = {
       id: Math.random().toString(36).substr(2, 9),
       description: newItemDesc,
       quantity: qty,
       unitPrice: price,
       totalPrice: price * qty,
-      type: newItemType
+      type: newItemType,
+      executionTimeValue: execTimeValue > 0 ? execTimeValue : undefined,
+      executionTimeUnit: execTimeValue > 0 ? newItemExecTimeUnit : undefined
     };
     setNewOsItems([...newOsItems, item]);
     setNewItemDesc('');
     setNewItemPrice('0');
     setNewItemQty('1');
+    setNewItemExecTimeValue('1');
+    setNewItemExecTimeUnit('Horas');
   };
 
   const removeItem = (id: string) => {
@@ -5794,34 +6641,36 @@ function OSListView({
     fuzzyMatch(c.phone || '', customerSearch) ||
     fuzzyMatch(c.email || '', customerSearch)
   );
-  const holidayDateSet = useMemo(
-    () => new Set((holidays || []).map((item) => normalizeHolidayDate(item.date)).filter(Boolean)),
-    [holidays]
-  );
-
-  const formatDeadlineCell = (deadline?: string) => {
-    if (!deadline) return null;
-    const date = startOfDay(new Date(deadline));
-    const today = startOfDay(new Date());
-    const diff = differenceInDays(date, today);
-    const weekday = format(date, 'EEEE', { locale: ptBR });
-    const weekdayLabel = weekday.charAt(0).toUpperCase() + weekday.slice(1);
-
-    if (diff === 0) return { primary: 'HOJE', secondary: weekdayLabel };
-    if (diff === 1) return { primary: 'AMANHÃ', secondary: weekdayLabel };
-    if (diff === -1) return { primary: 'ONTEM', secondary: weekdayLabel };
-    return { primary: format(date, 'dd/MM/yyyy'), secondary: weekdayLabel };
-  };
 
   const filteredOrders = allOrders.filter(os => {
-    const matchesSearch = 
-      fuzzyMatch(os.customerName, osSearch) ||
-      fuzzyMatch(os.equipment, osSearch) ||
-      os.number.toLowerCase().includes(osSearch.toLowerCase()) ||
-      fuzzyMatch(os.brand, osSearch) ||
-      fuzzyMatch(os.model, osSearch);
-    
-    const matchesStatus = statusFilter === 'todos' || os.status === statusFilter;
+    const normalizedQuery = filterQuery.trim();
+    const matchesText = (() => {
+      if (!normalizedQuery) return true;
+      switch (filterField) {
+        case 'nome':
+          return fuzzyMatch(os.customerName, normalizedQuery);
+        case 'os':
+          return os.number.toLowerCase().includes(normalizedQuery.toLowerCase());
+        case 'equipamento':
+          return fuzzyMatch(os.equipment, normalizedQuery);
+        case 'marca':
+          return fuzzyMatch(os.brand, normalizedQuery);
+        case 'modelo':
+          return fuzzyMatch(os.model, normalizedQuery);
+        case 'data': {
+          const filterDate = parseOrderDate(normalizedQuery);
+          const createdAt = parseOrderDate(os.createdAt || os.updatedAt);
+          if (!filterDate || !createdAt) return false;
+          return isSameDay(filterDate, createdAt);
+        }
+        default:
+          return true;
+      }
+    })();
+
+    const matchesStatus = filterField === 'status'
+      ? (statusFilter === 'todos' || os.status === statusFilter)
+      : true;
 
     // Filtro por equipamento permitido para técnicos
     const isTech = user?.role === 'USUARIO';
@@ -5831,7 +6680,7 @@ function OSListView({
     
     const matchesEquipPerm = !isTech || allowedEquipmentNames.includes(os.equipment.toLowerCase());
     
-    return matchesSearch && matchesStatus && matchesEquipPerm;
+    return matchesText && matchesStatus && matchesEquipPerm;
   });
 
   const sortedOrders = useMemo(() => {
@@ -5852,67 +6701,172 @@ function OSListView({
     });
   }, [filteredOrders, sortOrder]);
 
-  const handleSaveOS = (e: any) => {
+  const handleSaveOS = async (e: any) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
-    const eqTypeId = formData.get('equipmentType') as string;
-    const equipment = formData.get('equipment') as string;
+    const eqTypeId = newOSEquipmentTypeId || (formData.get('equipmentType') as string);
+    const equipment = normalizeUpperText(newOSEquipment || (formData.get('equipment') as string));
+    const brand = normalizeUpperText(newOSBrand || (formData.get('brand') as string));
+    const model = normalizeUpperText(newOSModel || (formData.get('model') as string));
     const eqType = equipmentTypes.find(et => et.id === eqTypeId);
     const selectedTechnician = teamUsers.find(u => u.id === newOSTechnicianId);
 
     const now = new Date();
     const baseDiagDays = eqType?.defaultDiagnosisDays || 1;
     const baseCompDays = eqType?.defaultCompletionDays || 3;
-    const eqName = ((equipment || eqType?.name || '').trim() || '').toUpperCase();
-    const activeEquipmentOrdersQty = allOrders.filter((order) => {
-      const sameEquipment = String(order.equipment || '').toUpperCase() === eqName;
-      const stillOpen = !['Finalizada', 'Entregue', 'Cancelada'].includes(order.status);
-      return sameEquipment && stillOpen;
-    }).length;
-    const shouldApplyOverload =
-      !!eqType &&
-      Number(eqType.overloadFromQty || 0) > 0 &&
-      activeEquipmentOrdersQty >= Number(eqType.overloadFromQty || 0);
-    const diagDays = baseDiagDays + (shouldApplyOverload ? Number(eqType?.overloadDiagnosisDays || 0) : 0);
-    const compDays = baseCompDays + (shouldApplyOverload ? Number(eqType?.overloadCompletionDays || 0) : 0);
     const customerName = customerSearch.trim();
     if (!customerName) {
       toast.error('Informe o nome do cliente para continuar.');
+      return;
+    }
+    if (!equipment) {
+      toast.error('Selecione o equipamento para continuar.');
       return;
     }
     const exactCustomer = selectedCustomerId
       ? globalCustomers.find((c) => c.id === selectedCustomerId)
       : globalCustomers.find((c) => c.name.toLowerCase() === customerName.toLowerCase());
 
-    const pushAfterHoliday = (baseDate: Date) => {
-      if (company.businessHoursHolidayClosed === false) return baseDate;
-      let current = baseDate;
-      let guard = 0;
-      while (holidayDateSet.has(toIsoDate(current)) && guard < 30) {
-        current = addDays(current, 1);
-        guard += 1;
-      }
-      return current;
-    };
+    const activeEquipmentLoad = allOrders.filter((order) =>
+      String(order.equipment || '').toUpperCase() === equipment &&
+      !['Finalizada', 'Cancelada', 'Entregue', 'Reprovado'].includes(order.status)
+    ).length;
+    const overloadEnabled = Boolean(eqType?.overloadFromQty && eqType.overloadFromQty > 0 && activeEquipmentLoad >= (eqType.overloadFromQty || 0));
+    const extraDiagDays = overloadEnabled ? Math.max(0, Number(eqType?.overloadDiagnosisDays || 0)) : 0;
+    const extraCompDays = overloadEnabled ? Math.max(0, Number(eqType?.overloadCompletionDays || 0)) : 0;
 
-    const diagDeadline = pushAfterHoliday(addDays(now, diagDays)).toISOString();
-    const compDeadline = pushAfterHoliday(addDays(now, compDays)).toISOString();
+    // ── HIERARCHICAL DEADLINE CALCULATION ──
+    // Level 1 (max): service exception (Formatação = 3h or equipment deadline rule)
+    // Level 2: equipment category (Notebook = 2 dias diag / 4 dias conclusão)
+    // Level 3: fallback (48h)
+    let diagDeadline: string;
+    let compDeadline: string;
+
+    const serviceItems = newOsItems.filter(i => i.type === 'Serviço');
+    const deadlineRules = eqType?.deadlineRules || [];
+    const isNotebook = String(equipment || '').toLowerCase().includes('notebook');
+    const hasFormattingService = serviceItems.some((item) => String(item.description || '').toLowerCase().includes('format'));
+
+    // Check each service item for matching deadline rules (sorted by priority)
+    const matchedRules: EquipmentDeadlineRule[] = [];
+    for (const item of serviceItems) {
+      const itemDesc = (item.description || '').toLowerCase();
+      for (const rule of deadlineRules) {
+        const keyword = (rule.serviceKeyword || '').toLowerCase();
+        if (keyword && itemDesc.includes(keyword)) {
+          matchedRules.push(rule);
+        }
+      }
+    }
+
+    // Also check via executionTimeValue on service items (quick services like formatação)
+    const quickServiceItems = serviceItems.filter(i => i.executionTimeValue && i.executionTimeValue > 0);
+
+    if (matchedRules.length > 0 || hasFormattingService) {
+      // Level 1 — Use highest priority rule (lowest priority number)
+      const topRule = hasFormattingService
+        ? ({
+            id: 'builtin-formatacao',
+            serviceKeyword: 'Formatação',
+            completionHours: 3,
+            priority: 0,
+          } as EquipmentDeadlineRule)
+        : matchedRules.sort((a, b) => a.priority - b.priority)[0];
+      // Also sum extra hours from all quick service items not already covered
+      let extraHoursFromServices = 0;
+      for (const item of quickServiceItems) {
+        if (item.executionTimeUnit === 'Horas') {
+          extraHoursFromServices += item.executionTimeValue || 0;
+        }
+      }
+
+      let rawDiag: Date;
+      let rawComp: Date;
+
+      if (topRule.completionHours) {
+        // Service is "quick" — completion deadline is X hours from now
+        const totalCompHours = topRule.completionHours;
+        // Diagnosis: use rule's diagnosisHours or equipment default
+        if (topRule.diagnosisHours) {
+          rawDiag = new Date(now.getTime() + topRule.diagnosisHours * 60 * 60 * 1000);
+        } else {
+          rawDiag = addDays(now, baseDiagDays + extraDiagDays);
+        }
+        // Completion: rule hours + any additional equipment base completion days
+        const baseCompMs = (topRule.completionDays || 0) * 24 * 60 * 60 * 1000;
+        rawComp = new Date(rawDiag.getTime() + totalCompHours * 60 * 60 * 1000 + baseCompMs);
+      } else if (topRule.completionDays) {
+        rawDiag = addDays(now, topRule.diagnosisHours ? 0 : baseDiagDays + extraDiagDays);
+        if (topRule.diagnosisHours) {
+          rawDiag = new Date(now.getTime() + topRule.diagnosisHours * 60 * 60 * 1000);
+        }
+        rawComp = addDays(now, topRule.completionDays);
+        // Sum hours from other quick services
+        if (extraHoursFromServices > 0) {
+          rawComp = new Date(rawComp.getTime() + extraHoursFromServices * 60 * 60 * 1000);
+        }
+      } else {
+        // Fallback to equipment defaults
+        rawDiag = addDays(now, baseDiagDays + extraDiagDays);
+        rawComp = addDays(now, baseCompDays + extraCompDays);
+      }
+
+      diagDeadline = (await adjustDeadlineToBusinessHours(rawDiag)).toISOString();
+      compDeadline = (await adjustDeadlineToBusinessHours(rawComp)).toISOString();
+
+      // Visual alert
+      toast.info(`Fluxo rápido detectado: prazo ajustado por "${topRule.serviceKeyword}".`, { duration: 4000 });
+
+    } else if (quickServiceItems.length > 0) {
+      // Service items have execution times set (e.g., from equipment service catalog)
+      // Sum all hours; completion = diagnosis + total service hours
+      const totalServiceHours = quickServiceItems.reduce((sum, item) => {
+        if (item.executionTimeUnit === 'Horas') return sum + (item.executionTimeValue || 0);
+        if (item.executionTimeUnit === 'Dias') return sum + (item.executionTimeValue || 0) * 24;
+        return sum;
+      }, 0);
+
+      const diagDays = baseDiagDays + extraDiagDays;
+      const rawDiag = addDays(now, diagDays);
+      const rawComp = new Date(rawDiag.getTime() + totalServiceHours * 60 * 60 * 1000);
+
+      diagDeadline = (await adjustDeadlineToBusinessHours(rawDiag)).toISOString();
+      compDeadline = (await adjustDeadlineToBusinessHours(rawComp)).toISOString();
+
+      const serviceLabel = quickServiceItems.map(i => i.description).join(' + ');
+      toast.info(`⚡ Prazo calculado com tempo de execução do serviço: ${serviceLabel}`, { duration: 4000 });
+
+    } else if (isNotebook) {
+      // Level 2 — Notebook category rule when there is no service exception
+      const rawDiag = addDays(now, 2 + extraDiagDays);
+      const rawComp = addDays(now, 4 + extraCompDays);
+      diagDeadline = (await adjustDeadlineToBusinessHours(rawDiag)).toISOString();
+      compDeadline = (await adjustDeadlineToBusinessHours(rawComp)).toISOString();
+
+    } else {
+      // Level 3 — Fallback 48h when no explicit exception/category rule applies
+      const rawDiagFallback = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+      const rawCompFallback = new Date(rawDiagFallback.getTime());
+      diagDeadline = (await adjustDeadlineToBusinessHours(rawDiagFallback)).toISOString();
+      compDeadline = (await adjustDeadlineToBusinessHours(rawCompFallback)).toISOString();
+      toast.info('Regra padrão aplicada: prazo fallback de 48h.');
+    }
 
     const newOS: ServiceOrder = {
       id: Math.random().toString(36).substr(2, 9),
       number: `OS-${new Date().getFullYear()}-${(allOrders.length + 1).toString().padStart(3, '0')}`,
       customerId: exactCustomer?.id || `manual-${Date.now()}`,
       customerName,
-      equipment: (equipment || '').toUpperCase(),
-      brand: (formData.get('brand') as string || '').toUpperCase(),
-      model: (formData.get('model') as string || '').toUpperCase(),
+      equipment,
+      brand,
+      model,
       serialNumber: (formData.get('serial') as string || '').toUpperCase(),
       defect: (formData.get('defeito') as string || '').toUpperCase(),
       details: (formData.get('defeito_balcao') as string || '').toUpperCase(),
       accessories: (formData.get('acessorios') as string || '').toUpperCase(),
       status: formData.get('status') as any || 'Aberta',
       serviceType: formData.get('serviceType') as any,
-      isApproved: formData.get('isApproved') === 'Sim',
+      isApproved: formData.get('isApproved') !== null,
       priority: formData.get('priority') as any,
       value: totalOSValue,
       items: newOsItems,
@@ -5925,6 +6879,68 @@ function OSListView({
       companyId: '1'
     };
 
+    if (eqTypeId) {
+      setEquipmentTypes((prev) => prev.map((eq) => {
+        if (eq.id !== eqTypeId) return eq;
+        const nextBrandModels = [...(eq.brandModels || [])];
+        const normalizedBrand = normalizeUpperText(brand);
+        const normalizedModel = normalizeUpperText(model);
+
+        if (normalizedBrand) {
+          const existingBrandIndex = nextBrandModels.findIndex((entry) =>
+            normalizeUpperText(entry.brand) === normalizedBrand
+          );
+          if (existingBrandIndex === -1) {
+            nextBrandModels.push({
+              brand: normalizedBrand,
+              models: normalizedModel ? [normalizedModel] : [],
+            });
+          } else if (normalizedModel) {
+            const existingBrand = nextBrandModels[existingBrandIndex];
+            const models = Array.from(new Set([...(existingBrand.models || []), normalizedModel]));
+            nextBrandModels[existingBrandIndex] = {
+              ...existingBrand,
+              models,
+            };
+          }
+        }
+
+        const nextServices = [...(eq.services || [])];
+        newOsItems
+          .filter((item) => item.type === 'Serviço')
+          .forEach((item) => {
+            const description = normalizeUpperText(item.description || '');
+            if (!description) return;
+            const existingServiceIndex = nextServices.findIndex((service) =>
+              normalizeUpperText(service.description) === description
+            );
+            const servicePayload = {
+              id: existingServiceIndex >= 0 ? nextServices[existingServiceIndex].id : Math.random().toString(36).substr(2, 9),
+              description,
+              unitPrice: Number(item.unitPrice) || 0,
+              executionTimeValue: item.executionTimeValue,
+              executionTimeUnit: item.executionTimeUnit,
+            };
+
+            if (existingServiceIndex >= 0) {
+              nextServices[existingServiceIndex] = {
+                ...nextServices[existingServiceIndex],
+                ...servicePayload,
+              };
+              return;
+            }
+
+            nextServices.push(servicePayload);
+          });
+
+        return {
+          ...eq,
+          brandModels: nextBrandModels,
+          services: nextServices,
+        };
+      }));
+    }
+
     setAllOrders(prev => [newOS, ...prev]);
     setIsDialogOpen(false);
     
@@ -5933,10 +6949,24 @@ function OSListView({
     setCustomerSearch('');
     setSelectedCustomerId('');
     setNewOSTechnicianId('');
+    setNewOSEquipmentTypeId('');
+    setNewOSEquipment('');
+    setNewOSBrand('');
+    setNewOSModel('');
+    setNewItemDesc('');
+    setNewItemPrice('0');
+    setNewItemQty('1');
+    setNewItemType('Produto');
+    setNewItemExecTimeValue('1');
+    setNewItemExecTimeUnit('Horas');
     
     // Open Print Selection Dialog
     setLastCreatedOS(newOS);
     setShowPostSavePrintDialog(true);
+
+    if (overloadEnabled && (extraDiagDays > 0 || extraCompDays > 0)) {
+      toast.info(`Acúmulo detectado em ${equipment}: prazo ajustado (+${extraDiagDays}d diag / +${extraCompDays}d conclusão).`);
+    }
   };
 
   const handleShareLink = (os: ServiceOrder) => {
@@ -5944,6 +6974,140 @@ function OSListView({
     const url = `https://wa.me/?text=${encodeURIComponent(text)}`;
     window.open(url, '_blank');
     toast.success('Link de acompanhamento gerado!');
+  };
+
+  const captureElementAsPngDataUrl = async (element: HTMLElement) => {
+    const canvas = await html2canvas(element, {
+      scale: 2,
+      useCORS: true,
+      backgroundColor: '#ffffff',
+      windowWidth: element.scrollWidth,
+      windowHeight: element.scrollHeight,
+    });
+    return canvas.toDataURL('image/png');
+  };
+
+  const buildEntryLabelDataUrl = (os: ServiceOrder) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 900;
+    canvas.height = 560;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return '';
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = '#111111';
+    ctx.lineWidth = 4;
+    ctx.strokeRect(8, 8, canvas.width - 16, canvas.height - 16);
+
+    ctx.fillStyle = '#111111';
+    ctx.font = 'bold 52px Arial';
+    ctx.fillText(os.number, 32, 74);
+
+    ctx.font = 'bold 28px Arial';
+    ctx.fillText('CLIENTE', 32, 124);
+    ctx.font = '26px Arial';
+    ctx.fillText(String(os.customerName || '-').slice(0, 52), 32, 162);
+
+    ctx.font = 'bold 28px Arial';
+    ctx.fillText('EQUIPAMENTO', 32, 220);
+    ctx.font = '26px Arial';
+    ctx.fillText(String(os.equipment || '-').slice(0, 52), 32, 258);
+
+    ctx.font = 'bold 24px Arial';
+    ctx.fillText('MARCA/MODELO', 32, 312);
+    ctx.font = '22px Arial';
+    ctx.fillText(`${os.brand || '-'} ${os.model || ''}`.trim().slice(0, 58), 32, 346);
+
+    ctx.font = 'bold 22px Arial';
+    ctx.fillText(`ENTRADA: ${format(new Date(os.createdAt), 'dd/MM/yyyy HH:mm')}`, 32, 404);
+    ctx.fillText(`STATUS: ${os.status}`, 32, 444);
+    ctx.font = '20px Arial';
+    ctx.fillText('TechManager', 32, 510);
+
+    return canvas.toDataURL('image/png');
+  };
+
+  const handleDirectPrintJobs = async () => {
+    if (!lastCreatedOS) {
+      toast.error('Não foi possível localizar a OS criada.');
+      return;
+    }
+
+    const hasSelectedPrint = printCheckboxes.label || printCheckboxes.entry || printCheckboxes.warranty;
+    if (!hasSelectedPrint) {
+      toast.error('Selecione pelo menos uma impressão.');
+      return;
+    }
+
+    if (printCheckboxes.label && !directPrintTargets.label) {
+      toast.error('Selecione a impressora da Etiqueta de Entrada.');
+      return;
+    }
+    if (printCheckboxes.entry && !directPrintTargets.entry) {
+      toast.error('Selecione a impressora do Comprovante de Entrada.');
+      return;
+    }
+    if (printCheckboxes.warranty && !directPrintTargets.warranty) {
+      toast.error('Selecione a impressora do Termo de Garantia.');
+      return;
+    }
+
+    try {
+      setIsDirectPrinting(true);
+      const jobs: Array<{ printerName: string; documentName: string; dataUrl: string }> = [];
+
+      if (printCheckboxes.label) {
+        const labelDataUrl = buildEntryLabelDataUrl(lastCreatedOS);
+        if (labelDataUrl) {
+          jobs.push({
+            printerName: directPrintTargets.label,
+            documentName: `${lastCreatedOS.number}-etiqueta`,
+            dataUrl: labelDataUrl,
+          });
+        }
+      }
+
+      if ((printCheckboxes.entry || printCheckboxes.warranty) && directA4PrintRef.current) {
+        const a4DataUrl = await captureElementAsPngDataUrl(directA4PrintRef.current);
+        if (printCheckboxes.entry) {
+          jobs.push({
+            printerName: directPrintTargets.entry,
+            documentName: `${lastCreatedOS.number}-comprovante`,
+            dataUrl: a4DataUrl,
+          });
+        }
+        if (printCheckboxes.warranty) {
+          jobs.push({
+            printerName: directPrintTargets.warranty,
+            documentName: `${lastCreatedOS.number}-garantia`,
+            dataUrl: a4DataUrl,
+          });
+        }
+      }
+
+      if (jobs.length === 0) {
+        toast.error('Não foi possível montar os arquivos de impressão.');
+        return;
+      }
+
+      const response = await axios.post('/api/system/print-jobs', { jobs });
+      const results = Array.isArray(response.data?.results) ? response.data.results : [];
+      const successCount = results.filter((item: any) => item?.success).length;
+      const failureCount = results.length - successCount;
+
+      if (failureCount === 0) {
+        toast.success(`Impressão direta enviada (${successCount} job${successCount > 1 ? 's' : ''}).`);
+      } else {
+        toast.error(`Algumas impressões falharam (${failureCount}). Verifique as impressoras.`);
+      }
+      setShowPostSavePrintDialog(false);
+    } catch (error: any) {
+      const message = error?.response?.data?.error || 'Falha ao enviar impressão direta.';
+      toast.error(message);
+    } finally {
+      setIsDirectPrinting(false);
+    }
   };
 
   const handleDeleteOS = (id: string) => {
@@ -5965,6 +7129,7 @@ function OSListView({
   };
 
   const resetQuickCustomer = () => {
+    lastQuickCustomerCepLookupRef.current = '';
     setQuickCustomer({
       name: '',
       doc: '',
@@ -5981,12 +7146,10 @@ function OSListView({
     });
   };
 
-  const handleLookupQuickCustomerCep = async () => {
-    const cep = onlyDigits(quickCustomer.zip || '');
-    if (cep.length !== 8) {
-      toast.error('Digite um CEP válido com 8 dígitos.');
-      return;
-    }
+  const handleLookupQuickCustomerCep = async (rawCep: string) => {
+    const cep = onlyDigits(rawCep || '');
+    if (cep.length !== 8) return;
+    if (lastQuickCustomerCepLookupRef.current === cep) return;
 
     try {
       setIsQuickCustomerCepLookupLoading(true);
@@ -5999,7 +7162,7 @@ function OSListView({
         city: data.city || prev.city,
         state: (data.state || prev.state || 'SP').toUpperCase().slice(0, 2),
       }));
-      toast.success('Endereço preenchido via CEP.');
+      lastQuickCustomerCepLookupRef.current = cep;
     } catch {
       toast.error('Não foi possível consultar este CEP na BrasilAPI.');
     } finally {
@@ -6036,6 +7199,10 @@ function OSListView({
     resetQuickCustomer();
     toast.success('Cliente cadastrado e selecionado!');
   };
+
+  const lastCreatedCustomerRecord = lastCreatedOS
+    ? (globalCustomers.find((c) => c.id === lastCreatedOS.customerId) as any)
+    : null;
 
   return (
     <div className="space-y-6">
@@ -6076,7 +7243,6 @@ function OSListView({
                         onChange={(e) => {
                           setCustomerSearch(e.target.value);
                           setSelectedCustomerId('');
-                          setShowCustomerResults(true);
                         }}
                         onFocus={() => setShowCustomerResults(true)}
                       />
@@ -6097,37 +7263,24 @@ function OSListView({
                           ))}
                         </div>
                       )}
-                      {showCustomerResults && customerSearch && filteredCustomers.length === 0 && (
-                        <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg">
-                          <div className="px-3 py-2 text-xs text-muted-foreground">
-                            Não existe cliente cadastrado com esse nome.
-                          </div>
+                      {showCustomerResults && customerSearch.trim() && filteredCustomers.length === 0 && (
+                        <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg p-3">
+                          <p className="text-sm font-medium text-rose-600">Este cliente não existe no cadastro.</p>
+                          <p className="text-xs text-muted-foreground mt-1">Clique no botão + para cadastrar este nome.</p>
                         </div>
                       )}
                     </div>
-                    <Dialog
-                      open={isNewCustomerOpen}
-                      onOpenChange={(open) => {
-                        setIsNewCustomerOpen(open);
-                        if (open) {
-                          setQuickCustomer((prev) => ({
-                            ...prev,
-                            name: (customerSearch || '').trim() || prev.name,
-                          }));
-                        }
-                      }}
-                    >
+                    <Dialog open={isNewCustomerOpen} onOpenChange={setIsNewCustomerOpen}>
                       <DialogTrigger render={
                         <Button
                           variant="outline"
                           size="icon"
                           title="Adicionar Novo Cliente"
-                          onClick={() =>
-                            setQuickCustomer((prev) => ({
-                              ...prev,
-                              name: (customerSearch || '').trim() || prev.name,
-                            }))
-                          }
+                          onClick={() => {
+                            const typedName = customerSearch.trim();
+                            if (!typedName) return;
+                            setQuickCustomer((prev) => ({ ...prev, name: typedName }));
+                          }}
                         >
                           <Plus className="w-4 h-4" />
                         </Button>
@@ -6185,26 +7338,22 @@ function OSListView({
                           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t">
                             <div className="space-y-2">
                               <Label>CEP</Label>
-                              <div className="flex gap-2">
-                                <Input
-                                  placeholder="00000-000"
-                                  value={quickCustomer.zip}
-                                  onChange={(e) => setQuickCustomer({ ...quickCustomer, zip: formatCep(e.target.value) })}
-                                  onBlur={() => {
-                                    if (onlyDigits(quickCustomer.zip).length === 8) {
-                                      handleLookupQuickCustomerCep();
-                                    }
-                                  }}
-                                />
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  onClick={handleLookupQuickCustomerCep}
-                                  disabled={isQuickCustomerCepLookupLoading}
-                                >
-                                  {isQuickCustomerCepLookupLoading ? 'Buscando...' : 'Buscar'}
-                                </Button>
-                              </div>
+                              <Input
+                                placeholder="00000-000"
+                                value={quickCustomer.zip}
+                                onChange={(e) => {
+                                  const formattedCep = formatCep(e.target.value);
+                                  setQuickCustomer((prev) => ({ ...prev, zip: formattedCep }));
+                                  const cepDigits = onlyDigits(formattedCep);
+                                  if (cepDigits.length === 8) {
+                                    handleLookupQuickCustomerCep(cepDigits);
+                                  }
+                                }}
+                                onBlur={() => handleLookupQuickCustomerCep(quickCustomer.zip)}
+                              />
+                              {isQuickCustomerCepLookupLoading && (
+                                <p className="text-[10px] text-muted-foreground">Consultando CEP...</p>
+                              )}
                             </div>
                             <div className="md:col-span-2 space-y-2">
                               <Label>Logradouro</Label>
@@ -6250,14 +7399,16 @@ function OSListView({
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="equipamento">Equipamento</Label>
-                  <Select name="equipmentType" onValueChange={(val) => {
+                  <Label>Equipamento</Label>
+                  <Select name="equipmentType" value={newOSEquipmentTypeId} onValueChange={(val) => {
+                    setNewOSEquipmentTypeId(val);
                     const eqType = equipmentTypes.find(e => e.id === val);
-                    const equipmentInput = document.getElementById('equipamento') as HTMLInputElement;
-                    if(equipmentInput) equipmentInput.value = (eqType?.name || '').toUpperCase();
+                    setNewOSEquipment((eqType?.name || '').toUpperCase());
                   }}>
                     <SelectTrigger className="h-10 text-xs w-full">
-                      <SelectValue placeholder="SELECIONE O TIPO..." />
+                      <span className="truncate">
+                        {equipmentTypes.find((e) => e.id === newOSEquipmentTypeId)?.name.toUpperCase() || 'SELECIONE O TIPO...'}
+                      </span>
                     </SelectTrigger>
                     <SelectContent>
                       {equipmentTypes.map(eq => (
@@ -6265,7 +7416,6 @@ function OSListView({
                       ))}
                     </SelectContent>
                   </Select>
-                  <Input id="equipamento" name="equipment" placeholder="DESCRIÇÃO (EX: IPHONE 13)" required className="uppercase" onInput={(e) => e.currentTarget.value = e.currentTarget.value.toUpperCase()} />
                 </div>
                 <div className="space-y-2">
                   <Label className="uppercase text-[10px] font-bold">Técnico Responsável</Label>
@@ -6285,7 +7435,21 @@ function OSListView({
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="marca" className="uppercase text-[10px] font-bold">Marca</Label>
-                  <Input id="marca" name="brand" placeholder="EX: APPLE" required className="uppercase" onInput={(e) => e.currentTarget.value = e.currentTarget.value.toUpperCase()} />
+                  <Input
+                    id="marca"
+                    name="brand"
+                    list="os-brand-suggestions"
+                    placeholder="EX: APPLE"
+                    required
+                    className="uppercase"
+                    value={newOSBrand}
+                    onChange={(e) => setNewOSBrand(e.target.value.toUpperCase())}
+                  />
+                  <datalist id="os-brand-suggestions">
+                    {brandSuggestions.map((brand) => (
+                      <option key={brand} value={brand} />
+                    ))}
+                  </datalist>
                 </div>
                 <div className="space-y-2">
                   <Label className="uppercase text-[10px] font-bold">Prioridade</Label>
@@ -6305,7 +7469,21 @@ function OSListView({
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="modelo" className="uppercase text-[10px] font-bold">Modelo</Label>
-                  <Input id="modelo" name="model" placeholder="EX: PRO MAX" required className="uppercase" onInput={(e) => e.currentTarget.value = e.currentTarget.value.toUpperCase()} />
+                  <Input
+                    id="modelo"
+                    name="model"
+                    list="os-model-suggestions"
+                    placeholder="EX: PRO MAX"
+                    required
+                    className="uppercase"
+                    value={newOSModel}
+                    onChange={(e) => setNewOSModel(e.target.value.toUpperCase())}
+                  />
+                  <datalist id="os-model-suggestions">
+                    {modelSuggestions.map((model) => (
+                      <option key={model} value={model} />
+                    ))}
+                  </datalist>
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="serial" className="uppercase text-[10px] font-bold">Nº de Série / IMEI</Label>
@@ -6352,23 +7530,54 @@ function OSListView({
                   </div>
                 </div>
                 <div className="grid grid-cols-12 gap-2">
-                  <div className="col-span-5">
+                  <div className="col-span-3">
+                    <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Tipo de operação</Label>
+                    <Select value={newItemType} onValueChange={(v: any) => {
+                      setNewItemType(v);
+                      if (v === 'Produto') {
+                        setNewItemExecTimeValue('1');
+                        setNewItemExecTimeUnit('Horas');
+                      }
+                    }}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="Produto">Produto</SelectItem>
+                        <SelectItem value="Serviço">Serviço</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="col-span-4 relative">
+                    <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Descrição</Label>
                     <Input 
                       placeholder="Descrição..." 
                       value={newItemDesc} 
                       onChange={(e) => setNewItemDesc(e.target.value)} 
+                      onFocus={() => setIsServiceSuggestionOpen(true)}
+                      onBlur={() => setTimeout(() => setIsServiceSuggestionOpen(false), 120)}
                     />
+                    {isServiceSuggestionOpen && serviceSuggestions.length > 0 && (
+                      <div className="absolute z-50 mt-1 w-full rounded-md border bg-white shadow-lg max-h-44 overflow-y-auto">
+                        {serviceSuggestions.map((suggestion) => (
+                          <button
+                            key={suggestion.description}
+                            type="button"
+                            className="w-full px-3 py-2 text-left hover:bg-secondary/40 text-xs"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => {
+                              setNewItemDesc(suggestion.description.toUpperCase());
+                              setNewItemPrice(String(suggestion.unitPrice || 0));
+                              setIsServiceSuggestionOpen(false);
+                            }}
+                          >
+                            <span className="font-semibold">{suggestion.description}</span>
+                            <span className="ml-2 text-muted-foreground">R$ {(suggestion.unitPrice || 0).toFixed(2)}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div className="col-span-2">
-                    <Select value={newItemType} onValueChange={(v: any) => setNewItemType(v)}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="Produto">Prod.</SelectItem>
-                        <SelectItem value="Serviço">Serv.</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="col-span-2">
+                    <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Qtd</Label>
                     <Input 
                       type="number" 
                       placeholder="Qtd" 
@@ -6377,6 +7586,7 @@ function OSListView({
                     />
                   </div>
                   <div className="col-span-2">
+                    <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Valor (R$)</Label>
                     <Input 
                       type="number" 
                       placeholder="Valor" 
@@ -6388,6 +7598,33 @@ function OSListView({
                     <Button type="button" size="icon" onClick={addItem}><Plus className="w-4 h-4" /></Button>
                   </div>
                 </div>
+                {newItemType === 'Serviço' && (
+                  <div className="grid grid-cols-12 gap-2">
+                    <div className="col-span-6">
+                      <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Prazo de execução</Label>
+                      <Input
+                        type="number"
+                        min="0"
+                        placeholder="Quantidade"
+                        value={newItemExecTimeValue}
+                        onChange={(e) => setNewItemExecTimeValue(e.target.value)}
+                      />
+                    </div>
+                    <div className="col-span-3">
+                      <Label className="text-[10px] uppercase font-bold text-muted-foreground mb-1 block">Unidade</Label>
+                      <Select value={newItemExecTimeUnit} onValueChange={(v: any) => setNewItemExecTimeUnit(v)}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="Horas">Horas</SelectItem>
+                          <SelectItem value="Dias">Dias</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                )}
+                <p className="text-[10px] text-muted-foreground">
+                  Digite descrição, marca e modelo para buscar serviços já usados nesse equipamento. Ao selecionar uma sugestão, o valor é preenchido automaticamente.
+                </p>
 
                 <div className="space-y-2">
                   {newOsItems.map(item => (
@@ -6395,6 +7632,9 @@ function OSListView({
                       <div className="flex-1">
                         <span className="font-bold">[{item.type}]</span> {item.description}
                         <p className="text-muted-foreground">{item.quantity}x R$ {item.unitPrice.toFixed(2)}</p>
+                        {item.type === 'Serviço' && item.executionTimeValue && item.executionTimeUnit && (
+                          <p className="text-[10px] text-muted-foreground">Prazo: {item.executionTimeValue} {item.executionTimeUnit}</p>
+                        )}
                       </div>
                       <div className="flex items-center gap-3">
                         <span className="font-bold">R$ {item.totalPrice.toFixed(2)}</span>
@@ -6440,12 +7680,12 @@ function OSListView({
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label className="uppercase text-[10px] font-bold">Status Inicial</Label>
-                  <Select name="status" defaultValue="Aberta">
+                  <Select name="status" defaultValue={orderedStatusColumns[0] || 'Aberta'}>
                     <SelectTrigger className="h-10 text-xs text-left w-full uppercase">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {STATUS_COLUMNS.map(status => (
+                      {orderedStatusColumns.map(status => (
                         <SelectItem key={status} value={status}>{status.toUpperCase()}</SelectItem>
                       ))}
                     </SelectContent>
@@ -6482,35 +7722,80 @@ function OSListView({
     </div>
 
     <div className="flex flex-col md:flex-row gap-4">
-      <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input 
-            placeholder="Filtrar por cliente, equipamento ou número..." 
-            className="pl-9" 
-            value={osSearch}
-            onChange={(e) => setOsSearch(e.target.value)}
-          />
-        </div>
-        <div className="flex gap-2">
-          <Select value={statusFilter} onValueChange={setStatusFilter}>
-            <SelectTrigger className="w-[180px]">
-              <div className="flex items-center gap-2">
-                <Filter className="w-4 h-4" />
-                <span>{statusFilter === 'todos' ? 'Todos Status' : statusFilter}</span>
-              </div>
+      <div className="flex flex-1 gap-2">
+        <Select
+          value={filterField}
+          onValueChange={(value) => {
+            const nextField = value as typeof filterField;
+            setFilterField(nextField);
+            setFilterQuery('');
+            if (nextField === 'status') {
+              setStatusFilter('todos');
+            }
+          }}
+        >
+          <SelectTrigger className="w-[180px]">
+            <div className="flex items-center gap-2">
+              <Filter className="w-4 h-4" />
+              <span>
+                {filterField === 'status' ? 'Status' :
+                filterField === 'nome' ? 'Nome' :
+                filterField === 'data' ? 'Data' :
+                filterField === 'os' ? 'O.S.' :
+                filterField === 'equipamento' ? 'Equipamento' :
+                filterField === 'marca' ? 'Marca' : 'Modelo'}
+              </span>
+            </div>
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="status">Status</SelectItem>
+            <SelectItem value="nome">Nome</SelectItem>
+            <SelectItem value="data">Data</SelectItem>
+            <SelectItem value="os">O.S.</SelectItem>
+            <SelectItem value="equipamento">Equipamento</SelectItem>
+            <SelectItem value="marca">Marca</SelectItem>
+            <SelectItem value="modelo">Modelo</SelectItem>
+          </SelectContent>
+        </Select>
+
+        {filterField === 'status' ? (
+          <Select value={statusFilter} onValueChange={(value) => setStatusFilter(value || 'todos')}>
+            <SelectTrigger className="flex-1 min-w-[180px]">
+              <span>{statusFilter === 'todos' ? 'Todos Status' : statusFilter}</span>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="todos">Todos Status</SelectItem>
-              {STATUS_COLUMNS.map(status => (
+              {orderedStatusColumns.map(status => (
                 <SelectItem key={status} value={status}>{status}</SelectItem>
               ))}
             </SelectContent>
           </Select>
-          <Button variant="outline" className="gap-2" onClick={() => window.print()}>
-            <Printer className="w-4 h-4" /> Imprimir Lista
-          </Button>
-        </div>
+        ) : (
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              type={filterField === 'data' ? 'date' : 'text'}
+              placeholder={
+                filterField === 'nome' ? 'Filtrar por nome...' :
+                filterField === 'data' ? 'Selecionar data...' :
+                filterField === 'os' ? 'Filtrar por O.S...' :
+                filterField === 'equipamento' ? 'Filtrar por equipamento...' :
+                filterField === 'marca' ? 'Filtrar por marca...' :
+                'Filtrar por modelo...'
+              }
+              className={cn('pl-9', filterField === 'data' && 'pl-3')}
+              value={filterQuery}
+              onChange={(e) => setFilterQuery(e.target.value)}
+            />
+          </div>
+        )}
       </div>
+      <div className="flex gap-2">
+        <Button variant="outline" className="gap-2" onClick={() => window.print()}>
+          <Printer className="w-4 h-4" /> Imprimir Lista
+        </Button>
+      </div>
+    </div>
 
       <Card className="border-none shadow-sm overflow-hidden">
         <div className="overflow-x-auto">
@@ -6598,28 +7883,20 @@ function OSListView({
                       </div>
                     </td>
                     <td className={cn("px-6 py-4 text-xs", getDeadlineColor(os.diagnosisDeadline))}>
-                      {(() => {
-                        const deadline = formatDeadlineCell(os.diagnosisDeadline);
-                        if (!deadline) return '-';
-                        return (
-                          <div className="leading-tight">
-                            <p className="font-bold">{deadline.primary}</p>
-                            <p className="text-[10px] text-muted-foreground">{deadline.secondary}</p>
-                          </div>
-                        );
-                      })()}
+                      <div className="flex flex-col leading-tight">
+                        <span>{formatOrderDeadlineLabel(os.diagnosisDeadline)}</span>
+                        <span className="text-[10px] text-muted-foreground font-medium mt-1">
+                          {formatOrderDeadlineWeekday(os.diagnosisDeadline)}
+                        </span>
+                      </div>
                     </td>
                     <td className={cn("px-6 py-4 text-xs", getDeadlineColor(os.completionDeadline))}>
-                      {(() => {
-                        const deadline = formatDeadlineCell(os.completionDeadline);
-                        if (!deadline) return '-';
-                        return (
-                          <div className="leading-tight">
-                            <p className="font-bold">{deadline.primary}</p>
-                            <p className="text-[10px] text-muted-foreground">{deadline.secondary}</p>
-                          </div>
-                        );
-                      })()}
+                      <div className="flex flex-col leading-tight">
+                        <span>{formatOrderDeadlineLabel(os.completionDeadline)}</span>
+                        <span className="text-[10px] text-muted-foreground font-medium mt-1">
+                          {formatOrderDeadlineWeekday(os.completionDeadline)}
+                        </span>
+                      </div>
                     </td>
                     <td className="px-6 py-4 text-right font-semibold">
                       R$ {os.value.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
@@ -6646,10 +7923,71 @@ function OSListView({
                         size="icon" 
                         className="h-8 w-8 text-primary"
                         onClick={() => onViewOS(os.id)}
-                        title="Ver Detalhes / Gerenciar O.S"
+                        title="Ver detalhes"
                       >
                         <Eye className="w-4 h-4" />
                       </Button>
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-8 w-8"
+                        onClick={() => onViewOS(os.id)}
+                        title="Editar"
+                      >
+                        <Edit className="w-4 h-4" />
+                      </Button>
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-8 w-8"
+                        onClick={() => handleA4Print(os)}
+                        title="Imprimir A4"
+                      >
+                        <Printer className="w-4 h-4" />
+                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="icon" className="h-8 w-8" title="Alterar status">
+                            <RefreshCw className="w-4 h-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {orderedStatusColumns.map((status) => (
+                            <DropdownMenuItem key={status} onClick={() => handleStatusChange(os.id, status as OSStatus)}>
+                              {status}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-amber-600"
+                        onClick={() => handleStatusChange(os.id, 'Cancelada')}
+                        title="Cancelar"
+                      >
+                        <XCircle className="w-4 h-4" />
+                      </Button>
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-8 w-8"
+                        onClick={() => handleA4Pdf(os)}
+                        title="Baixar PDF"
+                      >
+                        <FileDown className="w-4 h-4" />
+                      </Button>
+                      {(user?.role === 'ADMIN-USER' || user?.role === 'ADMIN-SAAS') && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 text-rose-500"
+                          onClick={() => handleDeleteOrder(os.id)}
+                          title="Apagar"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </Button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -6666,11 +8004,44 @@ function OSListView({
         </div>
       </Card>
 
+      <Dialog open={isCancelDialogOpen} onOpenChange={(open) => {
+        setIsCancelDialogOpen(open);
+        if (!open) {
+          setCancelReason('');
+          setCancelTargetId(null);
+          setIsRejectionDialog(false);
+        }
+      }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{isRejectionDialog ? 'Reprovar Orçamento' : 'Cancelar Ordem de Serviço'}</DialogTitle>
+            <DialogDescription>{isRejectionDialog ? 'Informe o motivo da reprovação para análise e estatísticas.' : 'Informe o motivo do cancelamento para análise no dashboard.'}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Label>{isRejectionDialog ? 'Motivo da Reprovação' : 'Motivo do Cancelamento'}</Label>
+            <textarea
+              className="flex min-h-[90px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              placeholder={isRejectionDialog ? 'Descreva o motivo da reprovação...' : 'Descreva o motivo do cancelamento...'}
+              value={cancelReason}
+              onChange={(e) => setCancelReason(e.target.value)}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setIsCancelDialogOpen(false)}>Voltar</Button>
+            <Button variant="destructive" onClick={confirmCancel}>{isRejectionDialog ? 'Confirmar Reprovação' : 'Confirmar Cancelamento'}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {selectedOSForA4Print && (
         <OSPrintView 
           os={selectedOSForA4Print} 
-          onClose={() => setSelectedOSForA4Print(null)} 
+          onClose={() => {
+            setSelectedOSForA4Print(null);
+            setSelectedOSForA4Action(null);
+          }} 
           company={company}
+          autoAction={selectedOSForA4Action}
         />
       )}
 
@@ -6794,6 +8165,27 @@ function OSListView({
                 {printCheckboxes.label && <Check className="w-4 h-4 text-white" strokeWidth={4} />}
               </div>
             </div>
+            {printCheckboxes.label && (
+              <div className="space-y-1">
+                <Label className="text-[10px] uppercase font-bold text-muted-foreground">Impressora da Etiqueta</Label>
+                <Select
+                  value={directPrintTargets.label}
+                  onValueChange={(value) => setDirectPrintTargets((prev) => ({ ...prev, label: value }))}
+                >
+                  <SelectTrigger className="h-9 text-xs">
+                    <SelectValue placeholder={isLoadingPrinters ? 'Carregando impressoras...' : 'Selecione a impressora'} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availablePrinters.map((printer) => (
+                      <SelectItem key={printer} value={printer}>{printer}</SelectItem>
+                    ))}
+                    {!isLoadingPrinters && availablePrinters.length === 0 && (
+                      <SelectItem value="none" disabled>Nenhuma impressora encontrada</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
 
             <div 
               className={cn(
@@ -6821,6 +8213,27 @@ function OSListView({
                 {printCheckboxes.entry && <Check className="w-4 h-4 text-white" strokeWidth={4} />}
               </div>
             </div>
+            {printCheckboxes.entry && (
+              <div className="space-y-1">
+                <Label className="text-[10px] uppercase font-bold text-muted-foreground">Impressora do Comprovante</Label>
+                <Select
+                  value={directPrintTargets.entry}
+                  onValueChange={(value) => setDirectPrintTargets((prev) => ({ ...prev, entry: value }))}
+                >
+                  <SelectTrigger className="h-9 text-xs">
+                    <SelectValue placeholder={isLoadingPrinters ? 'Carregando impressoras...' : 'Selecione a impressora'} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availablePrinters.map((printer) => (
+                      <SelectItem key={printer} value={printer}>{printer}</SelectItem>
+                    ))}
+                    {!isLoadingPrinters && availablePrinters.length === 0 && (
+                      <SelectItem value="none" disabled>Nenhuma impressora encontrada</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
 
             <div 
               className={cn(
@@ -6848,41 +8261,54 @@ function OSListView({
                 {printCheckboxes.warranty && <Check className="w-4 h-4 text-white" strokeWidth={4} />}
               </div>
             </div>
+            {printCheckboxes.warranty && (
+              <div className="space-y-1">
+                <Label className="text-[10px] uppercase font-bold text-muted-foreground">Impressora do Termo</Label>
+                <Select
+                  value={directPrintTargets.warranty}
+                  onValueChange={(value) => setDirectPrintTargets((prev) => ({ ...prev, warranty: value }))}
+                >
+                  <SelectTrigger className="h-9 text-xs">
+                    <SelectValue placeholder={isLoadingPrinters ? 'Carregando impressoras...' : 'Selecione a impressora'} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availablePrinters.map((printer) => (
+                      <SelectItem key={printer} value={printer}>{printer}</SelectItem>
+                    ))}
+                    {!isLoadingPrinters && availablePrinters.length === 0 && (
+                      <SelectItem value="none" disabled>Nenhuma impressora encontrada</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
 
             <div className="flex gap-3 pt-6">
               <Button variant="ghost" className="flex-1 h-12 font-bold uppercase" onClick={() => setShowPostSavePrintDialog(false)}>
                 Sair sem imprimir
               </Button>
               <Button 
-                className="flex-1 h-12 font-black bg-emerald-600 hover:bg-emerald-700 gap-2 shadow-lg shadow-emerald-200" 
-                onClick={() => {
-                  setShowPostSavePrintDialog(false);
-                  if (!lastCreatedOS) {
-                    toast.error('Nao foi possivel localizar a OS criada.');
-                    return;
-                  }
-
-                  const hasSelectedPrint = printCheckboxes.label || printCheckboxes.entry || printCheckboxes.warranty;
-                  if (!hasSelectedPrint) {
-                    toast.error('Selecione pelo menos uma impressao.');
-                    return;
-                  }
-
-                  toast.success('Gerando impressões selecionadas...');
-                  if (printCheckboxes.label) {
-                    handleEntryLabelPrint(lastCreatedOS);
-                  }
-                  if (printCheckboxes.entry || printCheckboxes.warranty) {
-                    setSelectedOSForA4Print(lastCreatedOS);
-                  }
-                }}
+                className="flex-1 h-12 font-black bg-emerald-600 hover:bg-emerald-700 gap-2 shadow-lg shadow-emerald-200"
+                disabled={isDirectPrinting || isLoadingPrinters}
+                onClick={handleDirectPrintJobs}
               >
-                <Printer className="w-5 h-5" strokeWidth={3} /> IMPRIMIR SELECIONADOS
+                <Printer className="w-5 h-5" strokeWidth={3} /> {isDirectPrinting ? 'ENVIANDO...' : 'IMPRIMIR DIRETO'}
               </Button>
             </div>
           </div>
         </DialogContent>
       </Dialog>
+
+      {lastCreatedOS && (
+        <div className="sr-only" aria-hidden="true">
+          <OSPrintContentForRef
+            ref={directA4PrintRef}
+            os={lastCreatedOS}
+            company={company}
+            customer={lastCreatedCustomerRecord as Customer}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -7945,6 +9371,9 @@ function StockView({
                   <div className="space-y-4">
                     <div className="space-y-2">
                       <Label>Imagem do Produto</Label>
+                      <p className="text-[10px] text-muted-foreground">
+                        Campo opcional. Essa imagem ajuda a identificar o produto na venda, estoque e impressão.
+                      </p>
                       <div 
                         className="border-2 border-dashed rounded-xl h-48 flex flex-col items-center justify-center gap-2 bg-secondary/20 hover:bg-secondary/30 transition-colors cursor-pointer relative overflow-hidden group"
                         onClick={() => document.getElementById('product-image-upload')?.click()}
@@ -10057,197 +11486,6 @@ function UserManagementView({
   );
 }
 
-function ExchangesAndReturnsView({
-  tickets,
-  setTickets,
-  salesHistory,
-  financeTransactions,
-}: {
-  tickets: any[];
-  setTickets: React.Dispatch<React.SetStateAction<any[]>>;
-  salesHistory: any[];
-  financeTransactions: any[];
-}) {
-  const todayKey = format(new Date(), 'yyyy-MM-dd');
-  const [originFilter, setOriginFilter] = useState<'todos' | 'venda' | 'os'>('os');
-
-  const getTicketOrigin = (ticket: any) => (ticket.sourceType === 'OS' || ticket.osId ? 'os' : 'venda');
-  const filteredTickets = tickets.filter((ticket) => originFilter === 'todos' || getTicketOrigin(ticket) === originFilter);
-
-  const markFiscalEntryAsIssued = (ticketId: string) => {
-    setTickets((prev) =>
-      prev.map((ticket) =>
-        ticket.id === ticketId
-          ? {
-              ...ticket,
-              fiscalEntryNoteStatus: 'Emitida',
-              fiscalEntryNoteIssuedAt: new Date().toISOString(),
-            }
-          : ticket
-      )
-    );
-  };
-
-  const todayRefundTotal = financeTransactions
-    .filter((tx) => {
-      if (tx.type !== 'OUT') return false;
-      const dateText = String(tx.date || '');
-      const normalizedDate = dateText.includes('/') ? new Date(dateText.split('/').reverse().join('-')) : new Date(dateText);
-      return !Number.isNaN(normalizedDate.getTime()) && format(normalizedDate, 'yyyy-MM-dd') === todayKey;
-    })
-    .reduce((acc, tx) => acc + Math.abs(Number(tx.val) || 0), 0);
-
-  const totalRefunded = filteredTickets.reduce((acc, ticket) => acc + (Number(ticket.refundTotal) || 0), 0);
-  const partialReturns = salesHistory.filter((sale) => sale.status === 'Devolução Parcial').length;
-  const pendingFiscalNotes = filteredTickets.filter((ticket) => ticket.fiscalEntryNoteStatus === 'Pendente').length;
-
-  return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight">Trocas e Devoluções</h1>
-        <p className="text-muted-foreground">Fluxo auditável de devoluções, estornos e tickets de mercadoria por venda.</p>
-      </div>
-
-      <div className="grid gap-4 md:grid-cols-4">
-        <StatCard
-          title="Estornado Hoje"
-          value={`R$ ${todayRefundTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`}
-          icon={TrendingDown}
-          color="bg-rose-600"
-          description="Saídas de caixa do dia em devoluções/estornos."
-        />
-        <StatCard
-          title="Total Estornado"
-          value={`R$ ${totalRefunded.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`}
-          icon={RefreshCw}
-          color="bg-amber-600"
-          description="Valor acumulado de estornos vinculados às vendas."
-        />
-        <StatCard
-          title="Devoluções Parciais"
-          value={partialReturns.toString()}
-          icon={Scissors}
-          color="bg-indigo-600"
-          description="Vendas com estorno item a item (não total)."
-        />
-        <StatCard
-          title="NF Entrada Pendente"
-          value={pendingFiscalNotes.toString()}
-          icon={FileText}
-          color="bg-blue-600"
-          description="Tickets que exigem nota fiscal de devolução (entrada)."
-        />
-      </div>
-
-      <Card className="border-none shadow-sm">
-        <CardHeader>
-          <CardTitle>Tickets de Devolução de Mercadoria</CardTitle>
-          <CardDescription>Rastreabilidade completa entre venda original, estoque (revenda/avaria) e lançamento financeiro.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="mb-4 flex items-center gap-2">
-            <Label htmlFor="returns-origin-filter" className="text-xs text-muted-foreground">Origem</Label>
-            <select
-              id="returns-origin-filter"
-              value={originFilter}
-              onChange={(e) => setOriginFilter(e.target.value as 'todos' | 'venda' | 'os')}
-              className="h-9 rounded-md border bg-background px-3 text-sm"
-              title="Filtrar tickets por origem"
-            >
-              <option value="os">Apenas O.S</option>
-              <option value="venda">Apenas Venda (PDV)</option>
-              <option value="todos">Todos</option>
-            </select>
-            <Badge variant="outline" className="ml-auto">{filteredTickets.length} ticket(s)</Badge>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm text-left">
-              <thead className="bg-secondary/30 text-[10px] uppercase font-bold text-muted-foreground">
-                <tr>
-                  <th className="px-4 py-3">Ticket</th>
-                  <th className="px-4 py-3">Venda Original</th>
-                  <th className="px-4 py-3">Origem</th>
-                  <th className="px-4 py-3">Cliente</th>
-                  <th className="px-4 py-3">Itens</th>
-                  <th className="px-4 py-3 text-right">Estorno</th>
-                  <th className="px-4 py-3">Financeiro</th>
-                  <th className="px-4 py-3">NF Devolução</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {filteredTickets.length > 0 ? (
-                  filteredTickets.map((ticket) => (
-                    <tr key={ticket.id} className="hover:bg-secondary/10 transition-colors">
-                      <td className="px-4 py-3">
-                        <p className="font-bold">{ticket.id}</p>
-                        <p className="text-[10px] text-muted-foreground">{ticket.createdAt ? format(new Date(ticket.createdAt), 'dd/MM/yyyy HH:mm') : '-'}</p>
-                      </td>
-                      <td className="px-4 py-3">
-                        <p className="font-medium">#{ticket.saleId || ticket.osId || '-'}</p>
-                        <p className="text-[10px] text-muted-foreground">{ticket.saleDate ? format(new Date(ticket.saleDate), 'dd/MM/yyyy') : '-'}</p>
-                      </td>
-                      <td className="px-4 py-3">
-                        <Badge variant={getTicketOrigin(ticket) === 'os' ? 'outline' : 'secondary'} className="text-[10px]">
-                          {getTicketOrigin(ticket) === 'os' ? 'O.S' : 'Venda'}
-                        </Badge>
-                      </td>
-                      <td className="px-4 py-3">{ticket.customer || '-'}</td>
-                      <td className="px-4 py-3">
-                        <div className="space-y-1">
-                          {(ticket.items || []).slice(0, 3).map((item: any, idx: number) => (
-                            <p key={idx} className="text-[11px]">
-                              {item.quantity}x {item.name} <span className="text-muted-foreground">({item.destination === 'avaria' ? 'avaria' : 'revenda'})</span>
-                            </p>
-                          ))}
-                          {(ticket.items || []).length > 3 && (
-                            <p className="text-[10px] text-muted-foreground">+ {(ticket.items || []).length - 3} item(ns)</p>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-right font-black text-rose-600">
-                        R$ {(Number(ticket.refundTotal) || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
-                      </td>
-                      <td className="px-4 py-3">
-                        <Badge variant="outline" className="text-[10px]">
-                          {ticket.financialEntryId ? `Saída vinculada (${ticket.financialEntryId})` : 'Sem estorno financeiro'}
-                        </Badge>
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-2">
-                          <Badge variant={ticket.fiscalEntryNoteStatus === 'Pendente' ? 'warning' : 'success'}>
-                            {ticket.fiscalEntryNoteStatus || 'Não se aplica'}
-                          </Badge>
-                          {getTicketOrigin(ticket) === 'os' && ticket.fiscalEntryNoteStatus === 'Pendente' && (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-7 text-[11px]"
-                              onClick={() => markFiscalEntryAsIssued(ticket.id)}
-                            >
-                              Marcar Emitida
-                            </Button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td colSpan={8} className="px-4 py-10 text-center text-muted-foreground italic">
-                      Nenhum ticket de troca/devolução processado ainda.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
 function POSView({ 
   fiscalEnabled, 
   salesHistory, 
@@ -10255,7 +11493,6 @@ function POSView({
   allProducts, 
   setAllProducts, 
   setFinanceTransactions,
-  setReturnTickets,
   rmaHistory,
   setRmaHistory,
   globalCustomers,
@@ -10267,7 +11504,6 @@ function POSView({
   allProducts: any[], 
   setAllProducts: React.Dispatch<React.SetStateAction<any[]>>, 
   setFinanceTransactions: React.Dispatch<React.SetStateAction<any[]>>,
-  setReturnTickets: React.Dispatch<React.SetStateAction<any[]>>,
   rmaHistory: any[],
   setRmaHistory: React.Dispatch<React.SetStateAction<any[]>>,
   globalCustomers: any[],
@@ -10294,199 +11530,39 @@ function POSView({
   const [saleFilterCustomer, setSaleFilterCustomer] = useState('');
   const [saleFilterDate, setSaleFilterDate] = useState('');
 
-  const [isReturnModalOpen, setIsReturnModalOpen] = useState(false);
-  const [saleForReturn, setSaleForReturn] = useState<any | null>(null);
-  const [returnDraft, setReturnDraft] = useState<Record<string, {
-    quantity: number;
-    refund: boolean;
-    destination: 'revenda' | 'avaria';
-    itemType: 'Produto' | 'Serviço';
-  }>>({});
-  const [returnReason, setReturnReason] = useState('');
+  const handleReturn = (saleId: string, itemSku: string) => {
+    const sale = salesHistory.find(s => s.id === saleId);
+    if (!sale) return;
 
-  const buildSaleItemKey = (item: any, index: number) => `${item.sku || item.name || 'item'}::${index}`;
-
-  const openReturnModal = (sale: any) => {
-    const nextDraft: Record<string, {
-      quantity: number;
-      refund: boolean;
-      destination: 'revenda' | 'avaria';
-      itemType: 'Produto' | 'Serviço';
-    }> = {};
-
-    (sale.items || []).forEach((item: any, index: number) => {
-      const key = buildSaleItemKey(item, index);
-      const alreadyReturned = Number((sale.returnedItems || {})[key] || 0);
-      const remaining = Math.max(0, Number(item.quantity || 0) - alreadyReturned);
-      const itemType: 'Produto' | 'Serviço' = item.itemType === 'Serviço' ? 'Serviço' : 'Produto';
-      nextDraft[key] = {
-        quantity: remaining > 0 ? 0 : 0,
-        refund: itemType === 'Serviço' ? true : true,
-        destination: itemType === 'Produto' ? 'avaria' : 'revenda',
-        itemType,
-      };
-    });
-
-    setSaleForReturn(sale);
-    setReturnDraft(nextDraft);
-    setReturnReason('');
-    setIsReturnModalOpen(true);
-  };
-
-  const processItemizedReturn = () => {
-    if (!saleForReturn) return;
-
-    const selectedItems = (saleForReturn.items || [])
-      .map((item: any, index: number) => {
-        const key = buildSaleItemKey(item, index);
-        const draft = returnDraft[key];
-        const alreadyReturned = Number((saleForReturn.returnedItems || {})[key] || 0);
-        const maxQty = Math.max(0, Number(item.quantity || 0) - alreadyReturned);
-        const qty = Math.min(maxQty, Math.max(0, Number(draft?.quantity || 0)));
-        if (!draft || qty <= 0) return null;
-
-        const unitPrice = Number(item.price || 0);
-        return {
-          key,
-          sku: item.sku,
-          name: item.name,
-          quantity: qty,
-          unitPrice,
-          refundValue: draft.refund ? qty * unitPrice : 0,
-          refund: draft.refund,
-          destination: draft.destination,
-          itemType: draft.itemType,
-        };
-      })
-      .filter(Boolean) as Array<{
-        key: string;
-        sku: string;
-        name: string;
-        quantity: number;
-        unitPrice: number;
-        refundValue: number;
-        refund: boolean;
-        destination: 'revenda' | 'avaria';
-        itemType: 'Produto' | 'Serviço';
-      }>;
-
-    if (selectedItems.length === 0) {
-      toast.error('Selecione ao menos 1 item com quantidade para processar a devolução.');
-      return;
-    }
-
-    const refundTotal = selectedItems.reduce((acc, item) => acc + item.refundValue, 0);
-    const now = new Date();
-    const financialEntryId = refundTotal > 0 ? safeRandomUUID() : '';
-    const returnTicketId = `DEV-${format(now, 'yyyyMMdd')}-${safeRandomUUID().slice(0, 6)}`;
-
-    setAllProducts((prev) =>
-      prev.map((product) => {
-        const productEntries = selectedItems.filter((item) => item.itemType === 'Produto' && item.sku === product.sku);
-        if (productEntries.length === 0) return product;
-
-        const revendaQty = productEntries
-          .filter((item) => item.destination === 'revenda')
-          .reduce((acc, item) => acc + item.quantity, 0);
-        const avariaQty = productEntries
-          .filter((item) => item.destination === 'avaria')
-          .reduce((acc, item) => acc + item.quantity, 0);
-
-        return {
-          ...product,
-          stock: Number(product.stock || 0) + revendaQty,
-          stockDefective: Number(product.stockDefective || 0) + avariaQty,
-        };
-      })
-    );
-
-    if (refundTotal > 0) {
-      setFinanceTransactions((prev) => [
-        {
-          id: financialEntryId,
-          desc: `Estorno de devolução vinculado à venda #${saleForReturn.id}`,
-          val: -refundTotal,
-          type: 'OUT',
-          date: format(now, 'dd/MM/yyyy'),
-          status: 'Pago',
-          category: 'Saída por Devolução',
-          costCenter: 'Assistência Técnica',
-          linkedSaleId: saleForReturn.id,
-          linkedSaleDate: saleForReturn.date,
-          observation: `Venda original de ${format(new Date(saleForReturn.date), 'dd/MM/yyyy')} | Cliente: ${saleForReturn.customer}`,
-        },
-        ...prev,
-      ]);
-    }
-
-    const avariaItems = selectedItems.filter((item) => item.itemType === 'Produto' && item.destination === 'avaria');
-    if (avariaItems.length > 0) {
-      setRmaHistory((prev) => [
-        ...avariaItems.map((item) => ({
-          id: safeRandomUUID(),
-          product: item.name,
-          sku: item.sku,
-          reason: returnReason || 'Devolução com item avariado',
-          supplier: 'A definir',
-          status: 'Avaria',
-          date: format(now, 'dd/MM/yyyy'),
-          linkedSaleId: saleForReturn.id,
-        })),
-        ...prev,
-      ]);
-    }
-
-    setReturnTickets((prev) => [
-      {
-        id: returnTicketId,
-        saleId: saleForReturn.id,
-        saleDate: saleForReturn.date,
-        customer: saleForReturn.customer,
-        createdAt: now.toISOString(),
-        items: selectedItems,
-        refundTotal,
-        financialEntryId: financialEntryId || null,
-        financialCategory: 'Devoluções/Estornos',
-        costCenter: 'Assistência Técnica',
-        fiscalEntryNoteStatus: fiscalEnabled && selectedItems.some((item) => item.itemType === 'Produto') ? 'Pendente' : 'Não se aplica',
-        reason: returnReason || 'Sem observações adicionais',
+    toast.info('Processando devolução...');
+    
+    // 1. Stock Propagation: Incrementar estoque de volta
+    setAllProducts(prev => prev.map(p => {
+      if (p.sku === itemSku) {
+        return { ...p, stock: p.stock + 1 };
+      }
+      return p;
+    }));
+    toast.success(`Estoque: Item ${itemSku} retornado.`);
+    
+    // 2. Finance Propagation: Registrar estorno (saída)
+    setFinanceTransactions(prev => [
+      { 
+        id: Math.random().toString(36).substr(2, 9), 
+        desc: `Estorno Venda #${saleId}`, 
+        val: -sale.total, 
+        type: 'OUT', 
+        date: format(new Date(), 'dd/MM/yyyy'), 
+        status: 'Pago', 
+        category: 'Vendas de Produtos' 
       },
-      ...prev,
+      ...prev
     ]);
-
-    setSalesHistory((prev) =>
-      prev.map((sale) => {
-        if (sale.id !== saleForReturn.id) return sale;
-
-        const returnedItems = { ...(sale.returnedItems || {}) };
-        selectedItems.forEach((item) => {
-          returnedItems[item.key] = Number(returnedItems[item.key] || 0) + item.quantity;
-        });
-
-        const totalQty = (sale.items || []).reduce((acc: number, item: any) => acc + Number(item.quantity || 0), 0);
-        const returnedQty = (sale.items || []).reduce((acc: number, item: any, index: number) => {
-          const key = buildSaleItemKey(item, index);
-          const qty = Number(returnedItems[key] || 0);
-          return acc + Math.min(Number(item.quantity || 0), qty);
-        }, 0);
-
-        const nextStatus = returnedQty >= totalQty ? 'Devolvida' : 'Devolução Parcial';
-
-        return {
-          ...sale,
-          status: nextStatus,
-          returnedItems,
-          refundTotal: Number(sale.refundTotal || 0) + refundTotal,
-          returnTicketIds: [...(sale.returnTicketIds || []), returnTicketId],
-        };
-      })
-    );
-
-    toast.success('Devolução processada com rastreabilidade completa (estoque + financeiro + ticket).');
-    setIsReturnModalOpen(false);
-    setSaleForReturn(null);
-    setReturnDraft({});
-    setReturnReason('');
+    toast.success('Financeiro: Estorno registrado.');
+    
+    // 3. Status Update
+    setSalesHistory(prev => prev.map(s => s.id === saleId ? { ...s, status: 'Devolvida' } : s));
+    toast.success('Venda marcada como DEVOLVIDA.');
   };
 
   const handleRMA = (saleId: string, itemSku: string) => {
@@ -10672,7 +11748,7 @@ function POSView({
       const newSale = {
         id: Math.random().toString(36).substr(2, 9),
         customer: customerName,
-        items: cart.map((item) => ({ ...item, itemType: 'Produto' })),
+        items: [...cart],
         total: total,
         date: new Date().toISOString(),
         type: saleType,
@@ -11329,14 +12405,13 @@ function POSView({
                           <td className="px-6 py-4 text-center">
                             <Badge variant={
                               sale.status === 'Devolvida' ? 'destructive' : 
-                              sale.status === 'Devolução Parcial' ? 'warning' :
                               sale.status === 'Finalizada' ? 'success' : 'warning'
                             }>
                               {sale.status}
                             </Badge>
                           </td>
                           <td className="px-6 py-4 text-right">
-                            {(sale.status === 'Finalizada' || sale.status === 'Devolução Parcial') && (
+                            {sale.status === 'Finalizada' && (
                               <div className="flex justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                                 <DropdownMenu>
                                   <DropdownMenuTrigger>
@@ -11349,9 +12424,9 @@ function POSView({
                                     <DropdownMenuSeparator />
                                     <DropdownMenuItem 
                                       className="text-rose-600 focus:text-rose-600 cursor-pointer text-left"
-                                      onClick={() => openReturnModal(sale)}
+                                      onClick={() => handleReturn(sale.id, sale.items[0].sku)}
                                     >
-                                      <RefreshCw className="w-4 h-4 mr-2" /> Troca/Devolução Item a Item
+                                      <RefreshCw className="w-4 h-4 mr-2" /> Devolução Total
                                     </DropdownMenuItem>
                                     <DropdownMenuItem 
                                       className="cursor-pointer text-left"
@@ -11394,127 +12469,6 @@ function POSView({
           </div>
         )}
       </div>
-
-      <Dialog open={isReturnModalOpen} onOpenChange={setIsReturnModalOpen}>
-        <DialogContent className="max-w-3xl">
-          <DialogHeader>
-            <DialogTitle>Troca e Devolução da Venda #{saleForReturn?.id}</DialogTitle>
-            <DialogDescription>
-              Defina item a item: quantidade, destino no estoque (revenda/avaria) e estorno financeiro associado à venda original.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
-            {saleForReturn?.items?.map((item: any, index: number) => {
-              const key = buildSaleItemKey(item, index);
-              const draft = returnDraft[key];
-              const alreadyReturned = Number((saleForReturn.returnedItems || {})[key] || 0);
-              const maxQty = Math.max(0, Number(item.quantity || 0) - alreadyReturned);
-              const itemType: 'Produto' | 'Serviço' = item.itemType === 'Serviço' ? 'Serviço' : 'Produto';
-
-              return (
-                <div key={key} className="rounded-lg border p-3 space-y-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <p className="font-semibold">{item.name}</p>
-                      <p className="text-[11px] text-muted-foreground">SKU: {item.sku || '-'} | Tipo: {itemType}</p>
-                    </div>
-                    <Badge variant={maxQty > 0 ? 'default' : 'secondary'}>
-                      Disponível para devolução: {maxQty}
-                    </Badge>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                    <div className="space-y-1">
-                      <Label className="text-xs">Qtd a devolver</Label>
-                      <Input
-                        type="number"
-                        min={0}
-                        max={maxQty}
-                        disabled={maxQty <= 0}
-                        value={draft?.quantity ?? 0}
-                        onChange={(e) => {
-                          const nextValue = Math.min(maxQty, Math.max(0, Number(e.target.value || 0)));
-                          setReturnDraft((prev) => ({
-                            ...prev,
-                            [key]: { ...(prev[key] || draft), quantity: nextValue },
-                          }));
-                        }}
-                      />
-                    </div>
-
-                    {itemType === 'Produto' && (
-                      <div className="space-y-1">
-                        <Label className="text-xs">Destino no estoque</Label>
-                        <Select
-                          value={draft?.destination || 'avaria'}
-                          onValueChange={(value: 'revenda' | 'avaria' | null) => {
-                            if (!value) return;
-                            setReturnDraft((prev) => ({
-                              ...prev,
-                              [key]: { ...(prev[key] || draft), destination: value as 'revenda' | 'avaria' },
-                            }));
-                          }}
-                        >
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="revenda">Retorna para revenda</SelectItem>
-                            <SelectItem value="avaria">Estoque com defeito / fornecedor</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                    )}
-
-                    <div className="space-y-1 md:col-span-2">
-                      <Label className="text-xs">Estorno financeiro</Label>
-                      <label className="h-10 rounded-md border px-3 flex items-center justify-between text-xs">
-                        <span>Estornar este item no financeiro</span>
-                        <input
-                          type="checkbox"
-                          checked={!!draft?.refund}
-                          onChange={(e) => {
-                            setReturnDraft((prev) => ({
-                              ...prev,
-                              [key]: { ...(prev[key] || draft), refund: e.target.checked },
-                            }));
-                          }}
-                        />
-                      </label>
-                      <p className="text-[10px] text-muted-foreground">
-                        Valor potencial: R$ {((Number(draft?.quantity || 0) * Number(item.price || 0)) || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-
-            <div className="space-y-2">
-              <Label>Motivo / Observações</Label>
-              <Input
-                value={returnReason}
-                onChange={(e) => setReturnReason(e.target.value)}
-                placeholder="Ex: Tela com falha intermitente, teclado ok."
-              />
-            </div>
-
-            {fiscalEnabled && (
-              <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
-                Nota fiscal ativa: ao devolver produto, o ticket será marcado com "NF de entrada pendente" para anular a saída original.
-              </div>
-            )}
-          </div>
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setIsReturnModalOpen(false)}>Cancelar</Button>
-            <Button className="bg-rose-600 hover:bg-rose-700" onClick={processItemizedReturn}>
-              Processar Troca/Devolução
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       {/* Keyboard Shortcuts Handled via Effects */}
 
@@ -13211,11 +14165,44 @@ function SettingsView({
 
   const [newSubStatus, setNewSubStatus] = useState('');
   const [selectedMainStatus, setSelectedMainStatus] = useState<string>(STATUS_COLUMNS[0]);
-  const [isEditEquipmentDialogOpen, setIsEditEquipmentDialogOpen] = useState(false);
-  const [editingEquipmentDraft, setEditingEquipmentDraft] = useState<EquipmentType | null>(null);
   const [newWaitingInstitutionName, setNewWaitingInstitutionName] = useState('');
   const [newWaitingPurchaseType, setNewWaitingPurchaseType] = useState('');
   const [newWaitingDeadlineDays, setNewWaitingDeadlineDays] = useState('7');
+  const [isEquipmentEditOpen, setIsEquipmentEditOpen] = useState(false);
+  const [equipmentEditData, setEquipmentEditData] = useState<EquipmentType | null>(null);
+  const [isEquipmentBrandsOpen, setIsEquipmentBrandsOpen] = useState(false);
+  const [equipmentBrandsData, setEquipmentBrandsData] = useState<EquipmentType | null>(null);
+  const [isEquipmentServicesOpen, setIsEquipmentServicesOpen] = useState(false);
+  const [equipmentServicesData, setEquipmentServicesData] = useState<EquipmentType | null>(null);
+  const [isEquipmentDeadlineRulesOpen, setIsEquipmentDeadlineRulesOpen] = useState(false);
+  const [equipmentDeadlineRulesData, setEquipmentDeadlineRulesData] = useState<EquipmentType | null>(null);
+  const [newDeadlineRuleKeyword, setNewDeadlineRuleKeyword] = useState('');
+  const [newDeadlineRuleDiagHours, setNewDeadlineRuleDiagHours] = useState('0');
+  const [newDeadlineRuleDiagDays, setNewDeadlineRuleDiagDays] = useState('0');
+  const [newDeadlineRuleCompHours, setNewDeadlineRuleCompHours] = useState('0');
+  const [newDeadlineRuleCompDays, setNewDeadlineRuleCompDays] = useState('0');
+  const [newEquipmentBrand, setNewEquipmentBrand] = useState('');
+  const [newEquipmentModel, setNewEquipmentModel] = useState('');
+  const [newEquipmentServiceName, setNewEquipmentServiceName] = useState('');
+  const [newEquipmentServicePrice, setNewEquipmentServicePrice] = useState('0');
+  const [newEquipmentServiceExecValue, setNewEquipmentServiceExecValue] = useState('1');
+  const [newEquipmentServiceExecUnit, setNewEquipmentServiceExecUnit] = useState<'Horas' | 'Dias'>('Horas');
+  const [newOsStatusName, setNewOsStatusName] = useState('');
+
+  const activeOsStatuses = useMemo(() => {
+    if (company.osStatuses && company.osStatuses.length > 0) {
+      return [...company.osStatuses].sort((a, b) => a.order - b.order).map(s => s.name);
+    }
+    return [...STATUS_COLUMNS];
+  }, [company.osStatuses]);
+
+  useEffect(() => {
+    if (!activeOsStatuses.includes(selectedMainStatus)) {
+      setSelectedMainStatus(activeOsStatuses[0] || STATUS_COLUMNS[0]);
+    }
+  }, [activeOsStatuses, selectedMainStatus]);
+
+  const normalizeEquipmentText = (value?: string) => String(value || '').trim().toUpperCase();
 
   const [wsConfig, setWsConfig] = useState({
     instanceName: '',
@@ -13782,38 +14769,6 @@ function SettingsView({
       return newMap;
     });
     toast.success('Sub-status removido!');
-  };
-
-  const openEditEquipmentDialog = (equipment: EquipmentType) => {
-    setEditingEquipmentDraft({ ...equipment });
-    setIsEditEquipmentDialogOpen(true);
-  };
-
-  const saveEditedEquipment = () => {
-    if (!editingEquipmentDraft) return;
-    const name = (editingEquipmentDraft.name || '').trim();
-    if (!name) {
-      toast.error('Informe o nome do equipamento.');
-      return;
-    }
-    setEquipmentTypes((prev) =>
-      prev.map((item) =>
-        item.id === editingEquipmentDraft.id
-          ? {
-              ...item,
-              name,
-              defaultDiagnosisDays: Math.max(0, Number(editingEquipmentDraft.defaultDiagnosisDays || 0)),
-              defaultCompletionDays: Math.max(0, Number(editingEquipmentDraft.defaultCompletionDays || 0)),
-              overloadFromQty: Math.max(0, Number(editingEquipmentDraft.overloadFromQty || 0)),
-              overloadDiagnosisDays: Math.max(0, Number(editingEquipmentDraft.overloadDiagnosisDays || 0)),
-              overloadCompletionDays: Math.max(0, Number(editingEquipmentDraft.overloadCompletionDays || 0)),
-            }
-          : item
-      )
-    );
-    setIsEditEquipmentDialogOpen(false);
-    setEditingEquipmentDraft(null);
-    toast.success('Equipamento atualizado com sucesso!');
   };
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -14464,136 +15419,138 @@ function SettingsView({
               </div>
 
               <div className="space-y-4 pt-4 border-t">
-                <h3 className="text-sm font-bold uppercase tracking-widest text-muted-foreground">Horário de Funcionamento</h3>
-                <div className="rounded-lg border overflow-hidden">
-                  <div className="grid grid-cols-[110px_1fr_1fr_1fr] bg-secondary/30 text-[10px] uppercase font-bold tracking-wider">
-                    <div className="px-3 py-2 border-r">Dia</div>
-                    <div className="px-3 py-2 border-r">Início Jornada</div>
-                    <div className="px-3 py-2 border-r">Início Intervalo</div>
-                    <div className="px-3 py-2">Término Jornada</div>
+                <h3 className="text-sm font-bold uppercase tracking-widest text-muted-foreground">Horário de Funcionamento Inteligente</h3>
+                <div className="flex items-center justify-between rounded-lg border bg-secondary/10 px-4 py-3">
+                  <div>
+                    <p className="text-sm font-semibold">Aplicar horário comercial no sistema</p>
+                    <p className="text-[10px] text-muted-foreground">Ajuda o time a manter prazos e atendimento alinhados ao expediente.</p>
                   </div>
-                  {WEEKDAY_CONFIG.map((weekday) => {
-                    const schedule = getWeekdaySchedule(company, weekday.day);
-                    return (
-                      <div key={weekday.day} className="grid grid-cols-[110px_1fr_1fr_1fr] border-t">
-                        <div className="px-3 py-2 border-r flex items-center gap-2">
-                          <input
-                            type="checkbox"
-                            checked={schedule.open}
-                            onChange={(e) =>
-                              setCompany((prev) => {
-                                const current = getWeekdaySchedule(prev, weekday.day);
-                                return {
-                                  ...prev,
-                                  businessHoursWeeklySchedule: {
-                                    ...(prev.businessHoursWeeklySchedule || {}),
-                                    [String(weekday.day)]: { ...current, open: e.target.checked },
-                                  },
-                                };
-                              })
-                            }
-                            className="w-4 h-4 accent-primary"
-                          />
-                          <span className="text-xs font-semibold">{weekday.label}</span>
-                        </div>
-                        <div className="px-3 py-2 border-r">
-                          <Input
-                            type="time"
-                            value={schedule.start}
-                            disabled={!schedule.open}
-                            onChange={(e) =>
-                              setCompany((prev) => {
-                                const current = getWeekdaySchedule(prev, weekday.day);
-                                return {
-                                  ...prev,
-                                  businessHoursStart: e.target.value,
-                                  businessHoursWeeklySchedule: {
-                                    ...(prev.businessHoursWeeklySchedule || {}),
-                                    [String(weekday.day)]: { ...current, start: e.target.value },
-                                  },
-                                };
-                              })
-                            }
-                          />
-                        </div>
-                        <div className="px-3 py-2 border-r">
-                          <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={company.businessHoursEnabled ? 'default' : 'outline'}
+                    onClick={() => setCompany((prev) => ({ ...prev, businessHoursEnabled: !prev.businessHoursEnabled }))}
+                  >
+                    {company.businessHoursEnabled ? 'Ativado' : 'Desativado'}
+                  </Button>
+                </div>
+
+                <div className="rounded-lg border overflow-hidden">
+                  <div className="grid grid-cols-12 bg-secondary/30 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    <div className="col-span-4 px-3 py-2">Início da Jornada</div>
+                    <div className="col-span-4 px-3 py-2 border-l">Início de Intervalo</div>
+                    <div className="col-span-4 px-3 py-2 border-l">Término da Jornada</div>
+                  </div>
+                  <div className="divide-y">
+                    {BUSINESS_DAY_ROWS.map((row) => {
+                      const enabled =
+                        row.day === 6
+                          ? company.businessHoursSaturdayEnabled !== false
+                          : row.day === 0
+                            ? company.businessHoursSundayEnabled === true
+                            : (company.businessHoursWeekdays || []).includes(row.day);
+                      const breakEnabled = (company.businessHoursBreakWeekdays || []).includes(row.day);
+                      const startValue = row.day === 6
+                        ? (company.businessHoursSaturdayStart || '08:30')
+                        : row.day === 0
+                          ? (company.businessHoursSundayStart || '00:00')
+                          : (company.businessHoursStart || '08:30');
+                      const endValue = row.day === 6
+                        ? (company.businessHoursSaturdayEnd || '12:30')
+                        : row.day === 0
+                          ? (company.businessHoursSundayEnd || '00:00')
+                          : (company.businessHoursEnd || '18:00');
+
+                      return (
+                        <div key={`business-row-${row.day}`} className="grid grid-cols-12 items-center">
+                          <div className="col-span-4 px-3 py-2 flex items-center gap-2">
                             <input
                               type="checkbox"
-                              checked={schedule.breakEnabled}
-                              disabled={!schedule.open}
-                              onChange={(e) =>
+                              checked={enabled}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
                                 setCompany((prev) => {
-                                  const current = getWeekdaySchedule(prev, weekday.day);
-                                  return {
-                                    ...prev,
-                                    businessHoursWeeklySchedule: {
-                                      ...(prev.businessHoursWeeklySchedule || {}),
-                                      [String(weekday.day)]: { ...current, breakEnabled: e.target.checked },
-                                    },
-                                  };
-                                })
-                              }
-                              className="w-4 h-4 accent-primary"
+                                  if (row.day === 6) return { ...prev, businessHoursSaturdayEnabled: checked };
+                                  if (row.day === 0) return { ...prev, businessHoursSundayEnabled: checked };
+                                  const setDays = new Set(prev.businessHoursWeekdays || []);
+                                  if (checked) setDays.add(row.day);
+                                  else setDays.delete(row.day);
+                                  return { ...prev, businessHoursWeekdays: Array.from(setDays).sort((a, b) => a - b) };
+                                });
+                              }}
+                              className="h-4 w-4 accent-primary"
                             />
+                            <Label className="min-w-[66px]">{row.label}</Label>
                             <Input
                               type="time"
-                              value={schedule.breakStart}
-                              disabled={!schedule.open || !schedule.breakEnabled}
-                              onChange={(e) =>
+                              disabled={!enabled}
+                              value={startValue}
+                              onChange={(e) => {
+                                const value = e.target.value;
+                                setCompany((prev) => row.day === 6
+                                  ? { ...prev, businessHoursSaturdayStart: value }
+                                  : row.day === 0
+                                    ? { ...prev, businessHoursSundayStart: value }
+                                    : { ...prev, businessHoursStart: value });
+                              }}
+                            />
+                          </div>
+                          <div className="col-span-4 px-3 py-2 border-l flex items-center gap-2">
+                            <input
+                              type="checkbox"
+                              checked={breakEnabled}
+                              disabled={!enabled}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
                                 setCompany((prev) => {
-                                  const current = getWeekdaySchedule(prev, weekday.day);
-                                  return {
-                                    ...prev,
-                                    businessHoursBreakStart: e.target.value,
-                                    businessHoursWeeklySchedule: {
-                                      ...(prev.businessHoursWeeklySchedule || {}),
-                                      [String(weekday.day)]: { ...current, breakStart: e.target.value },
-                                    },
-                                  };
-                                })
-                              }
+                                  const setDays = new Set(prev.businessHoursBreakWeekdays || []);
+                                  if (checked) setDays.add(row.day);
+                                  else setDays.delete(row.day);
+                                  return { ...prev, businessHoursBreakWeekdays: Array.from(setDays).sort((a, b) => a - b) };
+                                });
+                              }}
+                              className="h-4 w-4 accent-primary"
+                            />
+                            <div className="grid grid-cols-2 gap-2 w-full">
+                              <Input
+                                type="time"
+                                disabled={!enabled || !breakEnabled}
+                                value={company.businessHoursBreakStart || '12:00'}
+                                onChange={(e) => setCompany({ ...company, businessHoursBreakStart: e.target.value })}
+                              />
+                              <Input
+                                type="time"
+                                disabled={!enabled || !breakEnabled}
+                                value={company.businessHoursBreakEnd || '13:30'}
+                                onChange={(e) => setCompany({ ...company, businessHoursBreakEnd: e.target.value })}
+                              />
+                            </div>
+                          </div>
+                          <div className="col-span-4 px-3 py-2 border-l">
+                            <Input
+                              type="time"
+                              disabled={!enabled}
+                              value={endValue}
+                              onChange={(e) => {
+                                const value = e.target.value;
+                                setCompany((prev) => row.day === 6
+                                  ? { ...prev, businessHoursSaturdayEnd: value }
+                                  : row.day === 0
+                                    ? { ...prev, businessHoursSundayEnd: value }
+                                    : { ...prev, businessHoursEnd: value });
+                              }}
                             />
                           </div>
                         </div>
-                        <div className="px-3 py-2">
-                          <Input
-                            type="time"
-                            value={schedule.end}
-                            disabled={!schedule.open}
-                            onChange={(e) =>
-                              setCompany((prev) => {
-                                const current = getWeekdaySchedule(prev, weekday.day);
-                                return {
-                                  ...prev,
-                                  businessHoursEnd: e.target.value,
-                                  businessHoursWeeklySchedule: {
-                                    ...(prev.businessHoursWeeklySchedule || {}),
-                                    [String(weekday.day)]: { ...current, end: e.target.value },
-                                  },
-                                };
-                              })
-                            }
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <Label>Término Intervalo (Padrão)</Label>
-                    <Input
-                      type="time"
-                      value={company.businessHoursBreakEnd || '13:30'}
-                      onChange={(e) => setCompany({ ...company, businessHoursBreakEnd: e.target.value })}
-                    />
+                      );
+                    })}
                   </div>
                 </div>
+
                 <div className="flex items-center justify-between rounded-lg border bg-secondary/10 px-4 py-3">
                   <div>
                     <p className="text-sm font-semibold">Fechado nos feriados</p>
-                    <p className="text-[10px] text-muted-foreground">Comportamento padrão para datas de feriado.</p>
+                    <p className="text-[10px] text-muted-foreground">Quando ativado, o sistema considera feriado como fechado por padrão.</p>
                   </div>
                   <Button
                     type="button"
@@ -14601,9 +15558,161 @@ function SettingsView({
                     variant={company.businessHoursHolidayClosed !== false ? 'default' : 'outline'}
                     onClick={() => setCompany((prev) => ({ ...prev, businessHoursHolidayClosed: !(prev.businessHoursHolidayClosed !== false) }))}
                   >
-                    {company.businessHoursHolidayClosed !== false ? 'Sim' : 'Não'}
+                    {company.businessHoursHolidayClosed !== false ? 'Ativado' : 'Desativado'}
                   </Button>
                 </div>
+
+                <div className="hidden">
+                  <Label>Dias Úteis Ativos</Label>
+                  <div className="flex flex-wrap gap-2">
+                    {BUSINESS_WEEKDAY_OPTIONS.map((day) => {
+                      const selected = (company.businessHoursWeekdays || []).includes(day.value);
+                      return (
+                        <Button
+                          key={`business-day-${day.value}`}
+                          type="button"
+                          size="sm"
+                          variant={selected ? 'default' : 'outline'}
+                          onClick={() =>
+                            setCompany((prev) => {
+                              const current = new Set(prev.businessHoursWeekdays || []);
+                              if (current.has(day.value)) current.delete(day.value);
+                              else current.add(day.value);
+                              return { ...prev, businessHoursWeekdays: Array.from(current).sort((a, b) => a - b) };
+                            })
+                          }
+                        >
+                          {day.label}
+                        </Button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="hidden">
+                  <div className="space-y-2">
+                    <Label>Abertura</Label>
+                    <Input
+                      type="time"
+                      value={company.businessHoursStart || '08:30'}
+                      onChange={(e) => setCompany({ ...company, businessHoursStart: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Fechamento</Label>
+                    <Input
+                      type="time"
+                      value={company.businessHoursEnd || '18:00'}
+                      onChange={(e) => setCompany({ ...company, businessHoursEnd: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Intervalo Início</Label>
+                    <Input
+                      type="time"
+                      value={company.businessHoursBreakStart || '12:00'}
+                      onChange={(e) => setCompany({ ...company, businessHoursBreakStart: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Intervalo Fim</Label>
+                    <Input
+                      type="time"
+                      value={company.businessHoursBreakEnd || '13:30'}
+                      onChange={(e) => setCompany({ ...company, businessHoursBreakEnd: e.target.value })}
+                    />
+                  </div>
+                </div>
+
+                <div className="hidden">
+                  <div className="space-y-3 rounded-lg border p-3">
+                    <div className="flex items-center justify-between">
+                      <Label>Sábado</Label>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={company.businessHoursSaturdayEnabled ? 'default' : 'outline'}
+                        onClick={() =>
+                          setCompany((prev) => ({ ...prev, businessHoursSaturdayEnabled: !prev.businessHoursSaturdayEnabled }))
+                        }
+                      >
+                        {company.businessHoursSaturdayEnabled ? 'Aberto' : 'Fechado'}
+                      </Button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Input
+                        type="time"
+                        value={company.businessHoursSaturdayStart || '08:30'}
+                        onChange={(e) => setCompany({ ...company, businessHoursSaturdayStart: e.target.value })}
+                      />
+                      <Input
+                        type="time"
+                        value={company.businessHoursSaturdayEnd || '12:30'}
+                        onChange={(e) => setCompany({ ...company, businessHoursSaturdayEnd: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-3 rounded-lg border p-3">
+                    <div className="flex items-center justify-between">
+                      <Label>Domingo</Label>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={company.businessHoursSundayEnabled ? 'default' : 'outline'}
+                        onClick={() =>
+                          setCompany((prev) => ({ ...prev, businessHoursSundayEnabled: !prev.businessHoursSundayEnabled }))
+                        }
+                      >
+                        {company.businessHoursSundayEnabled ? 'Aberto' : 'Fechado'}
+                      </Button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Input
+                        type="time"
+                        value={company.businessHoursSundayStart || '00:00'}
+                        onChange={(e) => setCompany({ ...company, businessHoursSundayStart: e.target.value })}
+                      />
+                      <Input
+                        type="time"
+                        value={company.businessHoursSundayEnd || '00:00'}
+                        onChange={(e) => setCompany({ ...company, businessHoursSundayEnd: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4 pt-4 border-t">
+                <h3 className="text-sm font-bold uppercase tracking-widest text-muted-foreground">Pagamento PIX</h3>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label>Tipo de Chave PIX</Label>
+                    <Select
+                      value={company.pixKeyType || 'CPF'}
+                      onValueChange={(value: Company['pixKeyType']) => setCompany({ ...company, pixKeyType: value })}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {PIX_KEY_TYPE_OPTIONS.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Chave PIX</Label>
+                    <Input
+                      placeholder="Digite a chave conforme o tipo selecionado"
+                      value={company.pixKey || ''}
+                      onChange={(e) => setCompany({ ...company, pixKey: e.target.value })}
+                    />
+                  </div>
+                </div>
+                <p className="text-[10px] text-muted-foreground italic">
+                  Essa chave será usada para gerar QRCode PIX nas Ordens de Serviço com o valor total (produtos + serviços).
+                </p>
               </div>
 
               <div className="space-y-4 pt-4 border-t">
@@ -14938,6 +16047,141 @@ function SettingsView({
         </TabsContent>
 
         <TabsContent value="equipamentos" className="mt-6 space-y-6">
+          {/* ── STATUS MANAGEMENT ── */}
+          <Card className="border-none shadow-sm">
+            <CardHeader>
+              <CardTitle>Gerenciamento de Status</CardTitle>
+              <CardDescription>Defina os status disponíveis para as ordens de serviço e sua ordem de exibição.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Nome do novo status..."
+                  value={newOsStatusName}
+                  onChange={(e) => setNewOsStatusName(e.target.value)}
+                  className="flex-1"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      const name = newOsStatusName.trim();
+                      if (!name) return toast.error('Informe o nome do status.');
+                      const current = company.osStatuses && company.osStatuses.length > 0
+                        ? company.osStatuses
+                        : STATUS_COLUMNS.map((s, i) => ({ id: s, name: s, order: i }));
+                      if (current.some(s => s.name.toLowerCase() === name.toLowerCase())) {
+                        return toast.error('Status com este nome já existe.');
+                      }
+                      setCompany(prev => ({
+                        ...prev,
+                        osStatuses: [...current, { id: Math.random().toString(36).substr(2, 9), name, order: current.length }]
+                      }));
+                      setNewOsStatusName('');
+                      toast.success('Status adicionado.');
+                    }
+                  }}
+                />
+                <Button onClick={() => {
+                  const name = newOsStatusName.trim();
+                  if (!name) return toast.error('Informe o nome do status.');
+                  const current = company.osStatuses && company.osStatuses.length > 0
+                    ? company.osStatuses
+                    : STATUS_COLUMNS.map((s, i) => ({ id: s, name: s, order: i }));
+                  if (current.some(s => s.name.toLowerCase() === name.toLowerCase())) {
+                    return toast.error('Status com este nome já existe.');
+                  }
+                  setCompany(prev => ({
+                    ...prev,
+                    osStatuses: [...current, { id: Math.random().toString(36).substr(2, 9), name, order: current.length }]
+                  }));
+                  setNewOsStatusName('');
+                  toast.success('Status adicionado.');
+                }} className="gap-2">
+                  <Plus className="w-4 h-4" /> Adicionar
+                </Button>
+              </div>
+              <div className="rounded-md border overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead className="bg-secondary/50 text-[10px] uppercase font-bold text-muted-foreground">
+                    <tr>
+                      <th className="px-4 py-2 text-center w-16">Ordem</th>
+                      <th className="px-4 py-2 text-left">Nome do Status</th>
+                      <th className="px-4 py-2 text-right">Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {activeOsStatuses.map((statusName, index) => (
+                      <tr key={statusName} className="hover:bg-secondary/10">
+                        <td className="px-4 py-2 text-center text-muted-foreground text-xs">{index + 1}</td>
+                        <td className="px-4 py-2 font-medium">{statusName}</td>
+                        <td className="px-4 py-2 text-right">
+                          <div className="flex justify-end gap-1">
+                            <Button
+                              variant="ghost" size="icon" className="h-7 w-7"
+                              disabled={index === 0}
+                              onClick={() => {
+                                const current = company.osStatuses && company.osStatuses.length > 0
+                                  ? [...company.osStatuses].sort((a, b) => a.order - b.order)
+                                  : STATUS_COLUMNS.map((s, i) => ({ id: s, name: s, order: i }));
+                                const i = current.findIndex(s => s.name === statusName);
+                                if (i <= 0) return;
+                                const next = current.map((s, idx) => {
+                                  if (idx === i) return { ...s, order: current[i - 1].order };
+                                  if (idx === i - 1) return { ...s, order: current[i].order };
+                                  return s;
+                                });
+                                setCompany(prev => ({ ...prev, osStatuses: next }));
+                              }}
+                              title="Mover para cima"
+                            >
+                              <ChevronUp className="w-3 h-3" />
+                            </Button>
+                            <Button
+                              variant="ghost" size="icon" className="h-7 w-7"
+                              disabled={index === activeOsStatuses.length - 1}
+                              onClick={() => {
+                                const current = company.osStatuses && company.osStatuses.length > 0
+                                  ? [...company.osStatuses].sort((a, b) => a.order - b.order)
+                                  : STATUS_COLUMNS.map((s, i) => ({ id: s, name: s, order: i }));
+                                const i = current.findIndex(s => s.name === statusName);
+                                if (i >= current.length - 1) return;
+                                const next = current.map((s, idx) => {
+                                  if (idx === i) return { ...s, order: current[i + 1].order };
+                                  if (idx === i + 1) return { ...s, order: current[i].order };
+                                  return s;
+                                });
+                                setCompany(prev => ({ ...prev, osStatuses: next }));
+                              }}
+                              title="Mover para baixo"
+                            >
+                              <ChevronDown className="w-3 h-3" />
+                            </Button>
+                            <Button
+                              variant="ghost" size="icon" className="h-7 w-7 text-rose-500"
+                              onClick={() => {
+                                const current = company.osStatuses && company.osStatuses.length > 0
+                                  ? [...company.osStatuses].sort((a, b) => a.order - b.order)
+                                  : STATUS_COLUMNS.map((s, i) => ({ id: s, name: s, order: i }));
+                                const filtered = current.filter(s => s.name !== statusName).map((s, i) => ({ ...s, order: i }));
+                                setCompany(prev => ({ ...prev, osStatuses: filtered }));
+                                toast.success('Status removido.');
+                              }}
+                              title="Remover status"
+                            >
+                              <X className="w-3 h-3" />
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {(!company.osStatuses || company.osStatuses.length === 0) && (
+                <p className="text-[11px] text-muted-foreground italic">Exibindo status padrão do sistema. Adicione um status para personalizar a lista.</p>
+              )}
+            </CardContent>
+          </Card>
+
           <Card className="border-none shadow-sm">
             <CardHeader>
               <CardTitle>Cadastro de Equipamentos</CardTitle>
@@ -14977,34 +16221,693 @@ function SettingsView({
                     </div>
                   </div>
                 </div>
+                <div className="md:col-span-6 rounded-lg border border-dashed border-amber-400/40 bg-amber-50/50 dark:bg-amber-950/20 p-3">
+                  <p className="text-xs font-bold uppercase tracking-wider text-amber-700 dark:text-amber-400">Cobrança de Diagnóstico em Reprovação</p>
+                  <p className="text-[10px] text-muted-foreground mt-1 mb-3">
+                    Quando o orçamento for reprovado, cobrar o valor de diagnóstico ao cliente.
+                  </p>
+                  <div className="flex items-center gap-6">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        id="new-eq-charge-diag"
+                        className="w-4 h-4 rounded"
+                      />
+                      <span className="text-sm font-medium">Cobrar diagnóstico</span>
+                    </label>
+                    <div className="space-y-1">
+                      <Label className="text-xs">Valor (R$)</Label>
+                      <Input id="new-eq-diag-charge-value" type="number" defaultValue="0" min="0" step="0.01" className="h-8 w-32" />
+                    </div>
+                  </div>
+                </div>
                 <div className="md:col-span-6 flex justify-end">
                   <Button className="gap-2" onClick={() => {
-                    const name = (document.getElementById('new-eq-name') as HTMLInputElement).value;
-                    const diag = parseInt((document.getElementById('new-eq-diag') as HTMLInputElement).value);
-                    const comp = parseInt((document.getElementById('new-eq-comp') as HTMLInputElement).value);
-                    const overloadFromQty = parseInt((document.getElementById('new-eq-overload-from') as HTMLInputElement).value || '0');
-                    const overloadDiagnosisDays = parseInt((document.getElementById('new-eq-overload-diag') as HTMLInputElement).value || '0');
-                    const overloadCompletionDays = parseInt((document.getElementById('new-eq-overload-comp') as HTMLInputElement).value || '0');
+                    const nameInput = document.getElementById('new-eq-name') as HTMLInputElement | null;
+                    const diagInput = document.getElementById('new-eq-diag') as HTMLInputElement | null;
+                    const compInput = document.getElementById('new-eq-comp') as HTMLInputElement | null;
+                    const overloadFromInput = document.getElementById('new-eq-overload-from') as HTMLInputElement | null;
+                    const overloadDiagInput = document.getElementById('new-eq-overload-diag') as HTMLInputElement | null;
+                    const overloadCompInput = document.getElementById('new-eq-overload-comp') as HTMLInputElement | null;
+                    const chargeDiagInput = document.getElementById('new-eq-charge-diag') as HTMLInputElement | null;
+                    const diagChargeValueInput = document.getElementById('new-eq-diag-charge-value') as HTMLInputElement | null;
+                    if (!nameInput || !diagInput || !compInput || !overloadFromInput || !overloadDiagInput || !overloadCompInput) {
+                      toast.error('Campos de equipamento indisponíveis.');
+                      return;
+                    }
+
+                    const name = nameInput.value.trim();
+                    const diag = parseInt(diagInput.value);
+                    const comp = parseInt(compInput.value);
+                    const overloadFromQty = parseInt(overloadFromInput.value || '0');
+                    const overloadDiagnosisDays = parseInt(overloadDiagInput.value || '0');
+                    const overloadCompletionDays = parseInt(overloadCompInput.value || '0');
+                    const chargeDiag = chargeDiagInput?.checked || false;
+                    const diagChargeValue = parseFloat(diagChargeValueInput?.value || '0');
                     const safeDiag = Number.isFinite(diag) ? Math.max(0, diag) : 1;
                     const safeComp = Number.isFinite(comp) ? Math.max(0, comp) : 3;
                     if (!name) return toast.error('Nome do equipamento é obrigatório');
-                    setEquipmentTypes(prev => [...prev, {
-                      id: Math.random().toString(36).substr(2, 9),
+                    const nextEquipment = {
                       name,
                       defaultDiagnosisDays: safeDiag,
                       defaultCompletionDays: safeComp,
                       overloadFromQty: Number.isFinite(overloadFromQty) ? Math.max(0, overloadFromQty) : 0,
                       overloadDiagnosisDays: Number.isFinite(overloadDiagnosisDays) ? Math.max(0, overloadDiagnosisDays) : 0,
                       overloadCompletionDays: Number.isFinite(overloadCompletionDays) ? Math.max(0, overloadCompletionDays) : 0,
+                      chargeDiagnosisOnRejection: chargeDiag,
+                      diagnosisChargeValue: Number.isFinite(diagChargeValue) ? Math.max(0, diagChargeValue) : 0,
+                    };
+
+                    setEquipmentTypes(prev => [...prev, {
+                      id: Math.random().toString(36).substr(2, 9),
+                      ...nextEquipment,
                       companyId: '1'
                     }]);
                     toast.success('Equipamento cadastrado!');
-                    (document.getElementById('new-eq-name') as HTMLInputElement).value = '';
+
+                    nameInput.value = '';
+                    diagInput.value = '1';
+                    compInput.value = '3';
+                    overloadFromInput.value = '0';
+                    overloadDiagInput.value = '0';
+                    overloadCompInput.value = '0';
+                    if (chargeDiagInput) chargeDiagInput.checked = false;
+                    if (diagChargeValueInput) diagChargeValueInput.value = '0';
                   }}>
                     <Plus className="w-4 h-4" /> Cadastrar Equipamento
                   </Button>
                 </div>
               </div>
+
+              <Dialog open={isEquipmentEditOpen} onOpenChange={(open) => {
+                setIsEquipmentEditOpen(open);
+                if (!open) setEquipmentEditData(null);
+              }}>
+                <DialogContent className="max-w-2xl">
+                  <DialogHeader>
+                    <DialogTitle>Editar Equipamento</DialogTitle>
+                    <DialogDescription>Ajuste os prazos e regras de acúmulo deste equipamento.</DialogDescription>
+                  </DialogHeader>
+                  <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
+                    <div className="space-y-2 md:col-span-2">
+                      <Label>Nome do Equipamento</Label>
+                      <Input
+                        value={equipmentEditData?.name || ''}
+                        onChange={(e) => setEquipmentEditData((prev) => prev ? ({ ...prev, name: e.target.value }) : prev)}
+                        placeholder="Ex: Celular, Notebook..."
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Diagnóstico (Dias)</Label>
+                      <Input
+                        type="number"
+                        min="0"
+                        value={equipmentEditData?.defaultDiagnosisDays ?? 0}
+                        onChange={(e) => setEquipmentEditData((prev) => prev ? ({
+                          ...prev,
+                          defaultDiagnosisDays: Math.max(0, Number(e.target.value || 0))
+                        }) : prev)}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Conclusão (Dias)</Label>
+                      <Input
+                        type="number"
+                        min="0"
+                        value={equipmentEditData?.defaultCompletionDays ?? 0}
+                        onChange={(e) => setEquipmentEditData((prev) => prev ? ({
+                          ...prev,
+                          defaultCompletionDays: Math.max(0, Number(e.target.value || 0))
+                        }) : prev)}
+                      />
+                    </div>
+                    <div className="md:col-span-6 rounded-lg border border-dashed border-primary/30 bg-background/70 p-3">
+                      <p className="text-xs font-bold uppercase tracking-wider text-primary">Regra de Acúmulo (Extensão Automática de Prazo)</p>
+                      <p className="text-[10px] text-muted-foreground mt-1 mb-3">
+                        Defina a partir de quantas O.S. abertas deste equipamento o sistema deve estender o prazo de diagnóstico e conclusão.
+                      </p>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="space-y-2">
+                          <Label>A partir Qtd.</Label>
+                          <Input
+                            type="number"
+                            min="0"
+                            value={equipmentEditData?.overloadFromQty ?? 0}
+                            onChange={(e) => setEquipmentEditData((prev) => prev ? ({
+                              ...prev,
+                              overloadFromQty: Math.max(0, Number(e.target.value || 0))
+                            }) : prev)}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>+Dias Diag.</Label>
+                          <Input
+                            type="number"
+                            min="0"
+                            value={equipmentEditData?.overloadDiagnosisDays ?? 0}
+                            onChange={(e) => setEquipmentEditData((prev) => prev ? ({
+                              ...prev,
+                              overloadDiagnosisDays: Math.max(0, Number(e.target.value || 0))
+                            }) : prev)}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>+Dias Conclusão</Label>
+                          <Input
+                            type="number"
+                            min="0"
+                            value={equipmentEditData?.overloadCompletionDays ?? 0}
+                            onChange={(e) => setEquipmentEditData((prev) => prev ? ({
+                              ...prev,
+                              overloadCompletionDays: Math.max(0, Number(e.target.value || 0))
+                            }) : prev)}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                    <div className="md:col-span-6 mt-4 rounded-lg border border-dashed border-amber-400/40 bg-amber-50/50 dark:bg-amber-950/20 p-3">
+                      <p className="text-xs font-bold uppercase tracking-wider text-amber-700 dark:text-amber-400">Cobrança de Diagnóstico em Reprovação</p>
+                      <p className="text-[10px] text-muted-foreground mt-1 mb-3">
+                        Quando o orçamento for reprovado, cobrar o valor de diagnóstico ao cliente.
+                      </p>
+                      <div className="flex items-center gap-6">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            className="w-4 h-4 rounded"
+                            checked={equipmentEditData?.chargeDiagnosisOnRejection || false}
+                            onChange={(e) => setEquipmentEditData(prev => prev ? ({ ...prev, chargeDiagnosisOnRejection: e.target.checked }) : prev)}
+                          />
+                          <span className="text-sm font-medium">Cobrar diagnóstico</span>
+                        </label>
+                        <div className="space-y-1">
+                          <Label className="text-xs">Valor (R$)</Label>
+                          <Input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            className="h-8 w-32"
+                            value={equipmentEditData?.diagnosisChargeValue ?? 0}
+                            onChange={(e) => setEquipmentEditData(prev => prev ? ({
+                              ...prev,
+                              diagnosisChargeValue: Math.max(0, parseFloat(e.target.value || '0'))
+                            }) : prev)}
+                            disabled={!equipmentEditData?.chargeDiagnosisOnRejection}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <DialogFooter>
+                    <Button variant="outline" onClick={() => {
+                      setIsEquipmentEditOpen(false);
+                      setEquipmentEditData(null);
+                    }}>Cancelar</Button>
+                    <Button onClick={() => {
+                      if (!equipmentEditData) return;
+                      const name = equipmentEditData.name.trim();
+                      if (!name) {
+                        toast.error('Nome do equipamento é obrigatório');
+                        return;
+                      }
+                      setEquipmentTypes(prev => prev.map(eq => (
+                        eq.id === equipmentEditData.id
+                          ? { ...equipmentEditData, name }
+                          : eq
+                      )));
+                      toast.success('Equipamento atualizado!');
+                      setIsEquipmentEditOpen(false);
+                      setEquipmentEditData(null);
+                    }}>Salvar Alterações</Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+
+              <Dialog open={isEquipmentBrandsOpen} onOpenChange={(open) => {
+                setIsEquipmentBrandsOpen(open);
+                if (!open) {
+                  setEquipmentBrandsData(null);
+                  setNewEquipmentBrand('');
+                  setNewEquipmentModel('');
+                }
+              }}>
+                <DialogContent className="max-w-2xl">
+                  <DialogHeader>
+                    <DialogTitle>Marcas e Modelos</DialogTitle>
+                    <DialogDescription>
+                      Gerencie as marcas cadastradas para {equipmentBrandsData?.name || 'este equipamento'}.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="rounded-lg border bg-secondary/10 p-3">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      <div className="space-y-2 md:col-span-1">
+                        <Label>Marca</Label>
+                        <Input
+                          value={newEquipmentBrand}
+                          onChange={(e) => setNewEquipmentBrand(e.target.value.toUpperCase())}
+                          placeholder="Ex: APPLE"
+                        />
+                      </div>
+                      <div className="space-y-2 md:col-span-2">
+                        <Label>Modelo</Label>
+                        <Input
+                          value={newEquipmentModel}
+                          onChange={(e) => setNewEquipmentModel(e.target.value.toUpperCase())}
+                          placeholder="Ex: IPHONE 15"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex justify-end mt-3">
+                      <Button
+                        size="sm"
+                        className="gap-2"
+                        onClick={() => {
+                          if (!equipmentBrandsData) return;
+                          const brand = normalizeEquipmentText(newEquipmentBrand);
+                          const model = normalizeEquipmentText(newEquipmentModel);
+                          if (!brand) {
+                            toast.error('Informe a marca.');
+                            return;
+                          }
+                          setEquipmentTypes((prev) => prev.map((eq) => {
+                            if (eq.id !== equipmentBrandsData.id) return eq;
+                            const nextBrandModels = [...(eq.brandModels || [])];
+                            const existingIndex = nextBrandModels.findIndex((item) =>
+                              normalizeEquipmentText(item.brand) === brand
+                            );
+                            if (existingIndex === -1) {
+                              nextBrandModels.push({
+                                brand,
+                                models: model ? [model] : [],
+                              });
+                            } else if (model) {
+                              const existing = nextBrandModels[existingIndex];
+                              const models = Array.from(new Set([...(existing.models || []), model]));
+                              nextBrandModels[existingIndex] = { ...existing, models };
+                            }
+                            return { ...eq, brandModels: nextBrandModels };
+                          }));
+                          setEquipmentBrandsData((prev) => {
+                            if (!prev) return prev;
+                            const nextBrandModels = [...(prev.brandModels || [])];
+                            const existingIndex = nextBrandModels.findIndex((item) =>
+                              normalizeEquipmentText(item.brand) === brand
+                            );
+                            if (existingIndex === -1) {
+                              nextBrandModels.push({
+                                brand,
+                                models: model ? [model] : [],
+                              });
+                            } else if (model) {
+                              const existing = nextBrandModels[existingIndex];
+                              const models = Array.from(new Set([...(existing.models || []), model]));
+                              nextBrandModels[existingIndex] = { ...existing, models };
+                            }
+                            return { ...prev, brandModels: nextBrandModels };
+                          });
+                          setNewEquipmentBrand('');
+                          setNewEquipmentModel('');
+                        }}
+                      >
+                        <Plus className="w-4 h-4" /> Adicionar Marca
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    {(equipmentBrandsData?.brandModels || []).length === 0 ? (
+                      <div className="rounded-md border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
+                        Nenhuma marca cadastrada ainda.
+                      </div>
+                    ) : (
+                      (equipmentBrandsData?.brandModels || []).map((entry) => (
+                        <div key={entry.brand} className="rounded-md border p-3">
+                          <div className="flex items-center justify-between">
+                            <div className="text-sm font-bold">{entry.brand}</div>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-rose-500"
+                              onClick={() => {
+                                if (!equipmentBrandsData) return;
+                                setEquipmentTypes((prev) => prev.map((eq) => {
+                                  if (eq.id !== equipmentBrandsData.id) return eq;
+                                  const nextBrandModels = (eq.brandModels || []).filter((item) =>
+                                    normalizeEquipmentText(item.brand) !== normalizeEquipmentText(entry.brand)
+                                  );
+                                  return { ...eq, brandModels: nextBrandModels };
+                                }));
+                                setEquipmentBrandsData((prev) => prev ? ({
+                                  ...prev,
+                                  brandModels: (prev.brandModels || []).filter((item) =>
+                                    normalizeEquipmentText(item.brand) !== normalizeEquipmentText(entry.brand)
+                                  )
+                                }) : prev);
+                              }}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </Button>
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {(entry.models || []).length === 0 ? (
+                              <span className="text-[10px] text-muted-foreground">Sem modelos cadastrados.</span>
+                            ) : (
+                              entry.models.map((model) => (
+                                <div key={model} className="flex items-center gap-2 rounded-full border px-3 py-1 text-[10px]">
+                                  <span>{model}</span>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-5 w-5"
+                                    onClick={() => {
+                                      if (!equipmentBrandsData) return;
+                                      setEquipmentTypes((prev) => prev.map((eq) => {
+                                        if (eq.id !== equipmentBrandsData.id) return eq;
+                                        const nextBrandModels = (eq.brandModels || []).map((item) => {
+                                          if (normalizeEquipmentText(item.brand) !== normalizeEquipmentText(entry.brand)) return item;
+                                          const nextModels = (item.models || []).filter((m) => normalizeEquipmentText(m) !== normalizeEquipmentText(model));
+                                          return { ...item, models: nextModels };
+                                        }).filter((item) => (item.models || []).length > 0 || normalizeEquipmentText(item.brand) !== normalizeEquipmentText(entry.brand));
+                                        return { ...eq, brandModels: nextBrandModels };
+                                      }));
+                                      setEquipmentBrandsData((prev) => {
+                                        if (!prev) return prev;
+                                        const nextBrandModels = (prev.brandModels || []).map((item) => {
+                                          if (normalizeEquipmentText(item.brand) !== normalizeEquipmentText(entry.brand)) return item;
+                                          const nextModels = (item.models || []).filter((m) => normalizeEquipmentText(m) !== normalizeEquipmentText(model));
+                                          return { ...item, models: nextModels };
+                                        }).filter((item) => (item.models || []).length > 0 || normalizeEquipmentText(item.brand) !== normalizeEquipmentText(entry.brand));
+                                        return { ...prev, brandModels: nextBrandModels };
+                                      });
+                                    }}
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </Button>
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <DialogFooter>
+                    <Button variant="outline" onClick={() => setIsEquipmentBrandsOpen(false)}>Fechar</Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+
+              <Dialog open={isEquipmentServicesOpen} onOpenChange={(open) => {
+                setIsEquipmentServicesOpen(open);
+                if (!open) {
+                  setEquipmentServicesData(null);
+                  setNewEquipmentServiceName('');
+                  setNewEquipmentServicePrice('0');
+                  setNewEquipmentServiceExecValue('1');
+                  setNewEquipmentServiceExecUnit('Horas');
+                }
+              }}>
+                <DialogContent className="max-w-2xl">
+                  <DialogHeader>
+                    <DialogTitle>Serviços Cadastrados</DialogTitle>
+                    <DialogDescription>
+                      Gerencie os serviços vinculados a {equipmentServicesData?.name || 'este equipamento'}.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="rounded-lg border bg-secondary/10 p-3">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                      <div className="space-y-2 md:col-span-2">
+                        <Label>Descrição do Serviço</Label>
+                        <Input
+                          value={newEquipmentServiceName}
+                          onChange={(e) => setNewEquipmentServiceName(e.target.value.toUpperCase())}
+                          placeholder="Ex: TROCA DE TELA"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Valor (R$)</Label>
+                        <Input
+                          type="number"
+                          min="0"
+                          value={newEquipmentServicePrice}
+                          onChange={(e) => setNewEquipmentServicePrice(e.target.value)}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Prazo</Label>
+                        <Input
+                          type="number"
+                          min="0"
+                          value={newEquipmentServiceExecValue}
+                          onChange={(e) => setNewEquipmentServiceExecValue(e.target.value)}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Unidade</Label>
+                        <Select value={newEquipmentServiceExecUnit} onValueChange={(v: any) => setNewEquipmentServiceExecUnit(v)}>
+                          <SelectTrigger><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="Horas">Horas</SelectItem>
+                            <SelectItem value="Dias">Dias</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                    <div className="flex justify-end mt-3">
+                      <Button
+                        size="sm"
+                        className="gap-2"
+                        onClick={() => {
+                          if (!equipmentServicesData) return;
+                          const description = normalizeEquipmentText(newEquipmentServiceName);
+                          if (!description) {
+                            toast.error('Informe a descricao do servico.');
+                            return;
+                          }
+                          const unitPrice = Number(newEquipmentServicePrice) || 0;
+                          const execValue = Math.max(0, Number(newEquipmentServiceExecValue) || 0);
+                          const servicePayload = {
+                            id: Math.random().toString(36).substr(2, 9),
+                            description,
+                            unitPrice,
+                            executionTimeValue: execValue > 0 ? execValue : undefined,
+                            executionTimeUnit: execValue > 0 ? newEquipmentServiceExecUnit : undefined,
+                          };
+
+                          setEquipmentTypes((prev) => prev.map((eq) => {
+                            if (eq.id !== equipmentServicesData.id) return eq;
+                            const nextServices = [...(eq.services || [])];
+                            const existingIndex = nextServices.findIndex((item) =>
+                              normalizeEquipmentText(item.description) === description
+                            );
+                            if (existingIndex >= 0) {
+                              nextServices[existingIndex] = { ...nextServices[existingIndex], ...servicePayload };
+                            } else {
+                              nextServices.push(servicePayload);
+                            }
+                            return { ...eq, services: nextServices };
+                          }));
+
+                          setEquipmentServicesData((prev) => {
+                            if (!prev) return prev;
+                            const nextServices = [...(prev.services || [])];
+                            const existingIndex = nextServices.findIndex((item) =>
+                              normalizeEquipmentText(item.description) === description
+                            );
+                            if (existingIndex >= 0) {
+                              nextServices[existingIndex] = { ...nextServices[existingIndex], ...servicePayload };
+                            } else {
+                              nextServices.push(servicePayload);
+                            }
+                            return { ...prev, services: nextServices };
+                          });
+
+                          setNewEquipmentServiceName('');
+                          setNewEquipmentServicePrice('0');
+                          setNewEquipmentServiceExecValue('1');
+                          setNewEquipmentServiceExecUnit('Horas');
+                        }}
+                      >
+                        <Plus className="w-4 h-4" /> Adicionar Servico
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    {(equipmentServicesData?.services || []).length === 0 ? (
+                      <div className="rounded-md border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
+                        Nenhum serviço cadastrado ainda.
+                      </div>
+                    ) : (
+                      (equipmentServicesData?.services || []).map((service) => (
+                        <div key={service.id} className="rounded-md border p-3 flex items-center justify-between">
+                          <div>
+                            <div className="text-sm font-bold">{service.description}</div>
+                            <div className="text-[10px] text-muted-foreground">
+                              Valor: R$ {(Number(service.unitPrice) || 0).toFixed(2)}
+                              {service.executionTimeValue && service.executionTimeUnit && (
+                                <span> • Prazo: {service.executionTimeValue} {service.executionTimeUnit}</span>
+                              )}
+                            </div>
+                          </div>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 text-rose-500"
+                            onClick={() => {
+                              if (!equipmentServicesData) return;
+                              setEquipmentTypes((prev) => prev.map((eq) => {
+                                if (eq.id !== equipmentServicesData.id) return eq;
+                                const nextServices = (eq.services || []).filter((item) => item.id !== service.id);
+                                return { ...eq, services: nextServices };
+                              }));
+                              setEquipmentServicesData((prev) => prev ? ({
+                                ...prev,
+                                services: (prev.services || []).filter((item) => item.id !== service.id)
+                              }) : prev);
+                            }}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <DialogFooter>
+                    <Button variant="outline" onClick={() => setIsEquipmentServicesOpen(false)}>Fechar</Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+
+              {/* ── DEADLINE RULES DIALOG ── */}
+              <Dialog open={isEquipmentDeadlineRulesOpen} onOpenChange={(open) => {
+                setIsEquipmentDeadlineRulesOpen(open);
+                if (!open) {
+                  setEquipmentDeadlineRulesData(null);
+                  setNewDeadlineRuleKeyword('');
+                  setNewDeadlineRuleDiagHours('0');
+                  setNewDeadlineRuleDiagDays('0');
+                  setNewDeadlineRuleCompHours('0');
+                  setNewDeadlineRuleCompDays('0');
+                }
+              }}>
+                <DialogContent className="max-w-3xl">
+                  <DialogHeader>
+                    <DialogTitle>Regras de Prazo — {equipmentDeadlineRulesData?.name}</DialogTitle>
+                    <DialogDescription>
+                      Defina exceções de prazo por serviço. Se um item da OS contém a palavra-chave, este prazo tem prioridade máxima sobre os padrões do equipamento.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="space-y-4">
+                    <div className="rounded-lg border border-dashed border-primary/30 bg-primary/5 p-3 space-y-3">
+                      <p className="text-xs font-bold uppercase tracking-wider text-primary">Nova Regra de Exceção</p>
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                        <div className="col-span-2 space-y-1">
+                          <Label className="text-xs">Palavra-chave do Serviço</Label>
+                          <Input
+                            placeholder="Ex: Formatação, Troca de tela..."
+                            value={newDeadlineRuleKeyword}
+                            onChange={(e) => setNewDeadlineRuleKeyword(e.target.value)}
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">Diag. Horas</Label>
+                          <Input type="number" min="0" value={newDeadlineRuleDiagHours} onChange={(e) => setNewDeadlineRuleDiagHours(e.target.value)} />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">Conc. Horas</Label>
+                          <Input type="number" min="0" value={newDeadlineRuleCompHours} onChange={(e) => setNewDeadlineRuleCompHours(e.target.value)} />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">Conc. Dias</Label>
+                          <Input type="number" min="0" value={newDeadlineRuleCompDays} onChange={(e) => setNewDeadlineRuleCompDays(e.target.value)} />
+                        </div>
+                      </div>
+                      <p className="text-[10px] text-muted-foreground">Deixe Diag. Horas = 0 para usar o padrão de diagnóstico do equipamento. Use Conc. Horas para serviços rápidos (ex: Formatação = 3 horas). Conc. Dias é adicionado ao prazo base.</p>
+                      <div className="flex justify-end">
+                        <Button size="sm" className="gap-2" onClick={() => {
+                          if (!equipmentDeadlineRulesData) return;
+                          const keyword = newDeadlineRuleKeyword.trim();
+                          if (!keyword) return toast.error('Informe a palavra-chave do serviço.');
+                          const diagH = Math.max(0, Number(newDeadlineRuleDiagHours) || 0);
+                          const compH = Math.max(0, Number(newDeadlineRuleCompHours) || 0);
+                          const compD = Math.max(0, Number(newDeadlineRuleCompDays) || 0);
+                          const newRule: EquipmentDeadlineRule = {
+                            id: Math.random().toString(36).substr(2, 9),
+                            serviceKeyword: keyword,
+                            diagnosisHours: diagH > 0 ? diagH : undefined,
+                            completionHours: compH > 0 ? compH : undefined,
+                            completionDays: compD > 0 ? compD : undefined,
+                            priority: (equipmentDeadlineRulesData.deadlineRules?.length || 0) + 1,
+                          };
+                          const updatedRules = [...(equipmentDeadlineRulesData.deadlineRules || []), newRule];
+                          setEquipmentTypes(prev => prev.map(eq => eq.id === equipmentDeadlineRulesData.id ? { ...eq, deadlineRules: updatedRules } : eq));
+                          setEquipmentDeadlineRulesData(prev => prev ? { ...prev, deadlineRules: updatedRules } : prev);
+                          setNewDeadlineRuleKeyword('');
+                          setNewDeadlineRuleDiagHours('0');
+                          setNewDeadlineRuleDiagDays('0');
+                          setNewDeadlineRuleCompHours('0');
+                          setNewDeadlineRuleCompDays('0');
+                          toast.success('Regra adicionada.');
+                        }}>
+                          <Plus className="w-4 h-4" /> Adicionar Regra
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="rounded-md border overflow-hidden">
+                      <table className="w-full text-sm">
+                        <thead className="bg-secondary/50 text-[10px] uppercase font-bold text-muted-foreground">
+                          <tr>
+                            <th className="px-4 py-2 text-left">Palavra-chave</th>
+                            <th className="px-4 py-2 text-center">Diag. Horas</th>
+                            <th className="px-4 py-2 text-center">Conc. Horas</th>
+                            <th className="px-4 py-2 text-center">Conc. Dias</th>
+                            <th className="px-4 py-2 text-right">Ação</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          {(equipmentDeadlineRulesData?.deadlineRules || []).length === 0 ? (
+                            <tr>
+                              <td colSpan={5} className="px-4 py-4 text-center text-xs text-muted-foreground italic">
+                                Nenhuma regra cadastrada. O sistema usará os prazos padrão do equipamento.
+                              </td>
+                            </tr>
+                          ) : (
+                            (equipmentDeadlineRulesData?.deadlineRules || []).map((rule) => (
+                              <tr key={rule.id} className="hover:bg-secondary/10">
+                                <td className="px-4 py-2 font-medium">{rule.serviceKeyword}</td>
+                                <td className="px-4 py-2 text-center text-xs">{rule.diagnosisHours ?? '—'}</td>
+                                <td className="px-4 py-2 text-center text-xs">{rule.completionHours ?? '—'}</td>
+                                <td className="px-4 py-2 text-center text-xs">{rule.completionDays ?? '—'}</td>
+                                <td className="px-4 py-2 text-right">
+                                  <Button
+                                    variant="ghost" size="icon" className="h-7 w-7 text-rose-500"
+                                    onClick={() => {
+                                      if (!equipmentDeadlineRulesData) return;
+                                      const updatedRules = (equipmentDeadlineRulesData.deadlineRules || []).filter(r => r.id !== rule.id);
+                                      setEquipmentTypes(prev => prev.map(eq => eq.id === equipmentDeadlineRulesData.id ? { ...eq, deadlineRules: updatedRules } : eq));
+                                      setEquipmentDeadlineRulesData(prev => prev ? { ...prev, deadlineRules: updatedRules } : prev);
+                                    }}
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </Button>
+                                </td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="rounded-lg border border-blue-200 bg-blue-50 dark:bg-blue-950/20 p-3 text-xs text-blue-800 dark:text-blue-300 space-y-1">
+                      <p className="font-bold">Hierarquia de verificação ao abrir OS:</p>
+                      <p>1. <span className="font-semibold">Regra de Serviço</span> — Se um item da OS contiver a palavra-chave, aplica este prazo (prioridade máxima).</p>
+                      <p>2. <span className="font-semibold">Padrão do Equipamento</span> — Diagnóstico e conclusão em dias configurados acima.</p>
+                      <p>3. <span className="font-semibold">Fallback</span> — Se nenhuma regra se aplicar, o sistema usa 1 dia diagnóstico / 3 dias conclusão.</p>
+                    </div>
+                  </div>
+                  <DialogFooter>
+                    <Button variant="outline" onClick={() => setIsEquipmentDeadlineRulesOpen(false)}>Fechar</Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
 
               <div className="rounded-md border">
                 <table className="w-full text-sm">
@@ -15016,6 +16919,10 @@ function SettingsView({
                       <th className="px-6 py-3 text-center">A partir Qtd.</th>
                       <th className="px-6 py-3 text-center">+Dias Diag.</th>
                       <th className="px-6 py-3 text-center">+Dias Conc.</th>
+                      <th className="px-6 py-3 text-center">Cobrança Diag.</th>
+                      <th className="px-6 py-3 text-center">Regras de Prazo</th>
+                      <th className="px-6 py-3 text-center">Marcas e Modelos</th>
+                      <th className="px-6 py-3 text-center">Serviços</th>
                       <th className="px-6 py-3 text-right">Ações</th>
                     </tr>
                   </thead>
@@ -15028,14 +16935,63 @@ function SettingsView({
                         <td className="px-6 py-4 text-center">{eq.overloadFromQty || 0}</td>
                         <td className="px-6 py-4 text-center">{eq.overloadDiagnosisDays || 0}</td>
                         <td className="px-6 py-4 text-center">{eq.overloadCompletionDays || 0}</td>
+                        <td className="px-6 py-4 text-center">
+                          {eq.chargeDiagnosisOnRejection ? (
+                            <span className="text-xs font-medium text-amber-700">Sim · R${(eq.diagnosisChargeValue || 0).toFixed(2)}</span>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">Não</span>
+                          )}
+                        </td>
+                        <td className="px-6 py-4 text-center">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 text-xs"
+                            onClick={() => {
+                              setEquipmentDeadlineRulesData({ ...eq });
+                              setIsEquipmentDeadlineRulesOpen(true);
+                            }}
+                          >
+                            {(eq.deadlineRules?.length || 0) > 0 ? `${eq.deadlineRules!.length} regras` : 'Ver Regras'}
+                          </Button>
+                        </td>
+                        <td className="px-6 py-4 text-center">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 text-xs"
+                            onClick={() => {
+                              setEquipmentBrandsData({ ...eq });
+                              setIsEquipmentBrandsOpen(true);
+                            }}
+                          >
+                            Ver Marcas
+                          </Button>
+                        </td>
+                        <td className="px-6 py-4 text-center">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 text-xs"
+                            onClick={() => {
+                              setEquipmentServicesData({ ...eq });
+                              setIsEquipmentServicesOpen(true);
+                            }}
+                          >
+                            Ver Serviços
+                          </Button>
+                        </td>
                         <td className="px-6 py-4 text-right">
-                          <div className="flex items-center justify-end gap-1">
+                          <div className="flex justify-end gap-2">
                             <Button
                               variant="ghost"
                               size="icon"
-                              className="h-8 w-8 text-primary"
-                              onClick={() => openEditEquipmentDialog(eq)}
-                              title="Editar equipamento"
+                              className="h-8 w-8"
+                              onClick={() => {
+                                setEquipmentEditData({ ...eq });
+                                setIsEquipmentEditOpen(true);
+                              }}
+                              title="Editar"
                             >
                               <Edit className="w-4 h-4" />
                             </Button>
@@ -15054,7 +17010,7 @@ function SettingsView({
                 <div>
                   <h3 className="text-sm font-bold uppercase tracking-widest text-primary">Padrões para Status "Aguardando Peça"</h3>
                   <p className="text-[11px] text-muted-foreground mt-1">
-                    Cadastre instituição/tipo de compra com prazo padrão para aplicar automaticamente no prazo de conclusão.
+                    Cadastre instituição/tipo de compra com prazo padrão. Ao selecionar na O.S, o prazo de conclusão será ajustado automaticamente.
                   </p>
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -15071,7 +17027,7 @@ function SettingsView({
                     <Input
                       value={newWaitingPurchaseType}
                       onChange={(e) => setNewWaitingPurchaseType(e.target.value)}
-                      placeholder="Ex: Importação, Marketplace..."
+                      placeholder="Ex: Importação, Mercado Livre..."
                     />
                   </div>
                   <div className="space-y-2">
@@ -15098,7 +17054,12 @@ function SettingsView({
                         ...prev,
                         waitingPartOptions: [
                           ...(prev.waitingPartOptions || []),
-                          { id: safeRandomUUID(), institutionName, purchaseType, deadlineDays },
+                          {
+                            id: safeRandomUUID(),
+                            institutionName,
+                            purchaseType,
+                            deadlineDays,
+                          },
                         ],
                       }));
                       setNewWaitingInstitutionName('');
@@ -15115,7 +17076,7 @@ function SettingsView({
                     <thead className="bg-secondary/40 text-[10px] uppercase font-bold text-muted-foreground">
                       <tr>
                         <th className="px-4 py-2 text-left">Instituição</th>
-                        <th className="px-4 py-2 text-left">Tipo Compra</th>
+                        <th className="px-4 py-2 text-left">Tipo de Compra</th>
                         <th className="px-4 py-2 text-center">Prazo</th>
                         <th className="px-4 py-2 text-right">Ações</th>
                       </tr>
@@ -15123,7 +17084,9 @@ function SettingsView({
                     <tbody className="divide-y">
                       {(company.waitingPartOptions || []).length === 0 ? (
                         <tr>
-                          <td colSpan={4} className="px-4 py-4 text-center text-xs text-muted-foreground italic">Nenhum padrão cadastrado.</td>
+                          <td colSpan={4} className="px-4 py-4 text-center text-xs text-muted-foreground italic">
+                            Nenhum padrão cadastrado.
+                          </td>
                         </tr>
                       ) : (
                         (company.waitingPartOptions || []).map((item) => (
@@ -15136,10 +17099,12 @@ function SettingsView({
                                 variant="ghost"
                                 size="icon"
                                 className="h-8 w-8 text-rose-500"
-                                onClick={() => setCompany((prev) => ({
-                                  ...prev,
-                                  waitingPartOptions: (prev.waitingPartOptions || []).filter((entry) => entry.id !== item.id),
-                                }))}
+                                onClick={() =>
+                                  setCompany((prev) => ({
+                                    ...prev,
+                                    waitingPartOptions: (prev.waitingPartOptions || []).filter((entry) => entry.id !== item.id),
+                                  }))
+                                }
                               >
                                 <Trash2 className="w-4 h-4" />
                               </Button>
@@ -15151,54 +17116,6 @@ function SettingsView({
                   </table>
                 </div>
               </div>
-
-              <Dialog open={isEditEquipmentDialogOpen} onOpenChange={setIsEditEquipmentDialogOpen}>
-                <DialogContent className="max-w-md">
-                  <DialogHeader>
-                    <DialogTitle>Editar Equipamento</DialogTitle>
-                    <DialogDescription>Atualize nome e prazos padrão.</DialogDescription>
-                  </DialogHeader>
-                  <div className="space-y-3 py-2">
-                    <div className="space-y-2">
-                      <Label>Nome do Equipamento</Label>
-                      <Input
-                        value={editingEquipmentDraft?.name || ''}
-                        onChange={(e) => setEditingEquipmentDraft((prev) => prev ? { ...prev, name: e.target.value } : prev)}
-                      />
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="space-y-2">
-                        <Label>Diagnóstico (dias)</Label>
-                        <Input
-                          type="number"
-                          min="0"
-                          value={String(editingEquipmentDraft?.defaultDiagnosisDays ?? 0)}
-                          onChange={(e) => {
-                            const value = Math.max(0, Number(e.target.value || 0));
-                            setEditingEquipmentDraft((prev) => prev ? { ...prev, defaultDiagnosisDays: value } : prev);
-                          }}
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label>Conclusão (dias)</Label>
-                        <Input
-                          type="number"
-                          min="0"
-                          value={String(editingEquipmentDraft?.defaultCompletionDays ?? 0)}
-                          onChange={(e) => {
-                            const value = Math.max(0, Number(e.target.value || 0));
-                            setEditingEquipmentDraft((prev) => prev ? { ...prev, defaultCompletionDays: value } : prev);
-                          }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                  <DialogFooter>
-                    <Button variant="outline" onClick={() => setIsEditEquipmentDialogOpen(false)}>Cancelar</Button>
-                    <Button onClick={saveEditedEquipment}>Salvar Alterações</Button>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
             </CardContent>
           </Card>
         </TabsContent>
@@ -15219,7 +17136,7 @@ function SettingsView({
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        {STATUS_COLUMNS.map(s => (
+                        {activeOsStatuses.map(s => (
                           <SelectItem key={s} value={s}>{s}</SelectItem>
                         ))}
                       </SelectContent>
@@ -15918,13 +17835,13 @@ function CalendarView({
   tasks, 
   onViewOS,
   onNavigate,
-  holidays
+  holidayCalendar,
 }: { 
   allOrders: ServiceOrder[], 
   tasks: any[], 
   onViewOS: (id: string) => void,
   onNavigate: (tab: string) => void,
-  holidays: HolidayApiItem[]
+  holidayCalendar: HolidayCalendarCache,
 }) {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [selectedDate, setSelectedDate] = useState(new Date());
@@ -15942,20 +17859,19 @@ function CalendarView({
 
   const nextMonth = () => setCurrentDate(addMonths(currentDate, 1));
   const prevMonth = () => setCurrentDate(subMonths(currentDate, 1));
+  const holidayLookup = useMemo(() => {
+    const map = new Map<string, HolidayApiItem>();
+    Object.values(holidayCalendar || {}).forEach((yearCache) => {
+      (yearCache?.holidays || []).forEach((item) => {
+        if (item?.date) map.set(item.date, item);
+      });
+    });
+    return map;
+  }, [holidayCalendar]);
 
   // Derive events from allOrders and tasks
   const getEventsForDay = (day: Date) => {
     const dayEvents: any[] = [];
-    const holiday = holidays.find((item) => normalizeHolidayDate(item.date) === toIsoDate(day));
-    if (holiday) {
-      dayEvents.push({
-        id: `holiday-${holiday.date}`,
-        title: holiday.name,
-        type: 'holiday',
-        color: 'bg-rose-500',
-        time: 'Feriado',
-      });
-    }
     
     // OS events (Diagnóstico)
     allOrders.forEach(os => {
@@ -15994,6 +17910,18 @@ function CalendarView({
         });
       }
     });
+
+    const holidayKey = format(day, 'yyyy-MM-dd');
+    const holiday = holidayLookup.get(holidayKey);
+    if (holiday) {
+      dayEvents.push({
+        id: `holiday-${holiday.date}`,
+        title: holiday.name,
+        type: 'holiday',
+        color: 'bg-rose-600',
+        time: 'Feriado',
+      });
+    }
 
     return dayEvents;
   };
@@ -16043,7 +17971,7 @@ function CalendarView({
               const diagCount = dayEvents.filter(e => e.type === 'diagnosis').length;
               const deliveryCount = dayEvents.filter(e => e.type === 'delivery').length;
               const taskCount = dayEvents.filter(e => e.type === 'task').length;
-              const holidayCount = dayEvents.filter(e => e.type === 'holiday').length;
+              const holidayEvent = dayEvents.find((e) => e.type === 'holiday');
 
               return (
                 <div
@@ -16065,9 +17993,8 @@ function CalendarView({
                       {format(day, 'd')}
                     </span>
                     
-                    {(diagCount > 0 || deliveryCount > 0 || holidayCount > 0) && (
+                    {(diagCount > 0 || deliveryCount > 0) && (
                       <div className="flex gap-1">
-                        {holidayCount > 0 && <div className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse" />}
                         {diagCount > 0 && <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />}
                         {deliveryCount > 0 && <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />}
                       </div>
@@ -16076,11 +18003,6 @@ function CalendarView({
 
                   <div className="space-y-1">
                     {/* Resumo visual por tipo */}
-                    {holidayCount > 0 && (
-                      <div className="px-1.5 py-0.5 text-[9px] font-black bg-rose-100 text-rose-700 rounded-sm flex items-center gap-1">
-                        <AlertCircle className="w-2 h-2" /> Feriado
-                      </div>
-                    )}
                     {diagCount > 0 && (
                       <div className="px-1.5 py-0.5 text-[9px] font-black bg-amber-100 text-amber-700 rounded-sm flex items-center gap-1">
                          <Search className="w-2 h-2" /> {diagCount} Diagnóstico{diagCount > 1 ? 's' : ''}
@@ -16094,6 +18016,11 @@ function CalendarView({
                     {taskCount > 0 && (
                       <div className="px-1.5 py-0.5 text-[9px] font-black bg-blue-100 text-blue-700 rounded-sm flex items-center gap-1">
                          <CheckCircle2 className="w-2 h-2" /> {taskCount} Tarefa{taskCount > 1 ? 's' : ''}
+                      </div>
+                    )}
+                    {holidayEvent && (
+                      <div className="px-1.5 py-0.5 text-[9px] font-black bg-rose-100 text-rose-700 rounded-sm truncate">
+                        Feriado: {holidayEvent.title}
                       </div>
                     )}
                   </div>
@@ -16142,8 +18069,9 @@ function CalendarView({
                       className={cn(
                         "flex items-start gap-3 p-3 rounded-xl border transition-all cursor-pointer hover:shadow-md",
                         event.type === 'task' ? "bg-secondary/20 border-secondary" :
-                        event.type === 'holiday' ? "bg-rose-50 border-rose-100" :
-                        event.type === 'diagnosis' ? "bg-amber-50 border-amber-100" : "bg-emerald-50 border-emerald-100"
+                        event.type === 'diagnosis' ? "bg-amber-50 border-amber-100" :
+                        event.type === 'holiday' ? "bg-rose-50 border-rose-100 cursor-default" :
+                        "bg-emerald-50 border-emerald-100"
                       )}
                     >
                       <div className={cn("w-1 h-8 rounded-full shrink-0", event.color)}></div>
@@ -16812,27 +18740,39 @@ function DynamicPrintView({
   template,
   data,
   company,
+  customer,
   onClose,
 }: {
   template: PrintTemplate;
   data: ServiceOrder;
   company: Company;
+  customer?: Customer | null;
   onClose: () => void;
 }) {
   const [isPrinting, setIsPrinting] = useState(false);
   const previewHostRef = useRef<HTMLDivElement | null>(null);
   const [previewScale, setPreviewScale] = useState(1);
+  const stageRef = useRef<any>(null);
+  const [printImage, setPrintImage] = useState('');
+  const [isClient, setIsClient] = useState(false);
   const MM_TO_PT = 2.83465;
+  const BASE_SCALE = 3.78;
+  const mmStrokeToCanvasPx = (strokeMm: number) => Math.max(0.25, strokeMm * BASE_SCALE);
+  const lineDashByStyle = (style?: TemplateElement['lineStyle']) => {
+    if (style === 'dashed') return [12, 8];
+    if (style === 'dotted') return [2, 8];
+    return undefined;
+  };
 
   const resolvedTemplate = useMemo(() => {
     const density = Math.min(2.5, Math.max(0.5, template.density || 1));
     return {
       ...template,
       orientation: template.orientation || 'vertical',
-      labelRows: 1,
+      labelRows: Math.max(1, template.labelRows || 1),
       labelColumns: Math.max(1, template.labelColumns || 1),
-      gapX: 0,
-      gapY: 0,
+      gapX: Math.max(0, template.gapX || 0),
+      gapY: Math.max(0, template.gapY || 0),
       density,
       shape: template.shape || 'rectangle',
       cornerRadius: Math.max(1, template.cornerRadius || 4),
@@ -16842,12 +18782,25 @@ function DynamicPrintView({
     };
   }, [template]);
 
-  const labelWidthMm = resolvedTemplate.orientation === 'horizontal' ? resolvedTemplate.height : resolvedTemplate.width;
-  const labelHeightMm = resolvedTemplate.orientation === 'horizontal' ? resolvedTemplate.width : resolvedTemplate.height;
-  const effectiveGapX = resolvedTemplate.gapX / resolvedTemplate.density;
-  const effectiveGapY = resolvedTemplate.gapY / resolvedTemplate.density;
-  const sheetWidthMm = (labelWidthMm * resolvedTemplate.labelColumns) + (effectiveGapX * (resolvedTemplate.labelColumns - 1));
+  const orientation = resolvedTemplate.orientation || 'vertical';
+  const density = Math.min(2.5, Math.max(0.5, resolvedTemplate.density || 1));
+  const totalWidthMm = orientation === 'horizontal' ? resolvedTemplate.height : resolvedTemplate.width;
+  const labelHeightMm = orientation === 'horizontal' ? resolvedTemplate.width : resolvedTemplate.height;
+  const maxGapX = resolvedTemplate.labelColumns > 1
+    ? Math.max(0, (totalWidthMm - (resolvedTemplate.labelColumns * 5)) / (resolvedTemplate.labelColumns - 1))
+    : 0;
+  const effectiveGapX = resolvedTemplate.labelColumns > 1
+    ? Math.min((resolvedTemplate.gapX || 0) / density, maxGapX)
+    : 0;
+  const effectiveGapY = (resolvedTemplate.gapY || 0) / density;
+  const labelWidthMm = Math.max(
+    5,
+    (totalWidthMm - (effectiveGapX * (resolvedTemplate.labelColumns - 1))) / resolvedTemplate.labelColumns
+  );
+  const sheetWidthMm = totalWidthMm;
   const sheetHeightMm = (labelHeightMm * resolvedTemplate.labelRows) + (effectiveGapY * (resolvedTemplate.labelRows - 1));
+  const stageWidthPx = sheetWidthMm * BASE_SCALE;
+  const stageHeightPx = sheetHeightMm * BASE_SCALE;
   const printCells = Array.from({ length: resolvedTemplate.labelRows * resolvedTemplate.labelColumns }, (_, index) => {
     const row = Math.floor(index / resolvedTemplate.labelColumns);
     const col = index % resolvedTemplate.labelColumns;
@@ -16857,6 +18810,12 @@ function DynamicPrintView({
       left: (col * labelWidthMm) + (col * effectiveGapX),
     };
   });
+
+  const getPrintableImage = () => {
+    const stage = stageRef.current;
+    if (!stage) return '';
+    return stage.toDataURL({ pixelRatio: 4, mimeType: 'image/png' });
+  };
 
   const labelBorder = resolvedTemplate.showBorder
     ? `${resolvedTemplate.borderThickness}mm ${resolvedTemplate.borderStyle === 'double' ? 'double' : resolvedTemplate.borderStyle} #111`
@@ -16916,6 +18875,22 @@ function DynamicPrintView({
     };
   }, [sheetHeightMm, sheetWidthMm]);
 
+  useEffect(() => {
+    setIsClient(true);
+  }, []);
+
+  useEffect(() => {
+    if (!isClient) return;
+    const timer = window.setTimeout(() => {
+      const image = getPrintableImage();
+      if (image) {
+        setPrintImage(image);
+      }
+    }, 80);
+
+    return () => window.clearTimeout(timer);
+  }, [isClient, sheetHeightMm, sheetWidthMm, data, customer, resolvedTemplate]);
+
   const replaceVariables = (content: string) => {
     let result = content;
     const variables: Record<string, any> = {
@@ -16928,6 +18903,7 @@ function DynamicPrintView({
       '{{problem}}': data.defect,
       '{{os_date}}': format(new Date(data.createdAt), 'dd/MM/yyyy'),
       '{{status}}': data.status,
+      '{{customer_phone}}': customer?.phone || (customer as any)?.phone2 || '',
       '{{company_name}}': company.name || company.razaoSocial || 'TechManager Assistência',
       '{{company_phone}}': company.phone || '',
     };
@@ -16953,6 +18929,7 @@ function DynamicPrintView({
       el.width || 45,
       el.height || 8
     );
+    const fontSizeMm = fittedFontSize / MM_TO_PT;
 
     if (el.type === 'line') {
       return `
@@ -17005,11 +18982,13 @@ function DynamicPrintView({
           width:${el.width ? `${el.width}mm` : 'auto'};
           height:${el.height ? `${el.height}mm` : 'auto'};
           display:flex;
-          align-items:center;
+          align-items:${(el.wrapMode || 'wrap') === 'single-line' ? 'center' : 'flex-start'};
           line-height:1;
-          font-size:${fittedFontSize}pt;
+          font-size:${fontSizeMm}mm;
+          line-height:${fontSizeMm}mm;
           font-weight:${el.fontWeight === 'bold' ? 700 : 400};
           text-align:${el.textAlign || 'left'};
+          font-family: Arial, sans-serif;
           white-space:${(el.wrapMode || 'wrap') === 'single-line' ? 'nowrap' : 'pre-wrap'};
           overflow-wrap:${(el.wrapMode || 'wrap') === 'single-line' ? 'normal' : 'anywhere'};
           word-break:${(el.wrapMode || 'wrap') === 'single-line' ? 'normal' : 'break-word'};
@@ -17022,27 +19001,8 @@ function DynamicPrintView({
   };
 
   const buildPrintDocumentHtml = () => {
-    const shapeCss = [
-      labelBorder !== 'none' ? `border:${labelBorder};` : 'border:none;',
-      resolvedTemplate.shape === 'rounded' ? `border-radius:${resolvedTemplate.cornerRadius}mm;` : '',
-      resolvedTemplate.shape === 'ellipse' ? 'border-radius:50%; clip-path:ellipse(50% 50% at 50% 50%);' : '',
-      'overflow:hidden;',
-      'box-sizing:border-box;',
-    ].join(' ');
-
-    const cellsHtml = printCells.map((cell) => `
-      <div
-        style="
-          width:${labelWidthMm}mm;
-          height:${labelHeightMm}mm;
-          position:relative;
-          ${shapeCss}
-        "
-        data-cell-id="${escapeHtml(cell.id)}"
-      >
-        ${resolvedTemplate.elements.map((el) => renderPrintElementHtml(cell.id, el)).join('')}
-      </div>
-    `).join('');
+    const image = printImage || getPrintableImage();
+    if (!image) return '';
 
     return `
       <!DOCTYPE html>
@@ -17079,24 +19039,16 @@ function DynamicPrintView({
               page-break-after: avoid;
               break-after: avoid;
             }
-            .print-grid {
-              display: grid;
-              grid-template-columns: repeat(${resolvedTemplate.labelColumns}, ${labelWidthMm}mm);
-              column-gap: 0mm;
-              row-gap: 0mm;
+            .print-image {
+              display: block;
               width: ${sheetWidthMm}mm;
               height: ${sheetHeightMm}mm;
-              max-height: ${sheetHeightMm}mm;
-              overflow: hidden;
-              page-break-inside: avoid;
-              break-inside: avoid;
-              page-break-after: avoid;
-              break-after: avoid;
+              object-fit: fill;
             }
           </style>
         </head>
         <body>
-          <div class="print-grid">${cellsHtml}</div>
+          <img class="print-image" src="${image}" alt="Etiqueta" />
         </body>
       </html>
     `;
@@ -17104,7 +19056,8 @@ function DynamicPrintView({
 
   const handlePrint = () => {
     setIsPrinting(true);
-    const started = printHtmlUsingHiddenFrame(buildPrintDocumentHtml());
+    const printHtml = buildPrintDocumentHtml();
+    const started = printHtml ? printHtmlUsingHiddenFrame(printHtml) : false;
     if (!started) {
       toast.error('Nao foi possivel iniciar a impressao nativa do navegador.');
     }
@@ -17126,186 +19079,151 @@ function DynamicPrintView({
                 minWidth: `${sheetWidthMm * previewScale}mm`,
               }}
             >
-              <div style={{ transform: `scale(${previewScale})`, transformOrigin: 'top left' }}>
-                <div 
-                  id="printable-area"
-                  className="bg-white border shadow-xl relative print:shadow-none print:border-none"
-                  style={{ 
-                    width: `${sheetWidthMm}mm`, 
-                    height: `${sheetHeightMm}mm`,
-                    minWidth: `${sheetWidthMm}mm`,
-                    padding: 0,
-                    margin: '0 auto',
-                    position: 'relative',
-                    overflow: 'hidden',
-                    flexShrink: 0
+              {printImage ? (
+                <img
+                  src={printImage}
+                  alt="Preview da etiqueta"
+                  style={{
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'fill',
+                    display: 'block',
                   }}
-                >
-                  {printCells.map((cell) => (
-                    <div
-                      key={cell.id}
-                      style={{
-                        position: 'absolute',
-                        left: `${cell.left}mm`,
-                        top: `${cell.top}mm`,
-                        width: `${labelWidthMm}mm`,
-                        height: `${labelHeightMm}mm`,
-                        ...labelShapeStyle,
-                      }}
-                    >
-                      {resolvedTemplate.elements.map((el) => {
-                        const displayContent = el.type === 'variable' ? replaceVariables(el.content) : el.content;
-                        const fittedFontSize = getFittedFontSizePt(
-                          displayContent,
-                          el.fontSize || 12,
-                          el.width || 45,
-                          el.height || 8
-                        );
-                        const style: React.CSSProperties = {
-                          position: 'absolute',
-                          left: `${el.x}mm`,
-                          top: `${el.y}mm`,
-                          fontSize: `${fittedFontSize}pt`,
-                          fontWeight: el.fontWeight as any,
-                          width: el.width ? `${el.width}mm` : 'auto',
-                          height: el.height ? `${el.height}mm` : 'auto',
-                          display: 'flex',
-                          alignItems: 'center',
-                          lineHeight: 1,
-                          textAlign: el.textAlign || 'left',
-                          whiteSpace: (el.wrapMode || 'wrap') === 'single-line' ? 'nowrap' : 'pre-wrap',
-                          overflowWrap: (el.wrapMode || 'wrap') === 'single-line' ? 'normal' : 'anywhere',
-                          wordBreak: (el.wrapMode || 'wrap') === 'single-line' ? 'normal' : 'break-word',
-                          overflow: 'hidden',
-                          textOverflow: (el.wrapMode || 'wrap') === 'single-line' ? 'ellipsis' : 'clip'
-                        };
-
-                        if (el.type === 'line') {
-                          return (
-                            <div
-                              key={`${cell.id}-${el.id}`}
-                              style={{
-                                ...style,
-                                borderTop: `${Math.max(0.2, el.strokeWidth || 0.6)}mm ${el.lineStyle || 'solid'} #111`,
-                                height: 0,
-                              }}
-                            />
-                          );
-                        }
-
-                        if (el.type === 'qr' || el.type === 'barcode') {
-                          return (
-                            <div
-                              key={`${cell.id}-${el.id}`}
-                              style={{
-                                ...style,
-                                border: '1px solid black',
-                                display: 'flex',
-                                flexDirection: 'column',
-                                justifyContent: 'center',
-                                alignItems: 'center',
-                                background: '#eee'
-                              }}
-                            >
-                              <QrCode className="w-8 h-8" />
-                              <span className="text-[8px] uppercase">{el.type}</span>
-                            </div>
-                          );
-                        }
-
-                        return (
-                          <div key={`${cell.id}-${el.id}`} style={style}>
-                            {displayContent}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ))}
+                />
+              ) : (
+                <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+                  Gerando preview...
                 </div>
-              </div>
+              )}
             </div>
           </div>
-          <div id="printable-grid" className="hidden" style={printGridStyle}>
-            {printCells.map((cell) => (
-              <div
-                key={`print-${cell.id}`}
-                style={{
-                  width: `${labelWidthMm}mm`,
-                  height: `${labelHeightMm}mm`,
-                  position: 'relative',
-                  boxSizing: 'border-box',
-                  ...labelShapeStyle,
-                }}
-              >
-                {resolvedTemplate.elements.map((el) => {
-                  const displayContent = el.type === 'variable' ? replaceVariables(el.content) : el.content;
-                  const fittedFontSize = getFittedFontSizePt(
-                    displayContent,
-                    el.fontSize || 12,
-                    el.width || 45,
-                    el.height || 8
-                  );
-                  const style: React.CSSProperties = {
-                    position: 'absolute',
-                    left: `${el.x}mm`,
-                    top: `${el.y}mm`,
-                    fontSize: `${fittedFontSize}pt`,
-                    fontWeight: el.fontWeight as any,
-                    width: el.width ? `${el.width}mm` : 'auto',
-                    height: el.height ? `${el.height}mm` : 'auto',
-                    display: 'flex',
-                    alignItems: 'center',
-                    lineHeight: 1,
-                    textAlign: el.textAlign || 'left',
-                    whiteSpace: (el.wrapMode || 'wrap') === 'single-line' ? 'nowrap' : 'pre-wrap',
-                    overflowWrap: (el.wrapMode || 'wrap') === 'single-line' ? 'normal' : 'anywhere',
-                    wordBreak: (el.wrapMode || 'wrap') === 'single-line' ? 'normal' : 'break-word',
-                    overflow: 'hidden',
-                    textOverflow: (el.wrapMode || 'wrap') === 'single-line' ? 'ellipsis' : 'clip'
-                  };
-
-                  if (el.type === 'line') {
+          {isClient && (
+            <div className="sr-only">
+              <Stage ref={stageRef} width={stageWidthPx} height={stageHeightPx}>
+                <Layer>
+                  {printCells.map((cell) => {
+                    const offsetX = cell.left * BASE_SCALE;
+                    const offsetY = cell.top * BASE_SCALE;
                     return (
-                      <div
-                        key={`print-${cell.id}-${el.id}`}
-                        style={{
-                          ...style,
-                          borderTop: `${Math.max(0.2, el.strokeWidth || 0.6)}mm ${el.lineStyle || 'solid'} #111`,
-                          height: 0,
-                        }}
-                      />
-                    );
-                  }
+                      <KonvaGroup key={cell.id} x={offsetX} y={offsetY}>
+                        {resolvedTemplate.showBorder && (
+                          <KonvaRect
+                            x={0}
+                            y={0}
+                            width={labelWidthMm * BASE_SCALE}
+                            height={labelHeightMm * BASE_SCALE}
+                            cornerRadius={resolvedTemplate.shape === 'rounded' ? resolvedTemplate.cornerRadius * BASE_SCALE : 0}
+                            stroke="#111"
+                            strokeWidth={mmStrokeToCanvasPx(resolvedTemplate.borderThickness || 0.5)}
+                            dash={lineDashByStyle(resolvedTemplate.borderStyle)}
+                          />
+                        )}
+                        {resolvedTemplate.shape === 'ellipse' && (
+                          <KonvaEllipse
+                            x={(labelWidthMm * BASE_SCALE) / 2}
+                            y={(labelHeightMm * BASE_SCALE) / 2}
+                            radiusX={(labelWidthMm * BASE_SCALE) / 2}
+                            radiusY={(labelHeightMm * BASE_SCALE) / 2}
+                            stroke="#111"
+                            strokeWidth={mmStrokeToCanvasPx(resolvedTemplate.borderThickness || 0.5)}
+                          />
+                        )}
+                        {resolvedTemplate.elements.map((el) => {
+                          const displayContent = el.type === 'variable' ? replaceVariables(el.content) : el.content;
+                          const fittedFontSize = getFittedFontSizePt(
+                            displayContent,
+                            el.fontSize || 12,
+                            el.width || 45,
+                            el.height || 8
+                          );
+                          const fontSizePx = fittedFontSize * (96 / 72);
 
-                  if (el.type === 'qr' || el.type === 'barcode') {
-                    return (
-                      <div
-                        key={`print-${cell.id}-${el.id}`}
-                        style={{
-                          ...style,
-                          border: '1px solid black',
-                          display: 'flex',
-                          flexDirection: 'column',
-                          justifyContent: 'center',
-                          alignItems: 'center',
-                          background: '#eee'
-                        }}
-                      >
-                        <QrCode className="w-8 h-8" />
-                        <span className="text-[8px] uppercase">{el.type}</span>
-                      </div>
-                    );
-                  }
+                          if (el.type === 'line') {
+                            const lineStroke = mmStrokeToCanvasPx(el.strokeWidth || 0.6);
+                            const widthPx = (el.width || 45) * BASE_SCALE;
+                            if (el.lineStyle === 'double') {
+                              return (
+                                <KonvaGroup key={`${cell.id}-${el.id}`} x={el.x * BASE_SCALE} y={el.y * BASE_SCALE}>
+                                  <KonvaLine
+                                    points={[0, -lineStroke, widthPx, -lineStroke]}
+                                    stroke="#111"
+                                    strokeWidth={lineStroke}
+                                  />
+                                  <KonvaLine
+                                    points={[0, lineStroke, widthPx, lineStroke]}
+                                    stroke="#111"
+                                    strokeWidth={lineStroke}
+                                  />
+                                </KonvaGroup>
+                              );
+                            }
 
-                  return (
-                    <div key={`print-${cell.id}-${el.id}`} style={style}>
-                      {displayContent}
-                    </div>
-                  );
-                })}
-              </div>
-            ))}
-          </div>
+                            return (
+                              <KonvaLine
+                                key={`${cell.id}-${el.id}`}
+                                points={[
+                                  el.x * BASE_SCALE,
+                                  el.y * BASE_SCALE,
+                                  (el.x + (el.width || 45)) * BASE_SCALE,
+                                  el.y * BASE_SCALE,
+                                ]}
+                                stroke="#111"
+                                strokeWidth={lineStroke}
+                                dash={lineDashByStyle(el.lineStyle)}
+                              />
+                            );
+                          }
+
+                          if (el.type === 'qr' || el.type === 'barcode') {
+                            const widthPx = (el.width || 12) * BASE_SCALE;
+                            const heightPx = (el.height || 12) * BASE_SCALE;
+                            return (
+                              <KonvaGroup key={`${cell.id}-${el.id}`} x={el.x * BASE_SCALE} y={el.y * BASE_SCALE}>
+                                <KonvaRect
+                                  width={widthPx}
+                                  height={heightPx}
+                                  fill="#f3f4f6"
+                                  stroke="#111"
+                                  strokeWidth={1}
+                                />
+                                <KonvaText
+                                  text={el.type.toUpperCase()}
+                                  width={widthPx}
+                                  height={heightPx}
+                                  align="center"
+                                  verticalAlign="middle"
+                                  fontSize={10}
+                                  fontFamily="Arial"
+                                />
+                              </KonvaGroup>
+                            );
+                          }
+
+                          return (
+                            <KonvaText
+                              key={`${cell.id}-${el.id}`}
+                              text={displayContent}
+                              x={el.x * BASE_SCALE}
+                              y={el.y * BASE_SCALE}
+                              width={(el.width || 45) * BASE_SCALE}
+                              height={(el.height || 8) * BASE_SCALE}
+                              align={el.textAlign || 'left'}
+                              verticalAlign={(el.wrapMode || 'wrap') === 'single-line' ? 'middle' : 'top'}
+                              wrap={(el.wrapMode || 'wrap') === 'single-line' ? 'none' : 'char'}
+                              ellipsis={(el.wrapMode || 'wrap') === 'single-line'}
+                              fontSize={fontSizePx}
+                              fontStyle={el.fontWeight === 'bold' ? 'bold' : 'normal'}
+                              fontFamily="Arial"
+                            />
+                          );
+                        })}
+                      </KonvaGroup>
+                    );
+                  })}
+                </Layer>
+              </Stage>
+            </div>
+          )}
           <div className="flex gap-2 print:hidden bg-white/10 p-2 rounded-lg backdrop-blur-md">
             <Button variant="outline" className="bg-white" onClick={onClose}>Fechar</Button>
             <Button className="gap-2" onClick={handlePrint}>

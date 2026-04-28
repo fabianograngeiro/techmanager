@@ -24,8 +24,22 @@ async function startServer() {
   app.use(express.json());
 
   // JSON persistence fallback
-  const DB_PATH = path.join(__dirname, 'db.json');
-  const SUPPORT_CONTEXTS_PATH = path.join(__dirname, 'support-contexts.tmp.json');
+  const resolveDataDir = () => {
+    const envDataDir = process.env.TECHMANAGER_DATA_DIR || process.env.APP_DATA_DIR;
+    if (envDataDir && envDataDir.trim()) {
+      return path.resolve(envDataDir.trim());
+    }
+
+    // Keep app data outside transpiled/build folders to survive deploys and git pulls.
+    return path.join(process.cwd(), '.techmanager-data');
+  };
+
+  const DATA_DIR = resolveDataDir();
+  const DB_PATH = path.join(DATA_DIR, 'db.json');
+  const DB_BACKUP_PATH = path.join(DATA_DIR, 'db.backup.json');
+  const SUPPORT_CONTEXTS_PATH = path.join(DATA_DIR, 'support-contexts.tmp.json');
+  const LEGACY_DB_PATH = path.join(__dirname, 'db.json');
+  const LEGACY_SUPPORT_CONTEXTS_PATH = path.join(__dirname, 'support-contexts.tmp.json');
   const buildDefaultDb = () => ({
     companies: [],
     users: [],
@@ -48,24 +62,39 @@ async function startServer() {
     whatsappConfigs: {},
   });
 
+  const writeJsonFile = (filePath: string, data: unknown) => {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  };
+
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+
+  // One-time migration from old location (dist/app folder) to persistent data dir.
+  if (!fs.existsSync(DB_PATH) && fs.existsSync(LEGACY_DB_PATH)) {
+    fs.copyFileSync(LEGACY_DB_PATH, DB_PATH);
+  }
+
+  if (!fs.existsSync(SUPPORT_CONTEXTS_PATH) && fs.existsSync(LEGACY_SUPPORT_CONTEXTS_PATH)) {
+    fs.copyFileSync(LEGACY_SUPPORT_CONTEXTS_PATH, SUPPORT_CONTEXTS_PATH);
+  }
+
   const readDb = () => {
     const defaults = buildDefaultDb();
 
     try {
       if (!fs.existsSync(DB_PATH)) {
-        fs.writeFileSync(DB_PATH, JSON.stringify(defaults, null, 2));
+        writeJsonFile(DB_PATH, defaults);
         return defaults;
       }
 
       const raw = fs.readFileSync(DB_PATH, 'utf-8');
       if (!raw.trim()) {
-        fs.writeFileSync(DB_PATH, JSON.stringify(defaults, null, 2));
+        writeJsonFile(DB_PATH, defaults);
         return defaults;
       }
 
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        fs.writeFileSync(DB_PATH, JSON.stringify(defaults, null, 2));
+        writeJsonFile(DB_PATH, defaults);
         return defaults;
       }
 
@@ -74,21 +103,46 @@ async function startServer() {
         ...parsed,
       };
     } catch (error) {
-      console.warn('db.json inválido, restaurando estrutura padrão.', error);
-      fs.writeFileSync(DB_PATH, JSON.stringify(defaults, null, 2));
+      console.warn('db.json inválido, tentando restaurar backup.', error);
+
+      try {
+        if (fs.existsSync(DB_BACKUP_PATH)) {
+          const backupRaw = fs.readFileSync(DB_BACKUP_PATH, 'utf-8');
+          const backupParsed = JSON.parse(backupRaw);
+          if (backupParsed && typeof backupParsed === 'object' && !Array.isArray(backupParsed)) {
+            writeJsonFile(DB_PATH, backupParsed);
+            return {
+              ...defaults,
+              ...backupParsed,
+            };
+          }
+        }
+      } catch (backupError) {
+        console.warn('Falha ao restaurar backup do db.json.', backupError);
+      }
+
+      writeJsonFile(DB_PATH, defaults);
       return defaults;
     }
   };
 
   const writeDb = (data: Record<string, unknown>) => {
-    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+    const tempPath = `${DB_PATH}.tmp`;
+    writeJsonFile(tempPath, data);
+
+    if (fs.existsSync(DB_PATH)) {
+      fs.copyFileSync(DB_PATH, DB_BACKUP_PATH);
+    }
+
+    fs.renameSync(tempPath, DB_PATH);
   };
+
   if (!fs.existsSync(DB_PATH)) {
-    fs.writeFileSync(DB_PATH, JSON.stringify(buildDefaultDb(), null, 2));
+    writeJsonFile(DB_PATH, buildDefaultDb());
   }
 
   if (!fs.existsSync(SUPPORT_CONTEXTS_PATH)) {
-    fs.writeFileSync(SUPPORT_CONTEXTS_PATH, JSON.stringify({ threads: {} }, null, 2));
+    writeJsonFile(SUPPORT_CONTEXTS_PATH, { threads: {} });
   }
 
   // API Routes
@@ -96,9 +150,28 @@ async function startServer() {
     res.json({ status: 'ok' });
   });
 
-  app.get('/api/app-state', (_req, res) => {
+  app.get('/api/app-state', (req, res) => {
     try {
-      res.json(readDb());
+      const state = readDb();
+      const rawKeys = typeof req.query.keys === 'string' ? req.query.keys : '';
+      const keys = rawKeys
+        .split(',')
+        .map((key) => key.trim())
+        .filter(Boolean);
+
+      if (!keys.length) {
+        res.json(state);
+        return;
+      }
+
+      const filteredState = keys.reduce<Record<string, unknown>>((acc, key) => {
+        if (Object.prototype.hasOwnProperty.call(state, key)) {
+          acc[key] = (state as Record<string, unknown>)[key];
+        }
+        return acc;
+      }, {});
+
+      res.json(filteredState);
     } catch (error) {
       console.error('Erro ao carregar estado do app:', error);
       res.status(500).json({ error: 'Falha ao carregar dados do aplicativo.' });
