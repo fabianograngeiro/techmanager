@@ -280,11 +280,13 @@ export interface ServiceOrder {
   completionDeadline?: string;
   paymentStatus?: 'Pendente' | 'Pago' | 'Parcial';
   paymentDate?: string;
+  deliveredAt?: string;
   items?: OSItem[];
   serviceType?: 'Normal' | 'Garantia' | 'Retorno';
   isApproved?: boolean;
   accessories?: string;
   details?: string;
+  observation?: string;
   cancellationReason?: string;
   cancellationDate?: string;
   rejectionReason?: string;

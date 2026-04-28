@@ -1754,6 +1754,44 @@ const ROLE_FRIENDLY_NAMES: Record<string, string> = {
   'USUARIO': 'Técnico'
 };
 
+const getBatchWindowStart = (windowEnd: number, batchSize: number) => Math.max(0, windowEnd - batchSize);
+
+const getVisibleBatch = <T,>(items: T[], windowEnd: number, batchSize: number) =>
+  items.slice(getBatchWindowStart(windowEnd, batchSize), Math.min(windowEnd, items.length));
+
+const BatchNavigation = ({
+  windowEnd,
+  total,
+  batchSize,
+  summary,
+  onPrevious,
+  onNext,
+}: {
+  windowEnd: number;
+  total: number;
+  batchSize: number;
+  summary: string;
+  onPrevious: () => void;
+  onNext: () => void;
+}) => {
+  const canGoPrevious = windowEnd > batchSize;
+  const canGoNext = windowEnd < total;
+
+  return (
+    <div className="flex flex-col gap-2 px-1 sm:flex-row sm:items-center sm:justify-between">
+      <p className="text-xs text-muted-foreground">{summary}</p>
+      <div className="flex items-center gap-2">
+        <Button type="button" variant="outline" size="sm" onClick={onPrevious} disabled={!canGoPrevious}>
+          <ChevronLeft className="mr-1 h-4 w-4" /> Recuar 20
+        </Button>
+        <Button type="button" variant="outline" size="sm" onClick={onNext} disabled={!canGoNext}>
+          Avançar 20 <ChevronRight className="ml-1 h-4 w-4" />
+        </Button>
+      </div>
+    </div>
+  );
+};
+
 const SidebarItem = ({ icon: Icon, label, active, collapsed, onClick }: any) => (
   <button
     onClick={onClick}
@@ -2293,9 +2331,6 @@ export default function App() {
 
         if (cancelled) return;
 
-        setIsAppStateLoaded(true);
-        setIsBackendStateHydrated(true);
-
         for (const key of heavyKeys) {
           if (cancelled) break;
           try {
@@ -2311,11 +2346,14 @@ export default function App() {
 
         if (!cancelled) {
           isHydratingAppStateRef.current = false;
+          setIsBackendStateHydrated(true);
+          setIsAppStateLoaded(true);
         }
       } catch (error) {
         console.error('Erro ao carregar estado do banco:', error);
         if (!cancelled) {
           isHydratingAppStateRef.current = false;
+          setIsBackendStateHydrated(true);
           setIsAppStateLoaded(true);
         }
       }
@@ -2577,6 +2615,7 @@ export default function App() {
   useEffect(() => {
     if (!isAppStateLoaded || !isBackendStateHydrated) return;
     const run = async () => {
+      if (user?.role !== 'ADMIN-USER') return;
       const today = startOfDay(new Date());
       const seenKey = `techmanager_holiday_prompt_seen_${format(today, 'yyyy-MM-dd')}`;
       if (localStorage.getItem(seenKey)) return;
@@ -2590,12 +2629,12 @@ export default function App() {
         .sort((a, b) => a.date.localeCompare(b.date));
 
       const nextHoliday = allCached.find((item) => {
-        const date = startOfDay(new Date(item.date));
+        const date = startOfDay(new Date(item.date + 'T12:00:00'));
         return !Number.isNaN(date.getTime()) && differenceInDays(date, today) >= 0;
       });
       if (!nextHoliday) return;
 
-      const daysLeft = differenceInDays(startOfDay(new Date(nextHoliday.date)), today);
+      const daysLeft = differenceInDays(startOfDay(new Date(nextHoliday.date + 'T12:00:00')), today);
       if (daysLeft > 5) return;
 
       const override = company.holidayWorkOverrides?.[nextHoliday.date];
@@ -2610,7 +2649,7 @@ export default function App() {
       localStorage.setItem(seenKey, '1');
     };
     run();
-  }, [isAppStateLoaded, isBackendStateHydrated, company.businessHoursHolidayClosed, company.businessHoursStart, company.businessHoursBreakStart, company.businessHoursEnd, company.holidayWorkOverrides]);
+  }, [isAppStateLoaded, isBackendStateHydrated, user, company.businessHoursHolidayClosed, company.businessHoursStart, company.businessHoursBreakStart, company.businessHoursEnd, company.holidayWorkOverrides]);
 
   const confirmHolidayPrompt = () => {
     if (!holidayPromptHoliday) {
@@ -2732,7 +2771,14 @@ export default function App() {
       case 'tarefas':
         return <TasksView tasks={tasks} setTasks={setTasks} />;
       case 'clientes':
-        return <CustomerView customers={globalCustomers} setCustomers={setGlobalCustomers} />;
+        return (
+          <CustomerView
+            customers={globalCustomers}
+            setCustomers={setGlobalCustomers}
+            allOrders={allOrders}
+            onViewOS={(id) => setViewingOSId(id)}
+          />
+        );
       case 'estoque':
         return (
           <StockView 
@@ -2888,7 +2934,7 @@ export default function App() {
             <DialogTitle>Planejamento de Feriado</DialogTitle>
             <DialogDescription>
               {holidayPromptHoliday
-                ? `Faltam até 5 dias para ${holidayPromptHoliday.name} (${format(new Date(holidayPromptHoliday.date), 'dd/MM/yyyy')}).`
+                ? `${holidayPromptHoliday.name} está próximo. O feriado será em ${format(new Date(holidayPromptHoliday.date + 'T12:00:00'), 'dd/MM/yyyy')}.`
                 : 'Configure o horário para o próximo feriado.'}
             </DialogDescription>
           </DialogHeader>
@@ -6013,6 +6059,7 @@ function OSListView({
   holidayCalendar: HolidayCalendarCache,
   setHolidayCalendar: React.Dispatch<React.SetStateAction<HolidayCalendarCache>>
 }) {
+  const INITIAL_LIST_WINDOW = 20;
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isNewCustomerOpen, setIsNewCustomerOpen] = useState(false);
   const [customerSearch, setCustomerSearch] = useState('');
@@ -6466,6 +6513,7 @@ function OSListView({
   const [newOSEquipment, setNewOSEquipment] = useState('');
   const [newOSBrand, setNewOSBrand] = useState('');
   const [newOSModel, setNewOSModel] = useState('');
+  const [visibleOrdersCount, setVisibleOrdersCount] = useState(INITIAL_LIST_WINDOW);
   const [isServiceSuggestionOpen, setIsServiceSuggestionOpen] = useState(false);
 
   const normalizeUpperText = (value: string) => String(value || '').trim().toUpperCase();
@@ -6635,12 +6683,24 @@ function OSListView({
 
   const totalOSValue = newOsItems.reduce((acc, curr) => acc + curr.totalPrice, 0);
 
-  const filteredCustomers = globalCustomers.filter(c =>
-    fuzzyMatch(c.name, customerSearch) ||
-    fuzzyMatch(c.doc || '', customerSearch) ||
-    fuzzyMatch(c.phone || '', customerSearch) ||
-    fuzzyMatch(c.email || '', customerSearch)
+  const recentCustomers = useMemo(
+    () => [...globalCustomers].slice(-INITIAL_LIST_WINDOW).reverse(),
+    [globalCustomers]
   );
+
+  const customerSuggestions = useMemo(() => {
+    const query = customerSearch.trim();
+    if (!query) return recentCustomers;
+
+    return globalCustomers
+      .filter((c) =>
+        fuzzyMatch(c.name, query) ||
+        fuzzyMatch(c.doc || '', query) ||
+        fuzzyMatch(c.phone || '', query) ||
+        fuzzyMatch(c.email || '', query)
+      )
+      .slice(0, INITIAL_LIST_WINDOW);
+  }, [globalCustomers, customerSearch, recentCustomers]);
 
   const filteredOrders = allOrders.filter(os => {
     const normalizedQuery = filterQuery.trim();
@@ -6700,6 +6760,15 @@ function OSListView({
       }
     });
   }, [filteredOrders, sortOrder]);
+
+  useEffect(() => {
+    setVisibleOrdersCount(INITIAL_LIST_WINDOW);
+  }, [filterField, filterQuery, statusFilter, sortOrder, user?.role]);
+
+  const visibleOrders = useMemo(
+    () => getVisibleBatch(sortedOrders, visibleOrdersCount, INITIAL_LIST_WINDOW),
+    [sortedOrders, visibleOrdersCount]
+  );
 
   const handleSaveOS = async (e: any) => {
     e.preventDefault();
@@ -6864,6 +6933,7 @@ function OSListView({
       defect: (formData.get('defeito') as string || '').toUpperCase(),
       details: (formData.get('defeito_balcao') as string || '').toUpperCase(),
       accessories: (formData.get('acessorios') as string || '').toUpperCase(),
+      observation: (formData.get('observacao') as string || '').toUpperCase(),
       status: formData.get('status') as any || 'Aberta',
       serviceType: formData.get('serviceType') as any,
       isApproved: formData.get('isApproved') !== null,
@@ -7246,9 +7316,9 @@ function OSListView({
                         }}
                         onFocus={() => setShowCustomerResults(true)}
                       />
-                      {showCustomerResults && customerSearch && filteredCustomers.length > 0 && (
+                      {showCustomerResults && customerSuggestions.length > 0 && (
                         <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg max-h-40 overflow-y-auto">
-                          {filteredCustomers.map(c => (
+                          {customerSuggestions.map(c => (
                             <div 
                               key={c.id} 
                               className="px-4 py-2 hover:bg-secondary cursor-pointer text-sm"
@@ -7263,7 +7333,7 @@ function OSListView({
                           ))}
                         </div>
                       )}
-                      {showCustomerResults && customerSearch.trim() && filteredCustomers.length === 0 && (
+                      {showCustomerResults && customerSearch.trim() && customerSuggestions.length === 0 && (
                         <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg p-3">
                           <p className="text-sm font-medium text-rose-600">Este cliente não existe no cadastro.</p>
                           <p className="text-xs text-muted-foreground mt-1">Clique no botão + para cadastrar este nome.</p>
@@ -7518,6 +7588,16 @@ function OSListView({
                   name="acessorios"
                   className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm uppercase ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                   placeholder="EX: CAPINHA, CARREGADOR, CARTÃO DE MEMÓRIA..."
+                  onInput={(e) => e.currentTarget.value = e.currentTarget.value.toUpperCase()}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="observacao" className="uppercase text-[10px] font-bold">Observacao</Label>
+                <textarea
+                  id="observacao"
+                  name="observacao"
+                  className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm uppercase ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  placeholder="INFORMACOES ADICIONAIS DA O.S..."
                   onInput={(e) => e.currentTarget.value = e.currentTarget.value.toUpperCase()}
                 />
               </div>
@@ -7798,6 +7878,16 @@ function OSListView({
     </div>
 
       <Card className="border-none shadow-sm overflow-hidden">
+        <div className="border-b bg-secondary/5 p-3">
+          <BatchNavigation
+            windowEnd={visibleOrdersCount}
+            total={sortedOrders.length}
+            batchSize={INITIAL_LIST_WINDOW}
+            summary={`Mostrando ${visibleOrders.length} de ${sortedOrders.length} O.S.`}
+            onPrevious={() => setVisibleOrdersCount((prev) => Math.max(INITIAL_LIST_WINDOW, prev - INITIAL_LIST_WINDOW))}
+            onNext={() => setVisibleOrdersCount((prev) => Math.min(sortedOrders.length, prev + INITIAL_LIST_WINDOW))}
+          />
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm text-left">
             <thead className="text-xs uppercase bg-secondary/50 text-muted-foreground">
@@ -7813,7 +7903,7 @@ function OSListView({
               </tr>
             </thead>
             <tbody className="divide-y">
-              {sortedOrders.length > 0 ? sortedOrders.map((os) => {
+              {sortedOrders.length > 0 ? visibleOrders.map((os) => {
                 const getDeadlineColor = (deadline?: string) => {
                   if (!deadline) return "text-muted-foreground";
                   const today = startOfDay(new Date());
@@ -8003,6 +8093,14 @@ function OSListView({
           </table>
         </div>
       </Card>
+      <BatchNavigation
+        windowEnd={visibleOrdersCount}
+        total={sortedOrders.length}
+        batchSize={INITIAL_LIST_WINDOW}
+        summary={`Mostrando ${visibleOrders.length} de ${sortedOrders.length} O.S.`}
+        onPrevious={() => setVisibleOrdersCount((prev) => Math.max(INITIAL_LIST_WINDOW, prev - INITIAL_LIST_WINDOW))}
+        onNext={() => setVisibleOrdersCount((prev) => Math.min(sortedOrders.length, prev + INITIAL_LIST_WINDOW))}
+      />
 
       <Dialog open={isCancelDialogOpen} onOpenChange={(open) => {
         setIsCancelDialogOpen(open);
@@ -8315,11 +8413,16 @@ function OSListView({
 
 function CustomerView({ 
   customers, 
-  setCustomers 
+  setCustomers,
+  allOrders,
+  onViewOS,
 }: { 
   customers: any[], 
-  setCustomers: React.Dispatch<React.SetStateAction<any[]>> 
+  setCustomers: React.Dispatch<React.SetStateAction<any[]>>,
+  allOrders: ServiceOrder[],
+  onViewOS: (id: string) => void,
 }) {
+  const INITIAL_CUSTOMERS_WINDOW = 20;
   const emptyCustomer = {
     name: '',
     doc: '',
@@ -8337,15 +8440,85 @@ function CustomerView({
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [customerSearch, setCustomerSearch] = useState('');
   const [newCustomer, setNewCustomer] = useState<any>(emptyCustomer);
+  const [visibleCustomersCount, setVisibleCustomersCount] = useState(INITIAL_CUSTOMERS_WINDOW);
   const [editingCustomerId, setEditingCustomerId] = useState<string | null>(null);
+  const [historyCustomer, setHistoryCustomer] = useState<any | null>(null);
   const [isCustomerCnpjLookupLoading, setIsCustomerCnpjLookupLoading] = useState(false);
   const [isCustomerCepLookupLoading, setIsCustomerCepLookupLoading] = useState(false);
   
-  const filteredCustomers = customers.filter(c => 
-    fuzzyMatch(c.name, customerSearch) ||
-    fuzzyMatch(c.doc || '', customerSearch) ||
-    fuzzyMatch(c.phone || '', customerSearch) ||
-    fuzzyMatch(c.email || '', customerSearch)
+  const filteredCustomers = useMemo(() => {
+    const query = customerSearch.trim();
+    if (!query) {
+      return [...customers].slice(-INITIAL_CUSTOMERS_WINDOW).reverse();
+    }
+
+    return customers.filter((c) =>
+      fuzzyMatch(c.name, query) ||
+      fuzzyMatch(c.doc || '', query) ||
+      fuzzyMatch(c.phone || '', query) ||
+      fuzzyMatch(c.email || '', query)
+    );
+  }, [customers, customerSearch]);
+
+  useEffect(() => {
+    setVisibleCustomersCount(INITIAL_CUSTOMERS_WINDOW);
+  }, [customerSearch]);
+
+  const visibleCustomers = useMemo(
+    () => getVisibleBatch(filteredCustomers, visibleCustomersCount, INITIAL_CUSTOMERS_WINDOW),
+    [filteredCustomers, visibleCustomersCount]
+  );
+
+  const normalizeCustomerDoc = (value?: string) => onlyDigits(String(value || ''));
+  const normalizeCustomerName = (value?: string) =>
+    String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim();
+
+  const parseOrderTimestamp = (value?: string) => {
+    if (!value) return 0;
+    const parsed = new Date(value).getTime();
+    return Number.isNaN(parsed) ? 0 : parsed;
+  };
+
+  const formatOrderTimestamp = (value?: string) => {
+    const parsed = parseOrderTimestamp(value);
+    return parsed ? format(new Date(parsed), 'dd/MM/yyyy HH:mm') : '--';
+  };
+
+  const customersById = useMemo(
+    () => new Map(customers.map((item) => [item.id, item])),
+    [customers]
+  );
+
+  const getCustomerHistoryOrders = (customer: any) => {
+    const customerDoc = normalizeCustomerDoc(customer?.doc || customer?.document);
+    const customerName = normalizeCustomerName(customer?.name);
+
+    return allOrders
+      .filter((order) => {
+        if (order.customerId === customer.id) return true;
+
+        const linkedCustomer = customersById.get(order.customerId);
+        const linkedCustomerDoc = normalizeCustomerDoc(linkedCustomer?.doc || linkedCustomer?.document);
+        if (customerDoc && linkedCustomerDoc) {
+          return customerDoc === linkedCustomerDoc;
+        }
+
+        return normalizeCustomerName(order.customerName || linkedCustomer?.name) === customerName;
+      })
+      .sort((a, b) => {
+        const aDate = parseOrderTimestamp(a.updatedAt || a.createdAt);
+        const bDate = parseOrderTimestamp(b.updatedAt || b.createdAt);
+        return bDate - aDate;
+      });
+  };
+
+  const historyOrders = useMemo(
+    () => (historyCustomer ? getCustomerHistoryOrders(historyCustomer) : []),
+    [historyCustomer, allOrders, customersById]
   );
 
   const handleLookupCustomerByCnpj = async () => {
@@ -8611,6 +8784,18 @@ function CustomerView({
     </div>
 
     <Card className="border-none shadow-sm">
+      <div className="border-b bg-secondary/5 p-3">
+        <BatchNavigation
+          windowEnd={visibleCustomersCount}
+          total={filteredCustomers.length}
+          batchSize={INITIAL_CUSTOMERS_WINDOW}
+          summary={customerSearch.trim()
+            ? `Mostrando ${visibleCustomers.length} de ${filteredCustomers.length} clientes filtrados.`
+            : `Mostrando ${visibleCustomers.length} clientes mais recentes.`}
+          onPrevious={() => setVisibleCustomersCount((prev) => Math.max(INITIAL_CUSTOMERS_WINDOW, prev - INITIAL_CUSTOMERS_WINDOW))}
+          onNext={() => setVisibleCustomersCount((prev) => Math.min(filteredCustomers.length, prev + INITIAL_CUSTOMERS_WINDOW))}
+        />
+      </div>
       <div className="p-4 border-b flex gap-4">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
@@ -8628,26 +8813,32 @@ function CustomerView({
             <thead className="bg-secondary/30 text-muted-foreground uppercase text-[10px] font-bold">
               <tr>
                 <th className="px-6 py-3">Nome / Razão Social</th>
-                <th className="px-6 py-3">Documento</th>
-                <th className="px-6 py-3">Contato</th>
-                <th className="px-6 py-3">Cidade</th>
+                <th className="px-6 py-3">CPF / CNPJ</th>
+                <th className="px-6 py-3">Telefone</th>
+                <th className="px-6 py-3">E-mail</th>
+                <th className="px-6 py-3">Estado</th>
                 <th className="px-6 py-3 text-center">Ações</th>
               </tr>
             </thead>
             <tbody className="divide-y">
-              {filteredCustomers.map((c) => (
+              {visibleCustomers.map((c) => (
                 <tr key={c.id} className="hover:bg-secondary/10 transition-colors">
                   <td className="px-6 py-4 font-medium"><span className="flex items-center flex-wrap gap-0.5">{c.name}{c.importedFromBackup && <BackupBadge />}</span></td>
                   <td className="px-6 py-4 text-muted-foreground">{c.doc}</td>
-                  <td className="px-6 py-4">
-                    <div className="flex flex-col">
-                      <span>{c.phone}</span>
-                      <span className="text-xs text-muted-foreground">{c.email}</span>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4">{c.city}</td>
+                  <td className="px-6 py-4">{c.phone || '--'}</td>
+                  <td className="px-6 py-4 text-muted-foreground">{c.email || '--'}</td>
+                  <td className="px-6 py-4">{c.state || '--'}</td>
                   <td className="px-6 py-4">
                     <div className="flex justify-center gap-2">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-indigo-600"
+                        title="Histórico de O.S."
+                        onClick={() => setHistoryCustomer(c)}
+                      >
+                        <History className="w-4 h-4" />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="icon"
@@ -8674,6 +8865,77 @@ function CustomerView({
           </table>
         </div>
       </Card>
+      <BatchNavigation
+        windowEnd={visibleCustomersCount}
+        total={filteredCustomers.length}
+        batchSize={INITIAL_CUSTOMERS_WINDOW}
+        summary={customerSearch.trim()
+          ? `Mostrando ${visibleCustomers.length} de ${filteredCustomers.length} clientes filtrados.`
+          : `Mostrando ${visibleCustomers.length} clientes mais recentes.`}
+        onPrevious={() => setVisibleCustomersCount((prev) => Math.max(INITIAL_CUSTOMERS_WINDOW, prev - INITIAL_CUSTOMERS_WINDOW))}
+        onNext={() => setVisibleCustomersCount((prev) => Math.min(filteredCustomers.length, prev + INITIAL_CUSTOMERS_WINDOW))}
+      />
+
+      <Dialog open={!!historyCustomer} onOpenChange={(open) => !open && setHistoryCustomer(null)}>
+        <DialogContent className="max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>Histórico de Ordens de Serviço</DialogTitle>
+            <DialogDescription>
+              {historyCustomer
+                ? `Resultados para ${historyCustomer.name}. A busca prioriza CPF/CNPJ e usa nome completo quando o documento não estiver disponível.`
+                : 'Nenhum cliente selecionado.'}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar">
+            <table className="w-full text-sm text-left">
+              <thead className="sticky top-0 bg-secondary/30 text-muted-foreground uppercase text-[10px] font-bold">
+                <tr>
+                  <th className="px-4 py-3">O.S.</th>
+                  <th className="px-4 py-3">Equipamento</th>
+                  <th className="px-4 py-3">Status</th>
+                  <th className="px-4 py-3">Atualizada em</th>
+                  <th className="px-4 py-3 text-right">Ação</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {historyOrders.length > 0 ? historyOrders.map((order) => (
+                  <tr key={order.id} className="hover:bg-secondary/10 transition-colors">
+                    <td className="px-4 py-3 font-bold text-primary">{order.number}</td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-col">
+                        <span>{order.equipment}</span>
+                        <span className="text-xs text-muted-foreground">{[order.brand, order.model].filter(Boolean).join(' / ') || '--'}</span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3"><OSBadge status={order.status} /></td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">
+                      {formatOrderTimestamp(order.updatedAt || order.createdAt)}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setHistoryCustomer(null);
+                          onViewOS(order.id);
+                        }}
+                      >
+                        Ver O.S.
+                      </Button>
+                    </td>
+                  </tr>
+                )) : (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-10 text-center text-muted-foreground italic">
+                      Nenhuma ordem de serviço relacionada a este cliente.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -8697,6 +8959,7 @@ function StockView({
   setRmaHistory: React.Dispatch<React.SetStateAction<any[]>>,
   salesHistory?: any[]
 }) {
+  const INITIAL_STOCK_WINDOW = 20;
   const [isProductModalOpen, setIsProductModalOpen] = useState(false);
   const [isBuyModalOpen, setIsBuyModalOpen] = useState(false);
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
@@ -8729,6 +8992,10 @@ function StockView({
   const [fiscalCstIcmsValue, setFiscalCstIcmsValue] = useState('');
   const [fiscalCstPisValue, setFiscalCstPisValue] = useState('');
   const [fiscalCstCofinsValue, setFiscalCstCofinsValue] = useState('');
+  const [visibleLowStockCount, setVisibleLowStockCount] = useState(INITIAL_STOCK_WINDOW);
+  const [visibleStockProductsCount, setVisibleStockProductsCount] = useState(INITIAL_STOCK_WINDOW);
+  const [visibleInventoryProductsCount, setVisibleInventoryProductsCount] = useState(INITIAL_STOCK_WINDOW);
+  const [visibleRmaCount, setVisibleRmaCount] = useState(INITIAL_STOCK_WINDOW);
   const products = allProducts;
 
   const productImageFitClass = {
@@ -8888,6 +9155,35 @@ function StockView({
     const matchesCategory = stockFilterCategory === 'todas' || p.cat === stockFilterCategory;
     return matchesSearch && matchesCategory;
   });
+
+  const buyProductSuggestions = useMemo(
+    () => filteredBuyProducts.slice(0, INITIAL_STOCK_WINDOW),
+    [filteredBuyProducts]
+  );
+
+  const visibleLowStockProducts = useMemo(
+    () => getVisibleBatch(lowStockProducts, visibleLowStockCount, INITIAL_STOCK_WINDOW),
+    [lowStockProducts, visibleLowStockCount]
+  );
+
+  const visibleStockProducts = useMemo(
+    () => getVisibleBatch(filteredStockProducts, visibleStockProductsCount, INITIAL_STOCK_WINDOW),
+    [filteredStockProducts, visibleStockProductsCount]
+  );
+
+  const visibleInventoryProducts = useMemo(
+    () => getVisibleBatch(products, visibleInventoryProductsCount, INITIAL_STOCK_WINDOW),
+    [products, visibleInventoryProductsCount]
+  );
+
+  const visibleRmaHistory = useMemo(
+    () => getVisibleBatch(rmaHistory, visibleRmaCount, INITIAL_STOCK_WINDOW),
+    [rmaHistory, visibleRmaCount]
+  );
+
+  useEffect(() => {
+    setVisibleStockProductsCount(INITIAL_STOCK_WINDOW);
+  }, [stockSearch, stockFilterCategory]);
 
   const parseSalesDate = (value: string) => {
     if (!value) return null;
@@ -9097,9 +9393,9 @@ function StockView({
                     value={buySearch}
                     onChange={(e) => setBuySearch(e.target.value)}
                   />
-                  {buySearch && filteredBuyProducts.length > 0 && (
+                  {buySearch && buyProductSuggestions.length > 0 && (
                     <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg max-h-40 overflow-y-auto">
-                      {filteredBuyProducts.map(p => (
+                      {buyProductSuggestions.map(p => (
                         <div 
                           key={p.id} 
                           className="px-4 py-2 hover:bg-secondary cursor-pointer flex justify-between items-center"
@@ -9119,7 +9415,7 @@ function StockView({
                       ))}
                     </div>
                   )}
-                  {buySearch && filteredBuyProducts.length === 0 && (
+                  {buySearch && buyProductSuggestions.length === 0 && (
                     <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg p-4 text-center">
                       <p className="text-sm text-muted-foreground mb-2">Produto não encontrado</p>
                       <Button size="sm" className="gap-2" onClick={() => setIsProductModalOpen(true)}>
@@ -9137,6 +9433,16 @@ function StockView({
                     Itens com Estoque Crítico
                   </h3>
                   <div className="rounded-md border overflow-hidden">
+                    <div className="border-b bg-secondary/5 p-3">
+                      <BatchNavigation
+                        windowEnd={visibleLowStockCount}
+                        total={lowStockProducts.length}
+                        batchSize={INITIAL_STOCK_WINDOW}
+                        summary={`Mostrando ${visibleLowStockProducts.length} de ${lowStockProducts.length} itens críticos.`}
+                        onPrevious={() => setVisibleLowStockCount((prev) => Math.max(INITIAL_STOCK_WINDOW, prev - INITIAL_STOCK_WINDOW))}
+                        onNext={() => setVisibleLowStockCount((prev) => Math.min(lowStockProducts.length, prev + INITIAL_STOCK_WINDOW))}
+                      />
+                    </div>
                     <table className="w-full text-sm">
                       <thead className="bg-secondary/50">
                         <tr>
@@ -9148,7 +9454,7 @@ function StockView({
                         </tr>
                       </thead>
                       <tbody className="divide-y">
-                        {lowStockProducts.map(p => (
+                        {visibleLowStockProducts.map(p => (
                           <tr key={p.id} className="hover:bg-secondary/10">
                             <td className="px-4 py-2">
                               <div className="font-medium">{p.name}</div>
@@ -9171,6 +9477,14 @@ function StockView({
                       </tbody>
                     </table>
                   </div>
+                  <BatchNavigation
+                    windowEnd={visibleLowStockCount}
+                    total={lowStockProducts.length}
+                    batchSize={INITIAL_STOCK_WINDOW}
+                    summary={`Mostrando ${visibleLowStockProducts.length} de ${lowStockProducts.length} itens críticos.`}
+                    onPrevious={() => setVisibleLowStockCount((prev) => Math.max(INITIAL_STOCK_WINDOW, prev - INITIAL_STOCK_WINDOW))}
+                    onNext={() => setVisibleLowStockCount((prev) => Math.min(lowStockProducts.length, prev + INITIAL_STOCK_WINDOW))}
+                  />
                 </div>
               </div>
 
@@ -9850,6 +10164,16 @@ function StockView({
               </div>
               <Button className="gap-2"><Plus className="w-4 h-4" /> Novo RMA</Button>
             </div>
+            <div className="border-b bg-secondary/5 p-3">
+              <BatchNavigation
+                windowEnd={visibleRmaCount}
+                total={rmaHistory.length}
+                batchSize={INITIAL_STOCK_WINDOW}
+                summary={`Mostrando ${visibleRmaHistory.length} de ${rmaHistory.length} registros de RMA.`}
+                onPrevious={() => setVisibleRmaCount((prev) => Math.max(INITIAL_STOCK_WINDOW, prev - INITIAL_STOCK_WINDOW))}
+                onNext={() => setVisibleRmaCount((prev) => Math.min(rmaHistory.length, prev + INITIAL_STOCK_WINDOW))}
+              />
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className="bg-secondary/30 text-muted-foreground uppercase text-[10px] font-bold">
@@ -9863,7 +10187,7 @@ function StockView({
                   </tr>
                 </thead>
                 <tbody className="divide-y bg-white">
-                  {rmaHistory.map((rma) => (
+                  {visibleRmaHistory.map((rma) => (
                     <tr key={rma.id} className="hover:bg-secondary/5 transition-colors">
                       <td className="px-6 py-4">
                         <p className="font-bold">{rma.product}</p>
@@ -9893,6 +10217,16 @@ function StockView({
                   )}
                 </tbody>
               </table>
+            </div>
+            <div className="p-3 border-t bg-secondary/5">
+              <BatchNavigation
+                windowEnd={visibleRmaCount}
+                total={rmaHistory.length}
+                batchSize={INITIAL_STOCK_WINDOW}
+                summary={`Mostrando ${visibleRmaHistory.length} de ${rmaHistory.length} registros de RMA.`}
+                onPrevious={() => setVisibleRmaCount((prev) => Math.max(INITIAL_STOCK_WINDOW, prev - INITIAL_STOCK_WINDOW))}
+                onNext={() => setVisibleRmaCount((prev) => Math.min(rmaHistory.length, prev + INITIAL_STOCK_WINDOW))}
+              />
             </div>
           </Card>
         </TabsContent>
@@ -10009,6 +10343,16 @@ function StockView({
 
           <TabsContent value="lista" className="mt-6 space-y-6">
           <Card className="border-none shadow-sm">
+            <div className="border-b bg-secondary/5 p-3">
+              <BatchNavigation
+                windowEnd={visibleStockProductsCount}
+                total={filteredStockProducts.length}
+                batchSize={INITIAL_STOCK_WINDOW}
+                summary={`Mostrando ${visibleStockProducts.length} de ${filteredStockProducts.length} produtos.`}
+                onPrevious={() => setVisibleStockProductsCount((prev) => Math.max(INITIAL_STOCK_WINDOW, prev - INITIAL_STOCK_WINDOW))}
+                onNext={() => setVisibleStockProductsCount((prev) => Math.min(filteredStockProducts.length, prev + INITIAL_STOCK_WINDOW))}
+              />
+            </div>
             <div className="p-4 border-b flex flex-col md:flex-row gap-4">
               <div className="relative flex-1">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
@@ -10057,7 +10401,7 @@ function StockView({
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {filteredStockProducts.length > 0 ? filteredStockProducts.map((p) => (
+                  {filteredStockProducts.length > 0 ? visibleStockProducts.map((p) => (
                     <tr key={p.id} className="hover:bg-secondary/10 transition-colors">
                       <td className="px-6 py-4 font-medium">
                         <div className="flex items-center gap-3">
@@ -10152,6 +10496,16 @@ function StockView({
                 </tbody>
               </table>
             </div>
+            <div className="p-3 border-t bg-secondary/5">
+              <BatchNavigation
+                windowEnd={visibleStockProductsCount}
+                total={filteredStockProducts.length}
+                batchSize={INITIAL_STOCK_WINDOW}
+                summary={`Mostrando ${visibleStockProducts.length} de ${filteredStockProducts.length} produtos.`}
+                onPrevious={() => setVisibleStockProductsCount((prev) => Math.max(INITIAL_STOCK_WINDOW, prev - INITIAL_STOCK_WINDOW))}
+                onNext={() => setVisibleStockProductsCount((prev) => Math.min(filteredStockProducts.length, prev + INITIAL_STOCK_WINDOW))}
+              />
+            </div>
           </Card>
         </TabsContent>
 
@@ -10203,6 +10557,16 @@ function StockView({
               </Button>
             </CardHeader>
             <CardContent>
+              <div className="pb-3">
+                <BatchNavigation
+                  windowEnd={visibleInventoryProductsCount}
+                  total={products.length}
+                  batchSize={INITIAL_STOCK_WINDOW}
+                  summary={`Mostrando ${visibleInventoryProducts.length} de ${products.length} itens no inventário.`}
+                  onPrevious={() => setVisibleInventoryProductsCount((prev) => Math.max(INITIAL_STOCK_WINDOW, prev - INITIAL_STOCK_WINDOW))}
+                  onNext={() => setVisibleInventoryProductsCount((prev) => Math.min(products.length, prev + INITIAL_STOCK_WINDOW))}
+                />
+              </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm text-left">
                   <thead className="bg-secondary/30 text-muted-foreground uppercase text-[10px] font-bold">
@@ -10216,7 +10580,7 @@ function StockView({
                     </tr>
                   </thead>
                   <tbody className="divide-y">
-                    {products.map((p) => (
+                    {visibleInventoryProducts.map((p) => (
                       <tr key={p.id} className="hover:bg-secondary/10 transition-colors">
                         <td className="px-6 py-4">
                           <p className="font-bold">{p.name}</p>
@@ -10231,6 +10595,16 @@ function StockView({
                     ))}
                   </tbody>
                 </table>
+              </div>
+              <div className="pt-3">
+                <BatchNavigation
+                  windowEnd={visibleInventoryProductsCount}
+                  total={products.length}
+                  batchSize={INITIAL_STOCK_WINDOW}
+                  summary={`Mostrando ${visibleInventoryProducts.length} de ${products.length} itens no inventário.`}
+                  onPrevious={() => setVisibleInventoryProductsCount((prev) => Math.max(INITIAL_STOCK_WINDOW, prev - INITIAL_STOCK_WINDOW))}
+                  onNext={() => setVisibleInventoryProductsCount((prev) => Math.min(products.length, prev + INITIAL_STOCK_WINDOW))}
+                />
               </div>
             </CardContent>
           </Card>
@@ -10276,10 +10650,15 @@ function FinanceView({
   transactions: any[], 
   setTransactions: React.Dispatch<React.SetStateAction<any[]>> 
 }) {
+  const INITIAL_FINANCE_WINDOW = 20;
   const [isIncomeModalOpen, setIsIncomeModalOpen] = useState(false);
   const [isExpenseModalOpen, setIsExpenseModalOpen] = useState(false);
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [expenseType, setExpenseType] = useState<'avulsa' | 'fixa'>('avulsa');
+  const [visibleTransactionsCount, setVisibleTransactionsCount] = useState(INITIAL_FINANCE_WINDOW);
+  const [visiblePayableCount, setVisiblePayableCount] = useState(INITIAL_FINANCE_WINDOW);
+  const [visibleReceivableCount, setVisibleReceivableCount] = useState(INITIAL_FINANCE_WINDOW);
+  const [visibleFixedExpensesCount, setVisibleFixedExpensesCount] = useState(INITIAL_FINANCE_WINDOW);
   
   const [newExpCatName, setNewExpCatName] = useState('');
   const [newExpCatIcon, setNewExpCatIcon] = useState<any>(Tag);
@@ -10356,6 +10735,23 @@ function FinanceView({
   const currentLiabilities = totalPayable;
   const workingCapital = currentAssets - currentLiabilities;
   const currentRatio = currentLiabilities > 0 ? currentAssets / currentLiabilities : 0;
+
+  const visibleTransactions = useMemo(
+    () => getVisibleBatch(transactions, visibleTransactionsCount, INITIAL_FINANCE_WINDOW),
+    [transactions, visibleTransactionsCount]
+  );
+  const visiblePayable = useMemo(
+    () => getVisibleBatch(payable, visiblePayableCount, INITIAL_FINANCE_WINDOW),
+    [payable, visiblePayableCount]
+  );
+  const visibleReceivable = useMemo(
+    () => getVisibleBatch(receivable, visibleReceivableCount, INITIAL_FINANCE_WINDOW),
+    [receivable, visibleReceivableCount]
+  );
+  const visibleFixedExpenses = useMemo(
+    () => getVisibleBatch(fixedExpenses, visibleFixedExpensesCount, INITIAL_FINANCE_WINDOW),
+    [fixedExpenses, visibleFixedExpensesCount]
+  );
 
   return (
     <div className="space-y-6">
@@ -10515,6 +10911,16 @@ function FinanceView({
         </TabsList>
         <TabsContent value="fluxo" className="mt-6">
           <Card className="border-none shadow-sm">
+            <div className="border-b bg-secondary/5 p-3">
+              <BatchNavigation
+                windowEnd={visibleTransactionsCount}
+                total={transactions.length}
+                batchSize={INITIAL_FINANCE_WINDOW}
+                summary={`Mostrando ${visibleTransactions.length} de ${transactions.length} transações.`}
+                onPrevious={() => setVisibleTransactionsCount((prev) => Math.max(INITIAL_FINANCE_WINDOW, prev - INITIAL_FINANCE_WINDOW))}
+                onNext={() => setVisibleTransactionsCount((prev) => Math.min(transactions.length, prev + INITIAL_FINANCE_WINDOW))}
+              />
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className="bg-secondary/30 text-muted-foreground uppercase text-[10px] font-bold">
@@ -10527,7 +10933,7 @@ function FinanceView({
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {transactions.map((t) => (
+                  {visibleTransactions.map((t) => (
                     <tr key={t.id} className="hover:bg-secondary/10 transition-colors">
                       <td className="px-6 py-4 text-muted-foreground">{t.date}</td>
                       <td className="px-6 py-4 font-medium">{t.desc}</td>
@@ -10550,11 +10956,31 @@ function FinanceView({
                 </tbody>
               </table>
             </div>
+            <div className="p-3 border-t bg-secondary/5">
+              <BatchNavigation
+                windowEnd={visibleTransactionsCount}
+                total={transactions.length}
+                batchSize={INITIAL_FINANCE_WINDOW}
+                summary={`Mostrando ${visibleTransactions.length} de ${transactions.length} transações.`}
+                onPrevious={() => setVisibleTransactionsCount((prev) => Math.max(INITIAL_FINANCE_WINDOW, prev - INITIAL_FINANCE_WINDOW))}
+                onNext={() => setVisibleTransactionsCount((prev) => Math.min(transactions.length, prev + INITIAL_FINANCE_WINDOW))}
+              />
+            </div>
           </Card>
         </TabsContent>
 
         <TabsContent value="pagar" className="mt-6">
           <Card className="border-none shadow-sm">
+            <div className="border-b bg-secondary/5 p-3">
+              <BatchNavigation
+                windowEnd={visiblePayableCount}
+                total={payable.length}
+                batchSize={INITIAL_FINANCE_WINDOW}
+                summary={`Mostrando ${visiblePayable.length} de ${payable.length} contas a pagar.`}
+                onPrevious={() => setVisiblePayableCount((prev) => Math.max(INITIAL_FINANCE_WINDOW, prev - INITIAL_FINANCE_WINDOW))}
+                onNext={() => setVisiblePayableCount((prev) => Math.min(payable.length, prev + INITIAL_FINANCE_WINDOW))}
+              />
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className="bg-secondary/30 text-muted-foreground uppercase text-[10px] font-bold">
@@ -10567,7 +10993,7 @@ function FinanceView({
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {payable.map((p) => (
+                  {visiblePayable.map((p) => (
                     <tr key={p.id} className="hover:bg-secondary/10 transition-colors">
                       <td className="px-6 py-4 text-muted-foreground font-mono">{p.due}</td>
                       <td className="px-6 py-4 font-medium">{p.desc}</td>
@@ -10587,11 +11013,31 @@ function FinanceView({
                 </tbody>
               </table>
             </div>
+            <div className="p-3 border-t bg-secondary/5">
+              <BatchNavigation
+                windowEnd={visiblePayableCount}
+                total={payable.length}
+                batchSize={INITIAL_FINANCE_WINDOW}
+                summary={`Mostrando ${visiblePayable.length} de ${payable.length} contas a pagar.`}
+                onPrevious={() => setVisiblePayableCount((prev) => Math.max(INITIAL_FINANCE_WINDOW, prev - INITIAL_FINANCE_WINDOW))}
+                onNext={() => setVisiblePayableCount((prev) => Math.min(payable.length, prev + INITIAL_FINANCE_WINDOW))}
+              />
+            </div>
           </Card>
         </TabsContent>
 
         <TabsContent value="receber" className="mt-6">
           <Card className="border-none shadow-sm">
+            <div className="border-b bg-secondary/5 p-3">
+              <BatchNavigation
+                windowEnd={visibleReceivableCount}
+                total={receivable.length}
+                batchSize={INITIAL_FINANCE_WINDOW}
+                summary={`Mostrando ${visibleReceivable.length} de ${receivable.length} contas a receber.`}
+                onPrevious={() => setVisibleReceivableCount((prev) => Math.max(INITIAL_FINANCE_WINDOW, prev - INITIAL_FINANCE_WINDOW))}
+                onNext={() => setVisibleReceivableCount((prev) => Math.min(receivable.length, prev + INITIAL_FINANCE_WINDOW))}
+              />
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className="bg-secondary/30 text-muted-foreground uppercase text-[10px] font-bold">
@@ -10605,7 +11051,7 @@ function FinanceView({
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {receivable.map((r) => (
+                  {visibleReceivable.map((r) => (
                     <tr key={r.id} className="hover:bg-secondary/10 transition-colors">
                       <td className="px-6 py-4 text-muted-foreground font-mono">{r.due}</td>
                       <td className="px-6 py-4 font-medium">{r.customer}</td>
@@ -10626,6 +11072,16 @@ function FinanceView({
                 </tbody>
               </table>
             </div>
+            <div className="p-3 border-t bg-secondary/5">
+              <BatchNavigation
+                windowEnd={visibleReceivableCount}
+                total={receivable.length}
+                batchSize={INITIAL_FINANCE_WINDOW}
+                summary={`Mostrando ${visibleReceivable.length} de ${receivable.length} contas a receber.`}
+                onPrevious={() => setVisibleReceivableCount((prev) => Math.max(INITIAL_FINANCE_WINDOW, prev - INITIAL_FINANCE_WINDOW))}
+                onNext={() => setVisibleReceivableCount((prev) => Math.min(receivable.length, prev + INITIAL_FINANCE_WINDOW))}
+              />
+            </div>
           </Card>
         </TabsContent>
 
@@ -10641,6 +11097,16 @@ function FinanceView({
           </div>
 
           <Card className="border-none shadow-sm">
+            <div className="border-b bg-secondary/5 p-3">
+              <BatchNavigation
+                windowEnd={visibleFixedExpensesCount}
+                total={fixedExpenses.length}
+                batchSize={INITIAL_FINANCE_WINDOW}
+                summary={`Mostrando ${visibleFixedExpenses.length} de ${fixedExpenses.length} despesas fixas.`}
+                onPrevious={() => setVisibleFixedExpensesCount((prev) => Math.max(INITIAL_FINANCE_WINDOW, prev - INITIAL_FINANCE_WINDOW))}
+                onNext={() => setVisibleFixedExpensesCount((prev) => Math.min(fixedExpenses.length, prev + INITIAL_FINANCE_WINDOW))}
+              />
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className="bg-secondary/30 text-muted-foreground uppercase text-[10px] font-bold">
@@ -10653,7 +11119,7 @@ function FinanceView({
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {fixedExpenses.map((f) => (
+                  {visibleFixedExpenses.map((f) => (
                     <tr key={f.id} className="hover:bg-secondary/10 transition-colors">
                       <td className="px-6 py-4 font-mono">Todo dia {f.dueDay}</td>
                       <td className="px-6 py-4 font-medium">{f.desc}</td>
@@ -10682,6 +11148,16 @@ function FinanceView({
                   </tr>
                 </tfoot>
               </table>
+            </div>
+            <div className="p-3 border-t bg-secondary/5">
+              <BatchNavigation
+                windowEnd={visibleFixedExpensesCount}
+                total={fixedExpenses.length}
+                batchSize={INITIAL_FINANCE_WINDOW}
+                summary={`Mostrando ${visibleFixedExpenses.length} de ${fixedExpenses.length} despesas fixas.`}
+                onPrevious={() => setVisibleFixedExpensesCount((prev) => Math.max(INITIAL_FINANCE_WINDOW, prev - INITIAL_FINANCE_WINDOW))}
+                onNext={() => setVisibleFixedExpensesCount((prev) => Math.min(fixedExpenses.length, prev + INITIAL_FINANCE_WINDOW))}
+              />
             </div>
           </Card>
         </TabsContent>
@@ -11509,6 +11985,7 @@ function POSView({
   globalCustomers: any[],
   setGlobalCustomers: React.Dispatch<React.SetStateAction<any[]>>
 }) {
+  const INITIAL_POS_WINDOW = 20;
   const [cart, setCart] = useState<{ id: string, name: string, price: number, quantity: number, sku: string }[]>([]);
   const [search, setSearch] = useState('');
   const [customerSearch, setCustomerSearch] = useState('');
@@ -11529,6 +12006,7 @@ function POSView({
   // Filters for Sales History
   const [saleFilterCustomer, setSaleFilterCustomer] = useState('');
   const [saleFilterDate, setSaleFilterDate] = useState('');
+  const [visibleSalesHistoryCount, setVisibleSalesHistoryCount] = useState(INITIAL_POS_WINDOW);
 
   const handleReturn = (saleId: string, itemSku: string) => {
     const sale = salesHistory.find(s => s.id === saleId);
@@ -11602,18 +12080,54 @@ function POSView({
   const [movementNote, setMovementNote] = useState('');
   const [isNewCustomerModalOpen, setIsNewCustomerModalOpen] = useState(false);
 
-  const filteredCustomers = customerSearch ? globalCustomers.filter(c => 
-    fuzzyMatch(c.name, customerSearch) || (c.doc && fuzzyMatch(c.doc, customerSearch))
-  ) : [];
+  const filteredCustomers = useMemo(() => {
+    const query = customerSearch.trim();
+    if (!query) return [];
+    return globalCustomers.filter((c) =>
+      fuzzyMatch(c.name, query) || (c.doc && fuzzyMatch(c.doc, query))
+    );
+  }, [globalCustomers, customerSearch]);
+
+  const visibleCustomerSuggestions = useMemo(
+    () => filteredCustomers.slice(0, INITIAL_POS_WINDOW),
+    [filteredCustomers]
+  );
 
   const products = allProducts;
 
-  const filteredProducts = products.filter(p => 
-    fuzzyMatch(p.name, search) || 
-    fuzzyMatch(p.sku, search) ||
-    fuzzyMatch(String(p.brand || ''), search) ||
-    fuzzyMatch(String(p.model || ''), search)
+  const filteredProducts = useMemo(() => {
+    const query = search.trim();
+    if (!query) return [];
+    return products.filter((p) =>
+      fuzzyMatch(p.name, query) ||
+      fuzzyMatch(p.sku, query) ||
+      fuzzyMatch(String(p.brand || ''), query) ||
+      fuzzyMatch(String(p.model || ''), query)
+    );
+  }, [products, search]);
+
+  const visibleProductSuggestions = useMemo(
+    () => filteredProducts.slice(0, INITIAL_POS_WINDOW),
+    [filteredProducts]
   );
+
+  const filteredSalesHistory = useMemo(
+    () => salesHistory.filter((sale) => {
+      const matchesCustomer = fuzzyMatch(sale.customer, saleFilterCustomer);
+      const matchesDate = !saleFilterDate || sale.date.startsWith(saleFilterDate);
+      return matchesCustomer && matchesDate;
+    }),
+    [salesHistory, saleFilterCustomer, saleFilterDate]
+  );
+
+  const visibleSalesHistory = useMemo(
+    () => getVisibleBatch(filteredSalesHistory, visibleSalesHistoryCount, INITIAL_POS_WINDOW),
+    [filteredSalesHistory, visibleSalesHistoryCount]
+  );
+
+  useEffect(() => {
+    setVisibleSalesHistoryCount(INITIAL_POS_WINDOW);
+  }, [saleFilterCustomer, saleFilterDate]);
 
   const addToCart = (product: typeof products[0]) => {
     const existing = cart.find(item => item.id === product.id);
@@ -11879,7 +12393,7 @@ function POSView({
               </div>
               {customerSearch && !selectedCustomer && (
                 <div className="absolute z-50 w-full mt-1 bg-white border rounded-lg shadow-xl max-h-48 overflow-y-auto text-foreground">
-                  {filteredCustomers.length > 0 ? filteredCustomers.map(c => (
+                  {visibleCustomerSuggestions.length > 0 ? visibleCustomerSuggestions.map(c => (
                     <div 
                       key={c.id} 
                       className="p-2 hover:bg-primary/5 cursor-pointer text-sm border-b last:border-0"
@@ -11956,7 +12470,7 @@ function POSView({
               />
               {search && (
                 <div className="absolute z-50 w-full mt-1 bg-white border rounded-xl shadow-2xl max-h-[400px] overflow-y-auto">
-                  {filteredProducts.length > 0 ? filteredProducts.map(p => (
+                  {visibleProductSuggestions.length > 0 ? visibleProductSuggestions.map(p => (
                     <div 
                       key={p.id} 
                       className="p-4 hover:bg-primary/5 cursor-pointer flex justify-between items-center border-b last:border-0 transition-colors"
@@ -12360,13 +12874,20 @@ function POSView({
               </div>
             </div>
             <div className="flex-1 overflow-y-auto">
-              {salesHistory.filter(sale => {
-                const matchesCustomer = fuzzyMatch(sale.customer, saleFilterCustomer);
-                const matchesDate = !saleFilterDate || sale.date.startsWith(saleFilterDate);
-                return matchesCustomer && matchesDate;
-              }).length > 0 ? (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm text-left">
+              {filteredSalesHistory.length > 0 ? (
+                <>
+                  <div className="border-b bg-secondary/5 p-3">
+                    <BatchNavigation
+                      windowEnd={visibleSalesHistoryCount}
+                      total={filteredSalesHistory.length}
+                      batchSize={INITIAL_POS_WINDOW}
+                      summary={`Mostrando ${visibleSalesHistory.length} de ${filteredSalesHistory.length} vendas.`}
+                      onPrevious={() => setVisibleSalesHistoryCount((prev) => Math.max(INITIAL_POS_WINDOW, prev - INITIAL_POS_WINDOW))}
+                      onNext={() => setVisibleSalesHistoryCount((prev) => Math.min(filteredSalesHistory.length, prev + INITIAL_POS_WINDOW))}
+                    />
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm text-left">
                     <thead className="bg-secondary/30 text-[10px] uppercase font-bold text-muted-foreground sticky top-0">
                       <tr>
                         <th className="px-6 py-3">Data / Hora</th>
@@ -12378,13 +12899,7 @@ function POSView({
                       </tr>
                     </thead>
                     <tbody className="divide-y text-left">
-                      {salesHistory
-                        .filter(sale => {
-                          const matchesCustomer = fuzzyMatch(sale.customer, saleFilterCustomer);
-                          const matchesDate = !saleFilterDate || sale.date.startsWith(saleFilterDate);
-                          return matchesCustomer && matchesDate;
-                        })
-                        .map((sale) => (
+                      {visibleSalesHistory.map((sale) => (
                         <tr key={sale.id} className="hover:bg-secondary/5 transition-colors group">
                           <td className="px-6 py-4 font-mono text-xs">
                             {format(new Date(sale.date), 'dd/MM/yyyy HH:mm')}
@@ -12457,12 +12972,25 @@ function POSView({
                         </tr>
                       ))}
                     </tbody>
-                  </table>
-                </div>
+                    </table>
+                  </div>
+                </>
               ) : (
                 <div className="flex flex-col items-center justify-center p-12 text-center text-muted-foreground">
                    <History className="w-12 h-12 opacity-10 mb-4" />
                    <p>Nenhuma venda encontrada no histórico.</p>
+                </div>
+              )}
+              {filteredSalesHistory.length > 0 && (
+                <div className="p-3 border-t bg-secondary/5">
+                  <BatchNavigation
+                    windowEnd={visibleSalesHistoryCount}
+                    total={filteredSalesHistory.length}
+                    batchSize={INITIAL_POS_WINDOW}
+                    summary={`Mostrando ${visibleSalesHistory.length} de ${filteredSalesHistory.length} vendas.`}
+                    onPrevious={() => setVisibleSalesHistoryCount((prev) => Math.max(INITIAL_POS_WINDOW, prev - INITIAL_POS_WINDOW))}
+                    onNext={() => setVisibleSalesHistoryCount((prev) => Math.min(filteredSalesHistory.length, prev + INITIAL_POS_WINDOW))}
+                  />
                 </div>
               )}
             </div>
@@ -13422,15 +13950,19 @@ const MIGRATION_ENTITY_FIELDS: Record<MigrationEntityType, MigrationFieldDef[]> 
     { key: 'addressZip', label: 'CEP' },
   ],
   os: [
+    { key: 'number', label: 'N\u00ba OS' },
     { key: 'customerName', label: 'Nome do Cliente', required: true },
     { key: 'equipment', label: 'Equipamento', required: true },
     { key: 'brand', label: 'Marca' },
     { key: 'model', label: 'Modelo' },
     { key: 'serialNumber', label: 'Número de Série' },
     { key: 'defect', label: 'Defeito Relatado' },
+    { key: 'observation', label: 'Observacao' },
     { key: 'accessories', label: 'Acessórios' },
     { key: 'status', label: 'Status' },
     { key: 'value', label: 'Valor Total' },
+    { key: 'entryDate', label: 'Data de entrada' },
+    { key: 'deliveredAt', label: 'Data entregue' },
     { key: 'diagnosisDeadline', label: 'Prazo de Diagnóstico' },
     { key: 'completionDeadline', label: 'Prazo de Conclusão / Data' },
   ],
@@ -13523,6 +14055,19 @@ function MigrationAssistantView({
 
   const entityFields = MIGRATION_ENTITY_FIELDS[activeEntity];
 
+  const normalizeMigrationColumn = (value: string) =>
+    String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
+
+  const migrationFieldAliases: Record<string, string[]> = {
+    number: ['os', 'nos', 'nros', 'numeroos', 'numerodaos', 'ordemservico', 'ordemdeservico'],
+    entryDate: ['entrada', 'datadeentrada', 'dataentrada', 'criacao', 'datacriacao'],
+    deliveredAt: ['entrega', 'dataentrega', 'dataentregue', 'entregue', 'datafinalizada'],
+  };
+
   const resetWizard = () => {
     setStep('paste');
     setCsvText('');
@@ -13548,9 +14093,13 @@ function MigrationAssistantView({
     // Auto-map columns by fuzzy label match
     const autoMap: Record<string, string> = {};
     entityFields.forEach(field => {
+      const normalizedFieldLabel = normalizeMigrationColumn(field.label);
+      const normalizedFieldKey = normalizeMigrationColumn(field.key);
+      const aliases = (migrationFieldAliases[field.key] || []).map(normalizeMigrationColumn);
       const match = headers.find(h =>
-        h.toLowerCase().replace(/[_\s-]/g, '') === field.label.toLowerCase().replace(/[_\s-]/g, '') ||
-        h.toLowerCase().replace(/[_\s-]/g, '') === field.key.toLowerCase()
+        normalizeMigrationColumn(h) === normalizedFieldLabel ||
+        normalizeMigrationColumn(h) === normalizedFieldKey ||
+        aliases.includes(normalizeMigrationColumn(h))
       );
       if (match) autoMap[field.key] = match;
     });
@@ -13626,9 +14175,32 @@ function MigrationAssistantView({
       }));
       setGlobalCustomers(prev => [...prev, ...newItems]);
     } else if (activeEntity === 'os') {
-      const newItems: ServiceOrder[] = mapped.map(r => ({
+      const buildMigratedOsNumber = (value: string) => {
+        const raw = String(value || '').trim();
+        const withoutPrefix = raw.replace(/^MIG[-\s]*/i, '').trim();
+        const digits = withoutPrefix.replace(/\D/g, '');
+        return digits ? `MIG-${digits}` : '';
+      };
+
+      const parseMigratedDate = (value: string) => {
+        const raw = String(value || '').trim();
+        if (!raw) return '';
+
+        const direct = new Date(raw);
+        if (!Number.isNaN(direct.getTime())) return direct.toISOString();
+
+        const brDate = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?$/);
+        if (!brDate) return '';
+
+        const [, day, month, year, hour = '0', minute = '0'] = brDate;
+        const fullYear = year.length === 2 ? `20${year}` : year;
+        const parsed = new Date(Number(fullYear), Number(month) - 1, Number(day), Number(hour), Number(minute));
+        return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString();
+      };
+
+      const newItems: ServiceOrder[] = mapped.map((r, index) => ({
         id: `mig_${Math.random().toString(36).slice(2)}`,
-        number: `MIG-${Math.floor(Math.random() * 90000) + 10000}`,
+        number: buildMigratedOsNumber(r.number) || `MIG-${String(index + 1).padStart(5, '0')}`,
         customerId: '',
         customerName: r.customerName || 'Cliente Importado',
         equipment: r.equipment || '',
@@ -13636,14 +14208,17 @@ function MigrationAssistantView({
         model: r.model || '',
         serialNumber: r.serialNumber || '',
         defect: r.defect || '',
+        observation: r.observation || '',
         accessories: r.accessories || '',
         status: (r.status as any) || 'Aberta',
         priority: 'Média',
         value: parseFloat(r.value) || 0,
-        diagnosisDeadline: r.diagnosisDeadline || undefined,
-        completionDeadline: r.completionDeadline || undefined,
-        createdAt: now,
-        updatedAt: now,
+        diagnosisDeadline: parseMigratedDate(r.diagnosisDeadline) || r.diagnosisDeadline || undefined,
+        completionDeadline: parseMigratedDate(r.completionDeadline) || r.completionDeadline || undefined,
+        paymentDate: parseMigratedDate(r.deliveredAt) || undefined,
+        deliveredAt: parseMigratedDate(r.deliveredAt) || undefined,
+        createdAt: parseMigratedDate(r.entryDate) || now,
+        updatedAt: parseMigratedDate(r.deliveredAt) || parseMigratedDate(r.entryDate) || now,
         companyId: activeCompanyId,
         importedFromBackup: true,
       }));
@@ -18450,15 +19025,26 @@ function SupplierView({
   setSuppliers: React.Dispatch<React.SetStateAction<Supplier[]>>,
   activeCompanyId: string,
 }) {
+  const INITIAL_SUPPLIERS_WINDOW = 20;
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [editingSupplier, setEditingSupplier] = useState<Supplier | null>(null);
+  const [visibleSuppliersCount, setVisibleSuppliersCount] = useState(INITIAL_SUPPLIERS_WINDOW);
 
   const companySuppliers = suppliers.filter((supplier) => supplier.companyId === activeCompanyId);
 
   const filtered = companySuppliers.filter(s => 
     fuzzyMatch(s.name, search) || fuzzyMatch(s.document, search) || fuzzyMatch(s.contactName || '', search)
   );
+
+  const visibleSuppliers = useMemo(
+    () => getVisibleBatch(filtered, visibleSuppliersCount, INITIAL_SUPPLIERS_WINDOW),
+    [filtered, visibleSuppliersCount]
+  );
+
+  useEffect(() => {
+    setVisibleSuppliersCount(INITIAL_SUPPLIERS_WINDOW);
+  }, [search, activeCompanyId]);
 
   const handleDelete = (id: string) => {
     if (confirm('Tem certeza que deseja remover este fornecedor?')) {
@@ -18561,6 +19147,16 @@ function SupplierView({
       </div>
 
       <Card className="border-none shadow-sm overflow-hidden">
+        <div className="border-b bg-secondary/5 p-3">
+          <BatchNavigation
+            windowEnd={visibleSuppliersCount}
+            total={filtered.length}
+            batchSize={INITIAL_SUPPLIERS_WINDOW}
+            summary={`Mostrando ${visibleSuppliers.length} de ${filtered.length} fornecedores.`}
+            onPrevious={() => setVisibleSuppliersCount((prev) => Math.max(INITIAL_SUPPLIERS_WINDOW, prev - INITIAL_SUPPLIERS_WINDOW))}
+            onNext={() => setVisibleSuppliersCount((prev) => Math.min(filtered.length, prev + INITIAL_SUPPLIERS_WINDOW))}
+          />
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm text-left">
             <thead className="text-xs uppercase bg-secondary/50 text-muted-foreground">
@@ -18572,7 +19168,7 @@ function SupplierView({
               </tr>
             </thead>
             <tbody className="divide-y bg-white">
-              {filtered.length > 0 ? filtered.map(s => (
+              {filtered.length > 0 ? visibleSuppliers.map(s => (
                 <tr key={s.id} className="hover:bg-secondary/5 transition-colors">
                   <td className="px-6 py-4">
                     <div className="font-bold flex items-center flex-wrap gap-0.5">{s.name}{s.importedFromBackup && <BackupBadge />}</div>
@@ -18611,6 +19207,16 @@ function SupplierView({
             </tbody>
           </table>
         </div>
+        <div className="p-3 border-t bg-secondary/5">
+          <BatchNavigation
+            windowEnd={visibleSuppliersCount}
+            total={filtered.length}
+            batchSize={INITIAL_SUPPLIERS_WINDOW}
+            summary={`Mostrando ${visibleSuppliers.length} de ${filtered.length} fornecedores.`}
+            onPrevious={() => setVisibleSuppliersCount((prev) => Math.max(INITIAL_SUPPLIERS_WINDOW, prev - INITIAL_SUPPLIERS_WINDOW))}
+            onNext={() => setVisibleSuppliersCount((prev) => Math.min(filtered.length, prev + INITIAL_SUPPLIERS_WINDOW))}
+          />
+        </div>
       </Card>
     </div>
   );
@@ -18623,8 +19229,20 @@ function OSConferenceView({
   allOrders: ServiceOrder[];
   setAllOrders: React.Dispatch<React.SetStateAction<ServiceOrder[]>>;
 }) {
+  const INITIAL_CONFERENCE_WINDOW = 20;
   const [activeTab, setActiveTab] = useState('os');
+  const [visibleDeliveredOrdersCount, setVisibleDeliveredOrdersCount] = useState(INITIAL_CONFERENCE_WINDOW);
   const deliveredOrders = allOrders.filter((os) => os.status === 'Entregue');
+  const visibleDeliveredOrders = useMemo(
+    () => getVisibleBatch(deliveredOrders, visibleDeliveredOrdersCount, INITIAL_CONFERENCE_WINDOW),
+    [deliveredOrders, visibleDeliveredOrdersCount]
+  );
+
+  useEffect(() => {
+    if (activeTab === 'os') {
+      setVisibleDeliveredOrdersCount(INITIAL_CONFERENCE_WINDOW);
+    }
+  }, [activeTab, allOrders]);
 
   const handleFinalize = (id: string) => {
     setAllOrders((prev) =>
@@ -18661,6 +19279,16 @@ function OSConferenceView({
 
         <TabsContent value="os" className="space-y-4">
           <Card className="border-none shadow-sm overflow-hidden">
+            <div className="border-b bg-secondary/5 p-3">
+              <BatchNavigation
+                windowEnd={visibleDeliveredOrdersCount}
+                total={deliveredOrders.length}
+                batchSize={INITIAL_CONFERENCE_WINDOW}
+                summary={`Mostrando ${visibleDeliveredOrders.length} de ${deliveredOrders.length} O.S. entregues.`}
+                onPrevious={() => setVisibleDeliveredOrdersCount((prev) => Math.max(INITIAL_CONFERENCE_WINDOW, prev - INITIAL_CONFERENCE_WINDOW))}
+                onNext={() => setVisibleDeliveredOrdersCount((prev) => Math.min(deliveredOrders.length, prev + INITIAL_CONFERENCE_WINDOW))}
+              />
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className="text-xs uppercase bg-secondary/50 text-muted-foreground">
@@ -18675,7 +19303,7 @@ function OSConferenceView({
                 </thead>
                 <tbody className="divide-y">
                   {deliveredOrders.length > 0 ? (
-                    deliveredOrders.map((os) => (
+                    visibleDeliveredOrders.map((os) => (
                       <tr key={os.id} className="hover:bg-secondary/20 transition-all">
                         <td className="px-6 py-4 font-bold text-primary">{os.number}</td>
                         <td className="px-6 py-4">{os.customerName}</td>
@@ -18712,6 +19340,16 @@ function OSConferenceView({
                   )}
                 </tbody>
               </table>
+            </div>
+            <div className="p-3 border-t bg-secondary/5">
+              <BatchNavigation
+                windowEnd={visibleDeliveredOrdersCount}
+                total={deliveredOrders.length}
+                batchSize={INITIAL_CONFERENCE_WINDOW}
+                summary={`Mostrando ${visibleDeliveredOrders.length} de ${deliveredOrders.length} O.S. entregues.`}
+                onPrevious={() => setVisibleDeliveredOrdersCount((prev) => Math.max(INITIAL_CONFERENCE_WINDOW, prev - INITIAL_CONFERENCE_WINDOW))}
+                onNext={() => setVisibleDeliveredOrdersCount((prev) => Math.min(deliveredOrders.length, prev + INITIAL_CONFERENCE_WINDOW))}
+              />
             </div>
           </Card>
         </TabsContent>
@@ -19456,6 +20094,8 @@ function PrintCustomizationView({ templates, setTemplates }: { templates: PrintT
     </div>
   );
 }
+
+
 
 
 
