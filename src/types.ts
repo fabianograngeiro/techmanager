@@ -53,11 +53,41 @@ export interface Company {
   notifyBudgetReady?: boolean;
   pixKeyType?: 'CPF' | 'CNPJ' | 'EMAIL' | 'TELEFONE' | 'ALEATORIA';
   pixKey?: string;
+  businessHoursEnabled?: boolean;
+  businessHoursWeekdays?: number[]; // 0=Dom, 1=Seg ... 6=Sab
+  businessHoursStart?: string; // HH:mm
+  businessHoursEnd?: string; // HH:mm
+  businessHoursBreakStart?: string; // HH:mm
+  businessHoursBreakEnd?: string; // HH:mm
+  businessHoursBreakWeekdays?: number[]; // dias com intervalo ativo
+  businessHoursSaturdayEnabled?: boolean;
+  businessHoursSaturdayStart?: string; // HH:mm
+  businessHoursSaturdayEnd?: string; // HH:mm
+  businessHoursSundayEnabled?: boolean;
+  businessHoursSundayStart?: string; // HH:mm
+  businessHoursSundayEnd?: string; // HH:mm
+  businessHoursHolidayClosed?: boolean;
+  holidayWorkOverrides?: Record<string, {
+    open: boolean;
+    start: string;
+    breakEnabled: boolean;
+    breakStart: string;
+    end: string;
+  }>;
+  waitingPartOptions?: Array<{
+    id: string;
+    institutionName: string;
+    deadlineDays: number;
+    purchaseType?: string;
+  }>;
   aiAssistantMode?: CompanyAIAssistantMode;
   aiSaasCatalogId?: string;
   aiProvider?: AIProvider;
   aiModel?: string;
   aiModelSource?: 'provider-default' | 'preset';
+  osStatuses?: OsStatusConfig[];
+  defaultFallbackDiagnosisDays?: number;
+  defaultFallbackCompletionDays?: number;
 }
 
 export type TechnicalSector =
@@ -186,7 +216,25 @@ export type OSStatus =
   | 'Pronta' 
   | 'Entregue' 
   | 'Finalizada' 
-  | 'Cancelada';
+  | 'Cancelada'
+  | 'Reprovado'
+  | (string & {});
+
+export interface OsStatusConfig {
+  id: string;
+  name: string;
+  order: number;
+}
+
+export interface EquipmentDeadlineRule {
+  id: string;
+  serviceKeyword: string; // keyword to match in service description (case-insensitive)
+  diagnosisHours?: number;
+  diagnosisDays?: number;
+  completionHours?: number;
+  completionDays?: number;
+  priority: number; // lower = higher priority
+}
 
 export interface OSItem {
   id: string;
@@ -195,6 +243,21 @@ export interface OSItem {
   unitPrice: number;
   totalPrice: number;
   type: 'Produto' | 'Serviço';
+  executionTimeValue?: number;
+  executionTimeUnit?: 'Horas' | 'Dias';
+}
+
+export interface EquipmentBrandModel {
+  brand: string;
+  models: string[];
+}
+
+export interface EquipmentServiceDefinition {
+  id: string;
+  description: string;
+  unitPrice?: number;
+  executionTimeValue?: number;
+  executionTimeUnit?: 'Horas' | 'Dias';
 }
 
 export interface ServiceOrder {
@@ -224,6 +287,8 @@ export interface ServiceOrder {
   details?: string;
   cancellationReason?: string;
   cancellationDate?: string;
+  rejectionReason?: string;
+  rejectionDate?: string;
   technicianId?: string;
   technicianName?: string;
   createdAt: string;
@@ -288,8 +353,29 @@ export interface EquipmentType {
   name: string;
   defaultDiagnosisDays: number;
   defaultCompletionDays: number;
+  overloadFromQty?: number;
+  overloadDiagnosisDays?: number;
+  overloadCompletionDays?: number;
+  chargeDiagnosisOnRejection?: boolean;
+  diagnosisChargeValue?: number;
+  deadlineRules?: EquipmentDeadlineRule[];
+  brandModels?: EquipmentBrandModel[];
+  services?: EquipmentServiceDefinition[];
   companyId: string;
 }
+
+export interface HolidayApiItem {
+  date: string; // yyyy-MM-dd
+  name: string;
+  type: string;
+}
+
+export interface HolidayYearCache {
+  fetchedAt: string;
+  holidays: HolidayApiItem[];
+}
+
+export type HolidayCalendarCache = Record<string, HolidayYearCache>;
 
 export interface TemplateElement {
   id: string;
